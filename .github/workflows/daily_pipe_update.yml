@@ -1,0 +1,154 @@
+name: Daily Pipe Update
+
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'  # 7:00 AM ET (UTC-5), Mon–Fri
+  workflow_dispatch:          # Manual trigger from GitHub Actions tab
+
+jobs:
+  post-pipe-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Post Daily Pipe Update
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOTAPI }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          python3 - <<'EOF'
+          import urllib.request, urllib.parse, json, os, datetime
+          import pytz
+
+          HUBSPOT_KEY = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+
+          HUBSPOT_PORTAL_ID = "21451281"
+          SLACK_CHANNEL     = "D08JJMN2L66"
+          SLACK_USER        = "U08JJMM2QSW"
+          SELLERS           = ["Dillon DeWitt", "Will Weis", "Isabella Simpatico", "James Gregory"]
+
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          # ── Date range: previous calendar day in ET ──────────────
+          et        = pytz.timezone("America/New_York")
+          now_et    = datetime.datetime.now(et)
+          yesterday = now_et - datetime.timedelta(days=1)
+          start_et  = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0))
+          end_et    = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59))
+          start_ms  = int(start_et.timestamp() * 1000)
+          end_ms    = int(end_et.timestamp() * 1000)
+          date_label = yesterday.strftime("%A, %B %d, %Y")
+
+          print(f"Fetching deals for: {date_label}")
+
+          # ── Helper: HubSpot GET ───────────────────────────────────
+          def hs_get(path):
+              req = urllib.request.Request(
+                  f"https://api.hubapi.com{path}",
+                  headers=HS_HEADERS,
+                  method="GET"
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          # ── Helper: HubSpot POST ──────────────────────────────────
+          def hs_post(path, payload):
+              req = urllib.request.Request(
+                  f"https://api.hubapi.com{path}",
+                  data=json.dumps(payload).encode(),
+                  headers=HS_HEADERS,
+                  method="POST"
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          # ── Step 1: Get owner IDs ─────────────────────────────────
+          owners = hs_get("/crm/v3/owners").get("results", [])
+          owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+          seller_ids = {name: owner_map.get(name) for name in SELLERS}
+          print(f"Owner IDs: {seller_ids}")
+
+          # ── Step 2: Fetch yesterday's deals ──────────────────────
+          deals = hs_post("/crm/v3/objects/deals/search", {
+              "filterGroups": [{"filters": [
+                  {"propertyName": "hs_createdate", "operator": "GTE", "value": str(start_ms)},
+                  {"propertyName": "hs_createdate", "operator": "LTE", "value": str(end_ms)},
+              ]}],
+              "properties": [
+                  "dealname", "dealtype", "icp", "amount",
+                  "closedate", "dealstage", "hubspot_owner_id",
+                  "hs_createdate", "hs_object_id"
+              ],
+              "limit": 100
+          }).get("results", [])
+          print(f"Deals found: {len(deals)}")
+
+          # ── Step 3: Get deal stage labels ─────────────────────────
+          stage_labels = {}
+          for pipeline in hs_get("/crm/v3/pipelines/deals").get("results", []):
+              for stage in pipeline.get("stages", []):
+                  stage_labels[stage["id"]] = stage["label"]
+
+          # ── Step 4: Map deals to sellers ──────────────────────────
+          def fmt_currency(val):
+              try: return f"${float(val):,.0f}"
+              except: return "$0"
+
+          def fmt_date(iso):
+              if not iso: return "—"
+              try:
+                  d = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                  return d.strftime("%b %d, %Y")
+              except: return iso
+
+          seller_deals = {s: [] for s in SELLERS}
+          for deal in deals:
+              p = deal.get("properties", {})
+              oid = p.get("hubspot_owner_id")
+              for name, sid in seller_ids.items():
+                  if str(oid) == str(sid):
+                      seller_deals[name].append({**p, "hs_object_id": deal["id"]})
+
+          total_deals = sum(len(v) for v in seller_deals.values())
+          total_acv   = sum(float(d.get("amount") or 0) for v in seller_deals.values() for d in v)
+
+          # ── Step 5: Build Slack message ───────────────────────────
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*Daily Pipe Update — {date_label}*\n"
+          msg += f"*{total_deals} new deal{'s' if total_deals != 1 else ''} created | Total ACV: {fmt_currency(total_acv)}*\n\n"
+
+          for seller in SELLERS:
+              sd = seller_deals[seller]
+              if not sd:
+                  msg += f"*{seller}* — 0 deals\n\n"
+              else:
+                  acv = sum(float(d.get("amount") or 0) for d in sd)
+                  msg += f"*{seller}* — {len(sd)} deal(s) | *ACV: {fmt_currency(acv)}*\n"
+                  for d in sd:
+                      did   = d.get("hs_object_id", "")
+                      name  = d.get("dealname", "Unnamed Deal")
+                      amt   = fmt_currency(d.get("amount"))
+                      icp   = d.get("icp") or "—"
+                      dtype = d.get("dealtype") or "—"
+                      close = fmt_date(d.get("closedate"))
+                      url   = f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-3/{did}"
+                      msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
+                  msg += "\n"
+
+          print("Message preview:\n", msg)
+
+          # ── Step 6: Send Slack DM ─────────────────────────────────
+          req = urllib.request.Request(
+              "https://slack.com/api/chat.postMessage",
+              data=json.dumps({"channel": SLACK_CHANNEL, "text": msg}).encode(),
+              headers=SLACK_HEADERS,
+              method="POST"
+          )
+          with urllib.request.urlopen(req) as r:
+              result = json.loads(r.read())
+              if result.get("ok"):
+                  print("✅ Slack message sent!")
+              else:
+                  raise Exception(f"Slack error: {result.get('error')}")
+          EOF

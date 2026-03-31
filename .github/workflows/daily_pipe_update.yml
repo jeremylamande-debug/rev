@@ -138,10 +138,25 @@ jobs:
 
           print("Message preview:\n", msg)
 
-          # ── Step 6: Send Slack DM ─────────────────────────────────
+          # ── Step 6: Open DM channel then send ────────────────────
+          # First open a DM conversation with the user
+          req = urllib.request.Request(
+              "https://slack.com/api/conversations.open",
+              data=json.dumps({"users": SLACK_USER}).encode(),
+              headers=SLACK_HEADERS,
+              method="POST"
+          )
+          with urllib.request.urlopen(req) as r:
+              dm = json.loads(r.read())
+          if not dm.get("ok"):
+              raise Exception(f"Slack conversations.open error: {dm.get('error')}")
+          dm_channel = dm["channel"]["id"]
+          print(f"DM channel opened: {dm_channel}")
+
+          # Now send the message
           req = urllib.request.Request(
               "https://slack.com/api/chat.postMessage",
-              data=json.dumps({"channel": SLACK_CHANNEL, "text": msg}).encode(),
+              data=json.dumps({"channel": dm_channel, "text": msg}).encode(),
               headers=SLACK_HEADERS,
               method="POST"
           )

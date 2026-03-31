@@ -2,7 +2,7 @@ name: Daily Revenue Briefing
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # 8:00 AM Mountain Time (UTC-6) every day
+    - cron: '0 13 * * 1-5'  # 8:00 AM ET, Mon–Fri
   workflow_dispatch:       # Also allows manual trigger from GitHub Actions tab
 
 jobs:

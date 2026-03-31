@@ -3,113 +3,183 @@ name: Daily Revenue Briefing
 on:
   schedule:
     - cron: '0 13 * * 1-5'  # 8:00 AM ET, Mon–Fri
-  workflow_dispatch:       # Also allows manual trigger from GitHub Actions tab
+  workflow_dispatch:          # Manual trigger from GitHub Actions tab
 
 jobs:
   post-briefings:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Post Daily Sales Brief
+      - name: Post Daily Pipe Update with Chart
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
+          pip install matplotlib pytz --quiet
           python3 - <<'EOF'
-          import urllib.request, urllib.parse, json, os, datetime
+          import urllib.request, json, os, datetime, pytz, matplotlib
+          matplotlib.use('Agg')
+          import matplotlib.pyplot as plt
 
-          ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-          HUBSPOT_KEY = os.environ["HUBSPOT_API_KEY"]
-          SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-          JEREMY = "U08JJMM2QSW"
+          HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+          SLACK_CHANNEL = "C0APDRMLN1Z"  # #daily-sales
+          SLACK_USER    = "U08JJMM2QSW"
+          SELLERS       = ["Dillon DeWitt", "Will Weis", "Isabella Simpatico", "James Gregory"]
+          PORTAL_ID     = "21451281"
 
-          # --- HubSpot: fetch open deals past close date, no next step ---
-          def hs_search(payload):
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          # ── Date range: previous calendar day ET ──────────────────
+          et        = pytz.timezone("America/New_York")
+          now_et    = datetime.datetime.now(et)
+          yesterday = now_et - datetime.timedelta(days=1)
+          start_et  = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0))
+          end_et    = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59))
+          start_ms  = int(start_et.timestamp() * 1000)
+          end_ms    = int(end_et.timestamp() * 1000)
+          date_label = yesterday.strftime("%A, %B %d, %Y")
+
+          # ── HubSpot helpers ────────────────────────────────────────
+          def hs_get(path):
+              req = urllib.request.Request(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
+              with urllib.request.urlopen(req) as r: return json.loads(r.read())
+
+          def hs_post(path, payload):
               req = urllib.request.Request(
-                  "https://api.hubapi.com/crm/v3/objects/deals/search",
-                  data=json.dumps(payload).encode(),
-                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {HUBSPOT_KEY}"},
-                  method="POST"
-              )
-              with urllib.request.urlopen(req) as r:
-                  return json.loads(r.read())
+                  f"https://api.hubapi.com{path}",
+                  data=json.dumps(payload).encode(), headers=HS_HEADERS, method="POST")
+              with urllib.request.urlopen(req) as r: return json.loads(r.read())
 
-          today_ts = int(datetime.datetime.now().timestamp() * 1000)
-          sixty_days_ts = int((datetime.datetime.now() + datetime.timedelta(days=60)).timestamp() * 1000)
+          # ── Get owners ─────────────────────────────────────────────
+          owners = hs_get("/crm/v3/owners").get("results", [])
+          owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+          seller_ids = {name: owner_map.get(name) for name in SELLERS}
 
-          # Stalled / overdue deals
-          overdue = hs_search({
+          # ── Fetch yesterday's deals ────────────────────────────────
+          deals = hs_post("/crm/v3/objects/deals/search", {
               "filterGroups": [{"filters": [
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedwon"},
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedlost"},
-                  {"propertyName": "closedate", "operator": "LTE", "value": str(today_ts)},
-                  {"propertyName": "amount", "operator": "GT", "value": "10000"}
+                  {"propertyName": "hs_createdate", "operator": "GTE", "value": str(start_ms)},
+                  {"propertyName": "hs_createdate", "operator": "LTE", "value": str(end_ms)},
               ]}],
-              "properties": ["dealname", "amount", "closedate", "hubspot_owner_id", "hs_next_step"],
-              "sorts": [{"propertyName": "amount", "direction": "DESCENDING"}],
-              "limit": 5
-          })
+              "properties": ["dealname", "dealtype", "icp", "amount", "closedate",
+                             "dealstage", "hubspot_owner_id", "hs_createdate"],
+              "limit": 100
+          }).get("results", [])
 
-          # Renewals expiring in 60 days
-          renewals = hs_search({
-              "filterGroups": [{"filters": [
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedwon"},
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedlost"},
-                  {"propertyName": "contract_end_date__c", "operator": "LTE", "value": str(sixty_days_ts)},
-                  {"propertyName": "renewal_acv_", "operator": "GT", "value": "0"}
-              ]}],
-              "properties": ["dealname", "amount", "contract_end_date__c", "renewal_acv_"],
-              "sorts": [{"propertyName": "renewal_acv_", "direction": "DESCENDING"}],
-              "limit": 5
-          })
+          # ── Map deals to sellers ───────────────────────────────────
+          def fmt_currency(val):
+              try: return f"${float(val):,.0f}"
+              except: return "$0"
 
-          # Build Sales message
-          overdue_lines = ""
-          for d in overdue.get("results", []):
-              p = d["properties"]
-              amt = f"${int(float(p.get('amount') or 0)):,}"
-              name = p.get("dealname", "Unknown")[:50]
-              close = (p.get("closedate") or "")[:10]
-              no_next = "⚠️ No next step" if not p.get("hs_next_step") else ""
-              url = f"https://app.hubspot.com/contacts/21451281/record/0-3/{d['id']}"
-              overdue_lines += f"• <{url}|{name}> · *{amt}* · Due: {close} {no_next}\n"
+          def fmt_date(iso):
+              if not iso: return "—"
+              try:
+                  d = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                  return d.strftime("%b %d, %Y")
+              except: return iso
 
-          renewal_lines = ""
-          for d in renewals.get("results", []):
-              p = d["properties"]
-              acv = f"${int(float(p.get('renewal_acv_') or p.get('amount') or 0)):,}"
-              name = p.get("dealname", "Unknown")[:50]
-              end = p.get("contract_end_date__c", "")
-              url = f"https://app.hubspot.com/contacts/21451281/record/0-3/{d['id']}"
-              renewal_lines += f"• <{url}|{name}> · *{acv} ACV* · Expires: {end}\n"
+          seller_deals = {s: [] for s in SELLERS}
+          for deal in deals:
+              p = deal.get("properties", {})
+              oid = p.get("hubspot_owner_id")
+              for name, sid in seller_ids.items():
+                  if str(oid) == str(sid):
+                      seller_deals[name].append({**p, "hs_object_id": deal["id"]})
 
-          today_str = datetime.date.today().strftime("%a %b %-d, %Y")
-          sales_msg = f"""
-          :bar_chart: *Daily Sales Brief — {today_str}*
-          ━━━━━━━━━━━━━━━━━━━━━━━
-          <@{JEREMY}>
+          total_deals = sum(len(v) for v in seller_deals.values())
+          total_acv   = sum(float(d.get("amount") or 0) for v in seller_deals.values() for d in v)
 
-          *🔴 Overdue Deals — Top by ACV*
-          {overdue_lines or "No overdue high-value deals today."}
-          *📅 Renewals Expiring in 60 Days*
-          {renewal_lines or "No renewals flagged today."}
-          _Powered by HubSpot · Pipeline Monitor Agent_
-          """.strip()
+          # ── Generate bar chart ─────────────────────────────────────
+          acv_vals    = [sum(float(d.get("amount") or 0) for d in seller_deals[s]) for s in SELLERS]
+          short_names = [s.split()[0] for s in SELLERS]
+          max_val     = max(acv_vals) if max(acv_vals) > 0 else 1000
 
-          # Post to Slack
-          def slack_post(channel, text):
-              req = urllib.request.Request(
-                  "https://slack.com/api/chat.postMessage",
-                  data=json.dumps({"channel": channel, "text": text}).encode(),
-                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {SLACK_TOKEN}"},
-                  method="POST"
-              )
-              with urllib.request.urlopen(req) as r:
-                  return json.loads(r.read())
+          fig, ax = plt.subplots(figsize=(9, 5))
+          fig.patch.set_facecolor("#1a1a2e")
+          ax.set_facecolor("#1a1a2e")
 
-          slack_post("C0APDRMLN1Z", sales_msg)  # #daily-sales
-          print("Sales brief posted.")
+          bars = ax.barh(short_names, acv_vals, color="#4f8ef7", height=0.5)
+          for bar, val in zip(bars, acv_vals):
+              ax.text(bar.get_width() + max_val * 0.01, bar.get_y() + bar.get_height() / 2,
+                      fmt_currency(val), va='center', ha='left', color='white', fontsize=11, fontweight='bold')
+
+          ax.set_xlabel("ACV ($)", color="white", fontsize=11)
+          ax.tick_params(colors="white", labelsize=11)
+          ax.set_xlim(0, max_val * 1.3)
+          for spine in ax.spines.values(): spine.set_edgecolor("#333")
+          plt.title(
+              f"Daily Pipe Update — {date_label}\n{total_deals} new deals created   |   Total ACV: {fmt_currency(total_acv)}",
+              color="white", fontsize=12, fontweight="bold", pad=15)
+          plt.tight_layout()
+          chart_path = "/tmp/daily_pipe_chart.png"
+          plt.savefig(chart_path, facecolor="#1a1a2e", dpi=150)
+          plt.close()
+          print("Chart saved.")
+
+          # ── Build Slack text message ───────────────────────────────
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*Daily Pipe Update — {date_label}*\n"
+          msg += f"*{total_deals} new deal{'s' if total_deals != 1 else ''} created | Total ACV: {fmt_currency(total_acv)}*\n\n"
+
+          for seller in SELLERS:
+              sd = seller_deals[seller]
+              if not sd:
+                  msg += f"*{seller}* — 0 deals\n\n"
+              else:
+                  acv = sum(float(d.get("amount") or 0) for d in sd)
+                  msg += f"*{seller}* — {len(sd)} deal(s) | *ACV: {fmt_currency(acv)}*\n"
+                  for d in sd:
+                      did   = d.get("hs_object_id", "")
+                      name  = d.get("dealname", "Unnamed Deal")
+                      amt   = fmt_currency(d.get("amount"))
+                      icp   = d.get("icp") or "—"
+                      dtype = d.get("dealtype") or "—"
+                      close = fmt_date(d.get("closedate"))
+                      url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-3/{did}"
+                      msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
+                  msg += "\n"
+
+          # ── Upload chart + message to Slack ────────────────────────
+          with open(chart_path, "rb") as f:
+              chart_data = f.read()
+
+          boundary = "----FormBoundary7MA4YWxkTrZu0gW"
+          body = (
+              f"--{boundary}\r\n"
+              f'Content-Disposition: form-data; name="channels"\r\n\r\n'
+              f"{SLACK_CHANNEL}\r\n"
+              f"--{boundary}\r\n"
+              f'Content-Disposition: form-data; name="filename"\r\n\r\n'
+              f"daily_pipe_chart.png\r\n"
+              f"--{boundary}\r\n"
+              f'Content-Disposition: form-data; name="initial_comment"\r\n\r\n'
+              f"{msg}\r\n"
+              f"--{boundary}\r\n"
+              f'Content-Disposition: form-data; name="file"; filename="daily_pipe_chart.png"\r\n'
+              f"Content-Type: image/png\r\n\r\n"
+          ).encode() + chart_data + f"\r\n--{boundary}--\r\n".encode()
+
+          req = urllib.request.Request(
+              "https://slack.com/api/files.upload",
+              data=body,
+              headers={"Authorization": f"Bearer {SLACK_TOKEN}",
+                       "Content-Type": f"multipart/form-data; boundary={boundary}"},
+              method="POST"
+          )
+          with urllib.request.urlopen(req) as r:
+              result = json.loads(r.read())
+              if result.get("ok"):
+                  print("✅ Chart + message posted to Slack!")
+              else:
+                  print(f"⚠️ Upload error: {result.get('error')} — falling back to text only")
+                  req2 = urllib.request.Request(
+                      "https://slack.com/api/chat.postMessage",
+                      data=json.dumps({"channel": SLACK_CHANNEL, "text": msg}).encode(),
+                      headers=SLACK_HEADERS, method="POST")
+                  with urllib.request.urlopen(req2) as r2: r2.read()
+                  print("✅ Text fallback posted.")
           EOF
 
       - name: Post Daily CS Brief
@@ -121,29 +191,25 @@ jobs:
           import urllib.request, json, os, datetime
 
           ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-          SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-          JEREMY = "U08JJMM2QSW"
+          SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+          JEREMY        = "U08JJMM2QSW"
           CHURN_RISK_CHANNEL = "C0A2GPGBPD0"
 
           # Fetch recent #churn-risk messages
           req = urllib.request.Request(
               f"https://slack.com/api/conversations.history?channel={CHURN_RISK_CHANNEL}&limit=30",
-              headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-              method="GET"
-          )
+              headers={"Authorization": f"Bearer {SLACK_TOKEN}"}, method="GET")
           with urllib.request.urlopen(req) as r:
               churn_data = json.loads(r.read())
 
-          messages = churn_data.get("messages", [])
+          messages   = churn_data.get("messages", [])
           churn_text = "\n---\n".join([m.get("text", "")[:800] for m in messages if m.get("text")])[:6000]
 
           # Ask Claude to synthesize
           payload = {
               "model": "claude-sonnet-4-20250514",
               "max_tokens": 1000,
-              "messages": [{
-                  "role": "user",
-                  "content": f"""You are a CS intelligence agent for Rev.com. 
+              "messages": [{"role": "user", "content": f"""You are a CS intelligence agent for Rev.com.
           Analyze these recent #churn-risk Slack alerts and produce a concise daily CS brief in Slack markdown format.
 
           Structure it as:
@@ -155,34 +221,26 @@ jobs:
           Do not add a greeting or sign-off.
 
           #churn-risk data:
-          {churn_text}"""
-              }]
+          {churn_text}"""}]
           }
 
           req = urllib.request.Request(
               "https://api.anthropic.com/v1/messages",
               data=json.dumps(payload).encode(),
-              headers={
-                  "Content-Type": "application/json",
-                  "x-api-key": ANTHROPIC_KEY,
-                  "anthropic-version": "2023-06-01"
-              },
-              method="POST"
-          )
+              headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
+                       "anthropic-version": "2023-06-01"}, method="POST")
           with urllib.request.urlopen(req) as r:
               result = json.loads(r.read())
 
-          summary = result["content"][0]["text"]
-          today_str = datetime.date.today().strftime("%a %b %-d, %Y")
-
-          cs_msg = f":green_heart: *Daily CS Brief — {today_str}*\n━━━━━━━━━━━━━━━━━━━━━━━\n<@{JEREMY}>\n\n{summary}\n\n_Powered by #churn-risk · Health Monitor & Churn Risk Agents_"
+          summary    = result["content"][0]["text"]
+          today_str  = datetime.date.today().strftime("%a %b %-d, %Y")
+          cs_msg     = f":green_heart: *Daily CS Brief — {today_str}*\n━━━━━━━━━━━━━━━━━━━━━━━\n<@{JEREMY}>\n\n{summary}\n\n_Powered by #churn-risk · Health Monitor & Churn Risk Agents_"
 
           req = urllib.request.Request(
               "https://slack.com/api/chat.postMessage",
               data=json.dumps({"channel": "C0APJ5L22BY", "text": cs_msg}).encode(),
               headers={"Content-Type": "application/json", "Authorization": f"Bearer {SLACK_TOKEN}"},
-              method="POST"
-          )
+              method="POST")
           with urllib.request.urlopen(req) as r:
               print("CS brief posted:", json.loads(r.read()).get("ok"))
           EOF
@@ -197,60 +255,45 @@ jobs:
           import urllib.request, json, os, datetime
 
           ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-          HUBSPOT_KEY = os.environ["HUBSPOT_API_KEY"]
-          SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-          JEREMY = "U08JJMM2QSW"
+          HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+          JEREMY        = "U08JJMM2QSW"
 
-          # Fetch pipeline summary from HubSpot
-          def hs_search(payload):
+          def hs_post(payload):
               req = urllib.request.Request(
                   "https://api.hubapi.com/crm/v3/objects/deals/search",
                   data=json.dumps(payload).encode(),
-                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {HUBSPOT_KEY}"},
-                  method="POST"
-              )
-              with urllib.request.urlopen(req) as r:
-                  return json.loads(r.read())
+                  headers={"Content-Type": "application/json",
+                           "Authorization": f"Bearer {HUBSPOT_KEY}"}, method="POST")
+              with urllib.request.urlopen(req) as r: return json.loads(r.read())
 
-          today_ts = int(datetime.datetime.now().timestamp() * 1000)
-          open_deals = hs_search({
+          today_ts   = int(datetime.datetime.now().timestamp() * 1000)
+          open_deals = hs_post({
               "filterGroups": [{"filters": [
                   {"propertyName": "dealstage", "operator": "NEQ", "value": "closedwon"},
                   {"propertyName": "dealstage", "operator": "NEQ", "value": "closedlost"}
-              ]}],
-              "properties": ["dealname", "amount"],
-              "limit": 1
-          })
+              ]}], "properties": ["dealname"], "limit": 1})
           total_open = open_deals.get("total", 0)
 
-          overdue = hs_search({
+          overdue = hs_post({
               "filterGroups": [{"filters": [
                   {"propertyName": "dealstage", "operator": "NEQ", "value": "closedwon"},
                   {"propertyName": "dealstage", "operator": "NEQ", "value": "closedlost"},
                   {"propertyName": "closedate", "operator": "LTE", "value": str(today_ts)}
-              ]}],
-              "properties": ["dealname"],
-              "limit": 1
-          })
+              ]}], "properties": ["dealname"], "limit": 1})
           total_overdue = overdue.get("total", 0)
 
-          # Fetch churn risk channel for context
           req = urllib.request.Request(
               "https://slack.com/api/conversations.history?channel=C0A2GPGBPD0&limit=20",
-              headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-              method="GET"
-          )
+              headers={"Authorization": f"Bearer {SLACK_TOKEN}"}, method="GET")
           with urllib.request.urlopen(req) as r:
               churn_msgs = json.loads(r.read()).get("messages", [])
           churn_snippet = "\n".join([m.get("text","")[:400] for m in churn_msgs[:5]])[:2000]
 
-          # Ask Claude to write the leadership digest
           payload = {
               "model": "claude-sonnet-4-20250514",
               "max_tokens": 800,
-              "messages": [{
-                  "role": "user",
-                  "content": f"""You are a revenue intelligence agent for Rev.com. Write a leadership digest in Slack markdown.
+              "messages": [{"role": "user", "content": f"""You are a revenue intelligence agent for Rev.com. Write a leadership digest in Slack markdown.
 
           Format: Top 5 priorities numbered, each tagged [Sales] or [CS], with a red or yellow circle emoji for urgency.
           Then a 2-line NRR Signal section. Then a Pipeline line.
@@ -259,34 +302,26 @@ jobs:
           Data:
           - Total open deals: {total_open}
           - Open deals past close date: {total_overdue}
-          - Recent #churn-risk signals: {churn_snippet}"""
-              }]
+          - Recent #churn-risk signals: {churn_snippet}"""}]
           }
 
           req = urllib.request.Request(
               "https://api.anthropic.com/v1/messages",
               data=json.dumps(payload).encode(),
-              headers={
-                  "Content-Type": "application/json",
-                  "x-api-key": ANTHROPIC_KEY,
-                  "anthropic-version": "2023-06-01"
-              },
-              method="POST"
-          )
+              headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
+                       "anthropic-version": "2023-06-01"}, method="POST")
           with urllib.request.urlopen(req) as r:
               result = json.loads(r.read())
 
-          digest = result["content"][0]["text"]
+          digest    = result["content"][0]["text"]
           today_str = datetime.date.today().strftime("%a %b %-d, %Y")
-
-          msg = f":rocket: *Leadership Digest — {today_str}*\n━━━━━━━━━━━━━━━━━━━━━━━\n<@{JEREMY}>\n\n{digest}\n\n_Powered by HubSpot + #churn-risk · All 6 agents_"
+          msg       = f":rocket: *Leadership Digest — {today_str}*\n━━━━━━━━━━━━━━━━━━━━━━━\n<@{JEREMY}>\n\n{digest}\n\n_Powered by HubSpot + #churn-risk · All agents_"
 
           req = urllib.request.Request(
               "https://slack.com/api/chat.postMessage",
               data=json.dumps({"channel": "C0APDRPC96X", "text": msg}).encode(),
               headers={"Content-Type": "application/json", "Authorization": f"Bearer {SLACK_TOKEN}"},
-              method="POST"
-          )
+              method="POST")
           with urllib.request.urlopen(req) as r:
               print("Leadership digest posted:", json.loads(r.read()).get("ok"))
           EOF

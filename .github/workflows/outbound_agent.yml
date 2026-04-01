@@ -208,7 +208,8 @@ jobs:
           Return ONLY the JSON array starting with [ and ending with ]. No other text."""
 
               text = claude(prompt, max_tokens=2000, use_search=True)
-              print(f"    Raw response preview: {text[:200]}")
+              print(f"    Raw response (first 500 chars): {text[:500]}")
+              print(f"    Raw response (last 200 chars): {text[-200:]}")
 
               # Try multiple parsing strategies
               # Strategy 1: Direct parse
@@ -521,8 +522,22 @@ jobs:
                   time.sleep(2)
 
               # ── Check if county is exhausted ──────────────────────
-              total_found_today = len(added) + skipped
-              if not found_any and total_found_today == 0:
+              # ONLY mark exhausted if we successfully parsed leads
+              # but genuinely found none after multiple searches
+              if found_any == False and total_found_today == 0:
+                  # Don't mark exhausted — parsing may have failed
+                  # Just keep the county for next run
+                  print(f"  ℹ️ No leads parsed for {county} — keeping county for next run")
+              elif len(added) + skipped < MIN_LEADS_THRESH and found_any:
+                  print(f"  ⚠️ {county} truly exhausted — moving to next county")
+                  state[ae_name]["exhausted"].append(county)
+                  next_county = next_county_for_ae(ae_name, state)
+                  if next_county:
+                      state[ae_name]["county"] = next_county
+                      print(f"  ➡️ Next county for {ae_name}: {next_county}")
+                  else:
+                      print(f"  🚨 All counties exhausted for {ae_name}!")
+                      state[ae_name]["county"] = None
                   print(f"  ⚠️ {county} exhausted — moving to next county")
                   state[ae_name]["exhausted"].append(county)
                   next_county = next_county_for_ae(ae_name, state)

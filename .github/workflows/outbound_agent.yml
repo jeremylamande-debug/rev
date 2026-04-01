@@ -356,20 +356,16 @@ jobs:
                   "state":            "California",
                   "city":             f"{contact['county']} County",
                   "hs_lead_status":   "NEW",
-                  "leadsource":       "Claude",
-                  "icp":              "Law",
-                  "county":           contact.get("county", ""),
-                  "department":       dept,
-                  "hs_buying_role":   buying_role,
+                  "leadsource":       "OTHER",  # Safe fallback
               }
-              if owner_map.get(ae_name):      props["hubspot_owner_id"] = owner_map[ae_name]
-              if contact.get("email"):        props["email"]            = contact["email"]
-              if contact.get("phone"):        props["phone"]            = contact["phone"]
-              if contact.get("website"):      props["website"]          = contact["website"]
-              if contact.get("address"):      props["address"]          = contact["address"]
+              if owner_map.get(ae_name):  props["hubspot_owner_id"] = owner_map[ae_name]
+              if contact.get("email"):    props["email"]   = contact["email"]
+              if contact.get("phone"):    props["phone"]   = contact["phone"]
+              if contact.get("website"):  props["website"] = contact["website"]
 
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
+              print(f"    Contact API response: {json.dumps(resp)[:300]}")
               if not contact_id:
                   print(f"    ❌ Contact creation failed: {resp}")
                   return None

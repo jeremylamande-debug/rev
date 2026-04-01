@@ -53,6 +53,12 @@ jobs:
 
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
 
+          MEETING_LINKS = {
+              "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
+              "Will Weis":      "https://meetings.hubspot.com/will-weis",
+              "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
+          }
+
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
               r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
@@ -181,7 +187,8 @@ jobs:
           Target titles: {', '.join(titles)}
           Search official .gov websites, LinkedIn, and public records.
           Return a JSON array of up to 5 real contacts with fields:
-          first_name, last_name, title, organization, county, org_type, website, email
+          first_name, last_name, title, organization, county, org_type,
+          website, email, phone, address
           Only real verifiable people. Return [] if none found.
           Return ONLY valid JSON array."""
               text = claude(prompt, max_tokens=1500, use_search=True)
@@ -205,46 +212,186 @@ jobs:
               return r.get("total", 0) > 0
 
           # ── Generate email + subject ──────────────────────────────
-          def gen_email(contact):
-              return claude(f"""Write a cold outreach email from Rev.ai to {contact['title']} {contact['first_name']} {contact['last_name']}
-          at {contact['organization']} in {contact['county']} County, CA.
-          Rev.ai offers AI transcription for: court proceedings, interrogations, body cam footage, 911 calls.
-          - Professional but warm tone, 150-200 words
-          - Reference their specific role and org type ({contact['org_type']})
-          - Highlight 1-2 relevant use cases
-          - CTA: 15-minute demo call
-          - Sign off: "The Rev.ai Team"
+          # ── Persona angle by org type ─────────────────────────────
+          PERSONA_ANGLES = {
+              "Sheriff": {
+                  "pain":    "managing body cam footage and interrogation recordings manually",
+                  "use_case": "body cam transcription and interrogation documentation",
+                  "proof":   "departments using Rev.ai cut documentation time by 60%"
+              },
+              "District Attorney": {
+                  "pain":    "preparing court proceedings and managing evidence documentation",
+                  "use_case": "court proceeding transcription and evidence documentation",
+                  "proof":   "DA offices using Rev.ai reduce case prep time significantly"
+              },
+              "Public Defender": {
+                  "pain":    "transcribing client interviews and case preparation recordings",
+                  "use_case": "client interview transcription and case prep documentation",
+                  "proof":   "public defender offices using Rev.ai improve case turnaround"
+              },
+              "Police Department": {
+                  "pain":    "manually processing 911 calls and incident report recordings",
+                  "use_case": "911 call transcription and incident report automation",
+                  "proof":   "police departments using Rev.ai process calls 3x faster"
+              },
+          }
+
+          # ── Generate all 4 emails per contact ────────────────────
+          def gen_email_sequence(contact, ae_name):
+              meeting_link = MEETING_LINKS[ae_name]
+              ae_first     = ae_name.split()[0]
+              org_type     = contact.get("org_type", "Sheriff")
+              angles       = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
+              name         = f"{contact['title']} {contact['last_name']}"
+              org          = contact["organization"]
+              county       = contact["county"]
+
+              emails = {}
+
+              # Email 1 — Cold intro
+              emails["email_1"] = claude(f"""Write a cold outreach Email 1 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
+
+          Their pain point: {angles['pain']}
+          Use case to highlight: {angles['use_case']}
+          Meeting link: {meeting_link}
+
+          Rules:
+          - Professional but warm, 150-200 words
+          - Open with something specific to their role as {contact['title']}
+          - Highlight the use case above
+          - CTA: Book a 15-min demo at {meeting_link}
+          - Sign off: "{ae_first} from Rev.ai"
           - No "I hope this finds you well", no pricing
           Return ONLY the email body.""", max_tokens=400)
 
-          def gen_subject(contact):
-              return claude(f"""Cold email subject line for {contact['title']} at {contact['organization']}
-          about Rev.ai AI transcription for law enforcement. Under 10 words. Professional, curiosity-driving.
-          Return ONLY the subject line.""", max_tokens=50)
+              time.sleep(1)
+
+              # Email 2 — Follow up Day 3
+              emails["email_2"] = claude(f"""Write a follow-up Email 2 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
+          They didn't respond to the first email about {angles['use_case']}.
+
+          Rules:
+          - Professional but warm, 100-150 words
+          - Different angle — lead with a specific result: {angles['proof']}
+          - Ask if this is a priority for them right now
+          - CTA: Book a 15-min demo at {meeting_link}
+          - Sign off: "{ae_first} from Rev.ai"
+          - No "just following up", no pricing
+          Return ONLY the email body.""", max_tokens=350)
+
+              time.sleep(1)
+
+              # Email 3 — Value add Day 7
+              emails["email_3"] = claude(f"""Write a value-add Email 3 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
+          They haven't responded to 2 emails about {angles['use_case']}.
+
+          Rules:
+          - Professional but warm, 100-150 words
+          - Lead with a specific insight or stat about AI transcription in law enforcement
+          - Make it feel like a helpful resource, not a sales pitch
+          - CTA: "Would a quick 15-min call be worth your time?" + {meeting_link}
+          - Sign off: "{ae_first} from Rev.ai"
+          Return ONLY the email body.""", max_tokens=350)
+
+              time.sleep(1)
+
+              # Email 4 — Break up Day 14
+              emails["email_4"] = claude(f"""Write a break-up Email 4 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
+          This is the final email in the sequence about {angles['use_case']}.
+
+          Rules:
+          - Professional but warm, 75-100 words
+          - Acknowledge they're busy, no hard feelings
+          - Leave the door open — "if timing changes"
+          - One last soft CTA: {meeting_link}
+          - Sign off: "{ae_first} from Rev.ai"
+          - Warm, human, not passive aggressive
+          Return ONLY the email body.""", max_tokens=250)
+
+              return emails
+
+          def gen_subject(contact, email_num=1):
+              org_type = contact.get("org_type", "Sheriff")
+              angles   = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
+              prompts  = {
+                  1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev.ai {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
+                  2: f"Follow-up subject line for {contact['title']} at {contact['organization']} — 2nd email about {angles['use_case']}. Under 8 words. Not 'Following up'.",
+                  3: f"Value-add subject line for {contact['title']} at {contact['organization']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
+                  4: f"Break-up email subject for {contact['title']} at {contact['organization']} — final email. Under 8 words. Warm, closing tone.",
+              }
+              return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
+
+          # ── Buying role mapping by title ──────────────────────────
+          def get_buying_role(title):
+              t = title.lower()
+              if any(x in t for x in ["sheriff", "district attorney", "chief of police",
+                                       "public defender", "chief deputy"]):
+                  return "DECISION_MAKER"
+              if any(x in t for x in ["commander", "captain", "lieutenant"]):
+                  return "INFLUENCER"
+              if any(x in t for x in ["investigator", "detective", "analyst"]):
+                  return "END_USER"
+              if any(x in t for x in ["budget", "finance", "admin"]):
+                  return "BUDGET_HOLDER"
+              if any(x in t for x in ["legal", "compliance"]):
+                  return "LEGAL_AND_COMPLIANCE"
+              return "BUDGET_HOLDER"
+
+          # ── Dept mapping by org type ──────────────────────────────
+          DEPT_MAP = {
+              "Sheriff":           "Sheriff Dept",
+              "District Attorney": "DA Office",
+              "Public Defender":   "Public Defender",
+              "Police Department": "Police Dept",
+          }
 
           # ── Create HubSpot contact ────────────────────────────────
           def create_contact(contact, email_body, subject, ae_name):
+              buying_role = get_buying_role(contact.get("title", ""))
+              dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
+
               props = {
-                  "firstname":      contact["first_name"],
-                  "lastname":       contact["last_name"],
-                  "jobtitle":       contact["title"],
-                  "company":        contact["organization"],
-                  "state":          "California",
-                  "city":           f"{contact['county']} County",
-                  "hs_lead_status": "NEW",
-                  "icp":            "Law",
+                  # Standard HubSpot fields
+                  "firstname":        contact["first_name"],
+                  "lastname":         contact["last_name"],
+                  "jobtitle":         contact["title"],
+                  "company":          contact["organization"],
+                  "state":            "California",
+                  "city":             f"{contact['county']} County",
+                  "hs_lead_status":   "NEW",
+                  "leadsource":       "Claude",
+                  "icp":              "Law",
+
+                  # ⚠️ Verify these custom property internal names in HubSpot
+                  "county":           contact.get("county", ""),       # County (single text)
+                  "department":       dept,                             # Dept
+                  "role__c":          contact.get("title", ""),         # Role
+                  "hs_buying_role":   buying_role,                      # Buying Role
               }
-              if owner_map.get(ae_name): props["hubspot_owner_id"] = owner_map[ae_name]
-              if contact.get("email"):   props["email"]   = contact["email"]
-              if contact.get("website"): props["website"] = contact["website"]
+
+              if owner_map.get(ae_name):      props["hubspot_owner_id"] = owner_map[ae_name]
+              if contact.get("email"):        props["email"]            = contact["email"]
+              if contact.get("phone"):        props["phone"]            = contact["phone"]
+              if contact.get("website"):      props["website"]          = contact["website"]
+              if contact.get("address"):      props["address"]          = contact["address"]
 
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
 
               if contact_id:
+                  # Save outbound email as note
+                  note = (
+                      f"OUTBOUND EMAIL\n"
+                      f"Subject: {subject}\n"
+                      f"County: {contact.get('county','')}\n"
+                      f"Dept: {dept}\n"
+                      f"Buying Role: {buying_role}\n"
+                      f"Lead Source: Claude\n\n"
+                      f"{email_body}"
+                  )
                   hs_post("/crm/v3/objects/notes", {
                       "properties": {
-                          "hs_note_body": f"OUTBOUND EMAIL\nSubject: {subject}\n\n{email_body}",
+                          "hs_note_body": note,
                           "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000))
                       },
                       "associations": [{"to": {"id": contact_id},
@@ -281,8 +428,25 @@ jobs:
                               skipped += 1
                               print(f"    ↩ Duplicate: {fn} {ln}")
                               continue
-                          email_body = gen_email(lead)
-                          subject    = gen_subject(lead)
+                          # Generate all 4 emails
+                          emails   = gen_email_sequence(lead, ae_name)
+                          subject1 = gen_subject(lead, 1)
+                          subject2 = gen_subject(lead, 2)
+                          subject3 = gen_subject(lead, 3)
+                          subject4 = gen_subject(lead, 4)
+
+                          # Build combined note with all 4 emails
+                          email_body = (
+                              f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
+                              f"Subject: {subject1}\n\n{emails['email_1']}\n\n"
+                              f"━━━ EMAIL 2 — Day 3 (Follow Up) ━━━\n"
+                              f"Subject: {subject2}\n\n{emails['email_2']}\n\n"
+                              f"━━━ EMAIL 3 — Day 7 (Value Add) ━━━\n"
+                              f"Subject: {subject3}\n\n{emails['email_3']}\n\n"
+                              f"━━━ EMAIL 4 — Day 14 (Break Up) ━━━\n"
+                              f"Subject: {subject4}\n\n{emails['email_4']}"
+                          )
+                          subject = subject1  # Use Email 1 subject as primary
                           contact_id = create_contact(lead, email_body, subject, ae_name)
                           if contact_id:
                               added.append({

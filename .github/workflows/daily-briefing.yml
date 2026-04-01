@@ -2,7 +2,7 @@ name: Daily Revenue Briefing
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'  # 8:00 AM ET (UTC-5), Mon–Fri
+    - cron: '0 13 * * 1-5'  # 8:00 AM ET, Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -15,11 +15,9 @@ jobs:
           HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
-          pip install matplotlib pytz --quiet
+          pip install pytz --quiet
           python3 - <<'EOF'
-          import urllib.request, urllib.parse, json, os, datetime, pytz, matplotlib
-          matplotlib.use('Agg')
-          import matplotlib.pyplot as plt
+          import urllib.request, urllib.parse, json, os, datetime, pytz
 
           HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
@@ -91,32 +89,9 @@ jobs:
           total_deals = sum(len(v) for v in seller_deals.values())
           total_acv   = sum(float(d.get("amount") or 0) for v in seller_deals.values() for d in v)
 
-          # ── Generate bar chart ─────────────────────────────────────
+          # ── ACV values per seller for chart ───────────────────────
           acv_vals    = [sum(float(d.get("amount") or 0) for d in seller_deals[s]) for s in SELLERS]
           short_names = [s.split()[0] for s in SELLERS]
-          max_val     = max(acv_vals) if max(acv_vals) > 0 else 1000
-
-          fig, ax = plt.subplots(figsize=(9, 5))
-          fig.patch.set_facecolor("#1a1a2e")
-          ax.set_facecolor("#1a1a2e")
-
-          bars = ax.barh(short_names, acv_vals, color="#4f8ef7", height=0.5)
-          for bar, val in zip(bars, acv_vals):
-              ax.text(bar.get_width() + max_val * 0.01, bar.get_y() + bar.get_height() / 2,
-                      fmt_currency(val), va='center', ha='left', color='white', fontsize=11, fontweight='bold')
-
-          ax.set_xlabel("ACV ($)", color="white", fontsize=11)
-          ax.tick_params(colors="white", labelsize=11)
-          ax.set_xlim(0, max_val * 1.3)
-          for spine in ax.spines.values(): spine.set_edgecolor("#333")
-          plt.title(
-              f"Daily Pipe Update — {date_label}\n{total_deals} new deals created   |   Total ACV: {fmt_currency(total_acv)}",
-              color="white", fontsize=12, fontweight="bold", pad=15)
-          plt.tight_layout()
-          chart_path = "/tmp/daily_pipe_chart.png"
-          plt.savefig(chart_path, facecolor="#1a1a2e", dpi=150)
-          plt.close()
-          print("Chart saved.")
 
           # ── Build Slack text message ───────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"
@@ -141,40 +116,22 @@ jobs:
                       msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
                   msg += "\n"
 
-          # ── Upload chart to 0x0.st (no API key needed) ────────────
-          with open(chart_path, "rb") as f:
-              chart_data = f.read()
+          # ── Build ASCII bar chart for Slack ───────────────────────
+          max_bar = 20  # max bar width in chars
+          max_acv = max(acv_vals) if max(acv_vals) > 0 else 1
+          chart_lines = ["```"]
+          chart_lines.append(f"{'Rep':<12} {'ACV':>10}  Chart")
+          chart_lines.append("─" * 45)
+          for name, val in zip(short_names, acv_vals):
+              bar_len = int((val / max_acv) * max_bar)
+              bar     = "█" * bar_len
+              chart_lines.append(f"{name:<12} {fmt_currency(val):>10}  {bar}")
+          chart_lines.append("```")
+          chart_str = "\n".join(chart_lines)
 
-          boundary = "----Boundary"
-          body = (
-              f"--{boundary}\r\n"
-              f'Content-Disposition: form-data; name="file"; filename="chart.png"\r\n'
-              f"Content-Type: image/png\r\n\r\n"
-          ).encode() + chart_data + f"\r\n--{boundary}--\r\n".encode()
-
-          upload_req = urllib.request.Request(
-              "https://0x0.st",
-              data=body,
-              headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-              method="POST"
-          )
-          try:
-              with urllib.request.urlopen(upload_req, timeout=30) as r:
-                  img_url = r.read().decode("utf-8").strip()
-              print(f"Image URL: {img_url}")
-          except Exception as e:
-              print(f"Upload error: {e}")
-              img_url = ""
-
-          # ── Post text + image as Slack blocks ─────────────────────
-          if img_url:
-              blocks = [
-                  {"type": "section", "text": {"type": "mrkdwn", "text": msg}},
-                  {"type": "image", "image_url": img_url, "alt_text": "Daily Pipe Chart"}
-              ]
-              payload = {"channel": SLACK_CHANNEL, "blocks": blocks, "text": msg}
-          else:
-              payload = {"channel": SLACK_CHANNEL, "text": msg}
+          # ── Post message + chart ───────────────────────────────────
+          full_msg = msg + "\n" + chart_str
+          payload  = {"channel": SLACK_CHANNEL, "text": full_msg}
 
           req = urllib.request.Request(
               "https://slack.com/api/chat.postMessage",

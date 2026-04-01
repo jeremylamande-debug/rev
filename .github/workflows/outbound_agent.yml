@@ -139,30 +139,29 @@ jobs:
           # ── Get or create dynamic HubSpot list per AE ─────────────
           def get_or_create_list(ae_name):
               list_name = f"Outbound — {ae_name}"
-              resp = requests.get(
-                  "https://api.hubapi.com/contacts/v1/lists?count=250",
-                  headers=HS_HEADERS)
-              for lst in resp.json().get("lists", []):
-                  if lst.get("name") == list_name:
-                      return lst["listId"]
-              # Create dynamic list
-              resp = requests.post(
-                  "https://api.hubapi.com/contacts/v1/lists",
-                  headers=HS_HEADERS,
-                  json={
-                      "name": list_name,
-                      "dynamic": True,
-                      "filters": [[{
-                          "operator": "EQ",
-                          "property": "hubspot_owner_id",
-                          "value": str(owner_map.get(ae_name, ""))
-                      }, {
-                          "operator": "EQ",
-                          "property": "hs_lead_status",
-                          "value": "NEW"
-                      }]]
-                  })
-              return resp.json().get("listId")
+              try:
+                  resp = requests.get(
+                      "https://api.hubapi.com/contacts/v1/lists?count=250",
+                      headers=HS_HEADERS)
+                  for lst in resp.json().get("lists", []):
+                      if lst.get("name") == list_name:
+                          print(f"Found existing list: {list_name} → {lst['listId']}")
+                          return lst["listId"]
+              except Exception as e:
+                  print(f"List search error: {e}")
+
+              # Create static list (more reliable than dynamic)
+              try:
+                  resp = requests.post(
+                      "https://api.hubapi.com/contacts/v1/lists",
+                      headers=HS_HEADERS,
+                      json={"name": list_name, "dynamic": False})
+                  list_id = resp.json().get("listId")
+                  print(f"Created list: {list_name} → {list_id}")
+                  return list_id
+              except Exception as e:
+                  print(f"List creation error: {e}")
+                  return None
 
           list_ids = {ae: get_or_create_list(ae) for ae in AES}
           print(f"HubSpot lists: {list_ids}")
@@ -183,18 +182,76 @@ jobs:
 
           # ── Find leads ────────────────────────────────────────────
           def find_leads(county, org_type, titles):
-              prompt = f"""You are a lead researcher. Find real decision makers at the {org_type} in {county} County, California.
-          Target titles: {', '.join(titles)}
-          Search official .gov websites, LinkedIn, and public records.
-          Return a JSON array of up to 5 real contacts with fields:
-          first_name, last_name, title, organization, county, org_type,
-          website, email, phone, address
-          Only real verifiable people. Return [] if none found.
-          Return ONLY valid JSON array."""
-              text = claude(prompt, max_tokens=1500, use_search=True)
+              prompt = f"""Search for real decision makers at the {org_type} in {county} County, California.
+          Find people with these titles: {', '.join(titles)}
+          Look at official government websites and public records.
+
+          Return a JSON array. Each item must have these exact keys:
+          first_name, last_name, title, organization, county, org_type, website, email, phone, address
+
+          Example format:
+          [
+            {{
+              "first_name": "John",
+              "last_name": "Smith",
+              "title": "Sheriff",
+              "organization": "{county} County Sheriff's Office",
+              "county": "{county}",
+              "org_type": "{org_type}",
+              "website": "https://sheriff.{county.lower().replace(' ','')}county.gov",
+              "email": "",
+              "phone": "",
+              "address": ""
+            }}
+          ]
+
+          Return ONLY the JSON array starting with [ and ending with ]. No other text."""
+
+              text = claude(prompt, max_tokens=2000, use_search=True)
+              print(f"    Raw response preview: {text[:200]}")
+
+              # Try multiple parsing strategies
+              # Strategy 1: Direct parse
               try:
-                  return json.loads(text.replace("```json","").replace("```","").strip())
-              except: return []
+                  cleaned = text.strip()
+                  if cleaned.startswith("["):
+                      return json.loads(cleaned)
+              except: pass
+
+              # Strategy 2: Extract JSON array
+              try:
+                  start = text.find("[")
+                  end   = text.rfind("]") + 1
+                  if start != -1 and end > start:
+                      return json.loads(text[start:end])
+              except: pass
+
+              # Strategy 3: Strip markdown
+              try:
+                  cleaned = text.replace("```json","").replace("```","").strip()
+                  start = cleaned.find("[")
+                  end   = cleaned.rfind("]") + 1
+                  if start != -1 and end > start:
+                      return json.loads(cleaned[start:end])
+              except: pass
+
+              # Strategy 4: Ask Claude to fix it
+              try:
+                  fix_prompt = f"""Convert this text into a valid JSON array of contacts.
+          Extract any person names, titles, organizations mentioned.
+          Text: {text[:1000]}
+          Return ONLY a valid JSON array starting with ["""
+                  fixed = claude(fix_prompt, max_tokens=1000)
+                  start = fixed.find("[")
+                  end   = fixed.rfind("]") + 1
+                  if start != -1 and end > start:
+                      result = json.loads(fixed[start:end])
+                      print(f"    Fixed JSON — found {len(result)} leads")
+                      return result
+              except: pass
+
+              print(f"    ⚠️ Could not parse leads for {org_type} in {county}")
+              return []
 
           # ── Duplicate check ───────────────────────────────────────
           def is_duplicate(email, first_name, last_name):
@@ -449,6 +506,7 @@ jobs:
                           subject = subject1  # Use Email 1 subject as primary
                           contact_id = create_contact(lead, email_body, subject, ae_name)
                           if contact_id:
+                              add_to_list(list_ids[ae_name], contact_id)
                               added.append({
                                   "name":    f"{fn} {ln}",
                                   "title":   lead.get("title",""),

@@ -17,7 +17,7 @@ jobs:
         run: |
           pip install matplotlib pytz --quiet
           python3 - <<'EOF'
-          import urllib.request, urllib.parse, json, os, datetime, pytz, matplotlib, base64
+          import urllib.request, urllib.parse, json, os, datetime, pytz, matplotlib
           matplotlib.use('Agg')
           import matplotlib.pyplot as plt
 
@@ -141,23 +141,30 @@ jobs:
                       msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
                   msg += "\n"
 
-          # ── Upload chart to imgbb (free image host) ───────────────
-          import base64
+          # ── Upload chart to 0x0.st (no API key needed) ───────────
           with open(chart_path, "rb") as f:
-              img_b64 = base64.b64encode(f.read()).decode("utf-8")
+              chart_data = f.read()
 
-          # Upload to imgbb
-          imgbb_resp = urllib.request.urlopen(urllib.request.Request(
-              "https://api.imgbb.com/1/upload?expiration=86400&key=public",
-              data=urllib.parse.urlencode({
-                  "image": img_b64,
-                  "name": "daily_pipe_chart"
-              }).encode(),
+          boundary = "----Boundary"
+          body = (
+              f"--{boundary}\r\n"
+              f'Content-Disposition: form-data; name="file"; filename="chart.png"\r\n'
+              f"Content-Type: image/png\r\n\r\n"
+          ).encode() + chart_data + f"\r\n--{boundary}--\r\n".encode()
+
+          upload_req = urllib.request.Request(
+              "https://0x0.st",
+              data=body,
+              headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
               method="POST"
-          ))
-          imgbb_data = json.loads(imgbb_resp.read())
-          img_url = imgbb_data.get("data", {}).get("url", "")
-          print(f"Image URL: {img_url}")
+          )
+          try:
+              with urllib.request.urlopen(upload_req, timeout=30) as r:
+                  img_url = r.read().decode("utf-8").strip()
+              print(f"Image URL: {img_url}")
+          except Exception as e:
+              print(f"Upload error: {e}")
+              img_url = ""
 
           # ── Post text + image as Slack blocks ─────────────────────
           if img_url:

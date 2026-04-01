@@ -1,0 +1,360 @@
+name: Daily Outbound Agent — CA Law Enforcement
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'  # 9:00 AM ET, Mon–Fri
+  workflow_dispatch:
+
+jobs:
+  run-outbound-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run Outbound Agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HUBSPOT_API_KEY:   ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          pip install requests pytz --quiet
+          python3 - <<'EOF'
+          import requests, json, os, time, datetime
+
+          ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          SLACK_USER       = "U08JJMM2QSW"
+          PORTAL_ID        = "21451281"
+          LEADS_PER_AE     = 50   # 50 per AE = 100 total/day
+          MIN_LEADS_THRESH = 3    # if < 3 found, mark county exhausted
+
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+          ANTH_HEADERS  = {
+              "Content-Type": "application/json",
+              "x-api-key": ANTHROPIC_KEY,
+              "anthropic-version": "2023-06-01"
+          }
+
+          # ── Tier 2/3 CA Counties (100k–800k population) ───────────
+          TIER_COUNTIES = [
+              "Stanislaus", "Sonoma", "Tulare", "Santa Barbara", "Solano",
+              "Monterey", "San Luis Obispo", "Santa Cruz", "Merced", "Butte",
+              "Yolo", "El Dorado", "Imperial", "Kings", "Madera",
+              "Napa", "Placer", "Shasta", "Nevada", "Sutter"
+          ]
+
+          ORG_TYPES = [
+              {"type": "Sheriff",           "titles": ["Sheriff", "Chief Deputy Sheriff", "Commander", "Captain"]},
+              {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Chief Investigator"]},
+              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Deputy Public Defender"]},
+              {"type": "Police Department", "titles": ["Chief of Police", "Deputy Chief", "Commander"]},
+          ]
+
+          AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
+
+          # ── HubSpot helpers ───────────────────────────────────────
+          def hs_get(path):
+              r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
+              return r.json()
+
+          def hs_post(path, payload):
+              r = requests.post(f"https://api.hubapi.com{path}",
+                  headers=HS_HEADERS, json=payload)
+              return r.json()
+
+          # ── Get owner map ─────────────────────────────────────────
+          owners    = hs_get("/crm/v3/owners").get("results", [])
+          owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+
+          # ── State management via HubSpot notes ───────────────────
+          # We store agent state as a special note so it persists across runs
+          STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
+
+          def load_state():
+              """Load persisted state from HubSpot notes."""
+              try:
+                  resp = hs_post("/crm/v3/objects/notes/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "hs_note_body",
+                           "operator": "CONTAINS_TOKEN",
+                           "value": STATE_MARKER}
+                      ]}],
+                      "properties": ["hs_note_body", "hs_timestamp"],
+                      "sorts": [{"propertyName": "hs_timestamp", "direction": "DESCENDING"}],
+                      "limit": 1
+                  })
+                  results = resp.get("results", [])
+                  if results:
+                      body = results[0]["properties"]["hs_note_body"]
+                      json_str = body.split(STATE_MARKER)[1].strip()
+                      return json.loads(json_str)
+              except Exception as e:
+                  print(f"State load error: {e}")
+              return None
+
+          def save_state(state):
+              """Save state as a HubSpot note."""
+              try:
+                  hs_post("/crm/v3/objects/notes", {
+                      "properties": {
+                          "hs_note_body": f"{STATE_MARKER}\n{json.dumps(state)}",
+                          "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000))
+                      }
+                  })
+              except Exception as e:
+                  print(f"State save error: {e}")
+
+          def init_state():
+              """Create fresh state — assign first 3 different counties to AEs."""
+              return {
+                  "Dillon DeWitt":  {"county": TIER_COUNTIES[0], "exhausted": []},
+                  "Will Weis":      {"county": TIER_COUNTIES[1], "exhausted": []},
+                  "James Gregory":  {"county": TIER_COUNTIES[2], "exhausted": []},
+              }
+
+          def next_county_for_ae(ae_name, state):
+              """Pick next available county not assigned to ANY other AE and not exhausted."""
+              other_counties = [state[a]["county"] for a in AES if a != ae_name and state[a]["county"]]
+              exhausted      = state[ae_name]["exhausted"]
+              for county in TIER_COUNTIES:
+                  if county not in exhausted and county not in other_counties:
+                      return county
+              return None  # All counties exhausted
+
+          # ── Load or init state ────────────────────────────────────
+          state = load_state()
+          if not state:
+              print("No state found — initializing fresh state")
+              state = init_state()
+          else:
+              print(f"Loaded state: {json.dumps(state, indent=2)}")
+
+          # ── Get or create dynamic HubSpot list per AE ─────────────
+          def get_or_create_list(ae_name):
+              list_name = f"Outbound — {ae_name}"
+              resp = requests.get(
+                  "https://api.hubapi.com/contacts/v1/lists?count=250",
+                  headers=HS_HEADERS)
+              for lst in resp.json().get("lists", []):
+                  if lst.get("name") == list_name:
+                      return lst["listId"]
+              # Create dynamic list
+              resp = requests.post(
+                  "https://api.hubapi.com/contacts/v1/lists",
+                  headers=HS_HEADERS,
+                  json={
+                      "name": list_name,
+                      "dynamic": True,
+                      "filters": [[{
+                          "operator": "EQ",
+                          "property": "hubspot_owner_id",
+                          "value": str(owner_map.get(ae_name, ""))
+                      }, {
+                          "operator": "EQ",
+                          "property": "hs_lead_status",
+                          "value": "NEW"
+                      }]]
+                  })
+              return resp.json().get("listId")
+
+          list_ids = {ae: get_or_create_list(ae) for ae in AES}
+          print(f"HubSpot lists: {list_ids}")
+
+          # ── Claude helper ─────────────────────────────────────────
+          def claude(prompt, max_tokens=1000, use_search=False):
+              body = {
+                  "model": "claude-sonnet-4-20250514",
+                  "max_tokens": max_tokens,
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+              if use_search:
+                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+              resp = requests.post("https://api.anthropic.com/v1/messages",
+                  headers=ANTH_HEADERS, json=body)
+              data = resp.json()
+              return "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text").strip()
+
+          # ── Find leads ────────────────────────────────────────────
+          def find_leads(county, org_type, titles):
+              prompt = f"""You are a lead researcher. Find real decision makers at the {org_type} in {county} County, California.
+          Target titles: {', '.join(titles)}
+          Search official .gov websites, LinkedIn, and public records.
+          Return a JSON array of up to 5 real contacts with fields:
+          first_name, last_name, title, organization, county, org_type, website, email
+          Only real verifiable people. Return [] if none found.
+          Return ONLY valid JSON array."""
+              text = claude(prompt, max_tokens=1500, use_search=True)
+              try:
+                  return json.loads(text.replace("```json","").replace("```","").strip())
+              except: return []
+
+          # ── Duplicate check ───────────────────────────────────────
+          def is_duplicate(email, first_name, last_name):
+              if email:
+                  r = hs_post("/crm/v3/objects/contacts/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "email", "operator": "EQ", "value": email}
+                      ]}], "limit": 1})
+                  if r.get("total", 0) > 0: return True
+              r = hs_post("/crm/v3/objects/contacts/search", {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "firstname", "operator": "EQ", "value": first_name},
+                      {"propertyName": "lastname",  "operator": "EQ", "value": last_name}
+                  ]}], "limit": 1})
+              return r.get("total", 0) > 0
+
+          # ── Generate email + subject ──────────────────────────────
+          def gen_email(contact):
+              return claude(f"""Write a cold outreach email from Rev.ai to {contact['title']} {contact['first_name']} {contact['last_name']}
+          at {contact['organization']} in {contact['county']} County, CA.
+          Rev.ai offers AI transcription for: court proceedings, interrogations, body cam footage, 911 calls.
+          - Professional but warm tone, 150-200 words
+          - Reference their specific role and org type ({contact['org_type']})
+          - Highlight 1-2 relevant use cases
+          - CTA: 15-minute demo call
+          - Sign off: "The Rev.ai Team"
+          - No "I hope this finds you well", no pricing
+          Return ONLY the email body.""", max_tokens=400)
+
+          def gen_subject(contact):
+              return claude(f"""Cold email subject line for {contact['title']} at {contact['organization']}
+          about Rev.ai AI transcription for law enforcement. Under 10 words. Professional, curiosity-driving.
+          Return ONLY the subject line.""", max_tokens=50)
+
+          # ── Create HubSpot contact ────────────────────────────────
+          def create_contact(contact, email_body, subject, ae_name):
+              props = {
+                  "firstname":      contact["first_name"],
+                  "lastname":       contact["last_name"],
+                  "jobtitle":       contact["title"],
+                  "company":        contact["organization"],
+                  "state":          "California",
+                  "city":           f"{contact['county']} County",
+                  "hs_lead_status": "NEW",
+                  "icp":            "Law",
+              }
+              if owner_map.get(ae_name): props["hubspot_owner_id"] = owner_map[ae_name]
+              if contact.get("email"):   props["email"]   = contact["email"]
+              if contact.get("website"): props["website"] = contact["website"]
+
+              resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
+              contact_id = resp.get("id")
+
+              if contact_id:
+                  hs_post("/crm/v3/objects/notes", {
+                      "properties": {
+                          "hs_note_body": f"OUTBOUND EMAIL\nSubject: {subject}\n\n{email_body}",
+                          "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000))
+                      },
+                      "associations": [{"to": {"id": contact_id},
+                          "types": [{"associationCategory": "HUBSPOT_DEFINED",
+                                     "associationTypeId": 202}]}]
+                  })
+              return contact_id
+
+          # ── Main loop — process each AE ───────────────────────────
+          today_str = datetime.date.today().strftime("%A, %B %d, %Y")
+          results   = {}
+
+          for ae_name in AES:
+              county  = state[ae_name]["county"]
+              added   = []
+              skipped = 0
+              found_any = False
+
+              print(f"\n{'='*50}")
+              print(f"👤 {ae_name} → 📍 {county} County")
+
+              for org in ORG_TYPES:
+                  if len(added) >= LEADS_PER_AE: break
+                  print(f"  Searching {org['type']}...")
+                  try:
+                      leads = find_leads(county, org["type"], org["titles"])
+                      if leads: found_any = True
+                      for lead in leads:
+                          if len(added) >= LEADS_PER_AE: break
+                          fn = lead.get("first_name","")
+                          ln = lead.get("last_name","")
+                          if not fn or not ln: continue
+                          if is_duplicate(lead.get("email",""), fn, ln):
+                              skipped += 1
+                              print(f"    ↩ Duplicate: {fn} {ln}")
+                              continue
+                          email_body = gen_email(lead)
+                          subject    = gen_subject(lead)
+                          contact_id = create_contact(lead, email_body, subject, ae_name)
+                          if contact_id:
+                              added.append({
+                                  "name":    f"{fn} {ln}",
+                                  "title":   lead.get("title",""),
+                                  "org":     lead.get("organization",""),
+                                  "id":      contact_id,
+                                  "subject": subject
+                              })
+                              print(f"    ✅ {fn} {ln} — {lead.get('title')}")
+                          time.sleep(1)
+                  except Exception as e:
+                      print(f"    Error: {e}")
+                  time.sleep(2)
+
+              # ── Check if county is exhausted ───────────────────────
+              if not found_any or (len(added) + skipped < MIN_LEADS_THRESH):
+                  print(f"  ⚠️ {county} exhausted — moving to next county")
+                  state[ae_name]["exhausted"].append(county)
+                  next_county = next_county_for_ae(ae_name, state)
+                  if next_county:
+                      state[ae_name]["county"] = next_county
+                      print(f"  ➡️ Next county for {ae_name}: {next_county}")
+                  else:
+                      print(f"  🚨 All counties exhausted for {ae_name}!")
+                      state[ae_name]["county"] = None
+
+              results[ae_name] = {
+                  "county":  county,
+                  "added":   added,
+                  "skipped": skipped
+              }
+
+          # ── Save updated state ────────────────────────────────────
+          save_state(state)
+          print(f"\nState saved: {json.dumps(state, indent=2)}")
+
+          # ── Slack summary ─────────────────────────────────────────
+          total_added = sum(len(r["added"]) for r in results.values())
+          total_skip  = sum(r["skipped"]    for r in results.values())
+
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*🎯 Daily Outbound Agent — {today_str}*\n"
+          msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n\n"
+
+          for ae_name, data in results.items():
+              county   = data["county"]
+              added    = data["added"]
+              list_id  = list_ids[ae_name]
+              list_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/{list_id}"
+              next_c   = state[ae_name].get("county","")
+              next_str = f" → moving to *{next_c}* tomorrow" if next_c != county else ""
+
+              msg += f"*👤 {ae_name}* — 📍 {county} County{next_str} | <{list_url}|View Segment>\n"
+              msg += f"*{len(added)} leads added*\n"
+              if not added:
+                  msg += "  No new leads found today\n"
+              else:
+                  for c in added:
+                      hs_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
+                      msg += f"  • <{hs_url}|{c['name']}> — {c['title']} @ {c['org']}\n"
+                      msg += f"    _{c['subject']}_\n"
+              msg += "\n"
+
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v3_"
+
+          # Send DM to Jeremy
+          dm = requests.post("https://slack.com/api/conversations.open",
+              headers=SLACK_HEADERS, json={"users": SLACK_USER})
+          dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")
+          requests.post("https://slack.com/api/chat.postMessage",
+              headers=SLACK_HEADERS, json={"channel": dm_ch, "text": msg})
+
+          print(f"\n✅ Done! {total_added} leads added today.")
+          EOF

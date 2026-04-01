@@ -25,8 +25,8 @@ jobs:
           SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
           SLACK_USER       = "U08JJMM2QSW"
           PORTAL_ID        = "21451281"
-          LEADS_PER_AE     = 50   # 50 per AE = 100 total/day
-          MIN_LEADS_THRESH = 3    # if < 3 found, mark county exhausted
+          LEADS_PER_AE     = 50   # 50 per AE = 150 total/day
+          MIN_LEADS_THRESH = 1    # only exhaust county if literally 0 leads found ever
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -462,8 +462,9 @@ jobs:
                       print(f"    Error: {e}")
                   time.sleep(2)
 
-              # ── Check if county is exhausted ───────────────────────
-              if not found_any or (len(added) + skipped < MIN_LEADS_THRESH):
+              # ── Check if county is exhausted ──────────────────────
+              total_found_today = len(added) + skipped
+              if not found_any and total_found_today == 0:
                   print(f"  ⚠️ {county} exhausted — moving to next county")
                   state[ae_name]["exhausted"].append(county)
                   next_county = next_county_for_ae(ae_name, state)

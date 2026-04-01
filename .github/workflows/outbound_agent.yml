@@ -476,7 +476,9 @@ jobs:
                   print(f"  Searching {org['type']}...")
                   try:
                       leads = find_leads(county, org["type"], org["titles"])
-                      if leads: found_any = True
+                      if leads: 
+                          found_any = True
+                          print(f"    Found {len(leads)} leads")
                       for lead in leads:
                           if len(added) >= LEADS_PER_AE: break
                           fn = lead.get("first_name","")
@@ -522,9 +524,22 @@ jobs:
                   time.sleep(2)
 
               # ── Check if county is exhausted ──────────────────────
-              # ONLY mark exhausted if we successfully parsed leads
-              # but genuinely found none after multiple searches
-              if found_any == False and total_found_today == 0:
+              # Only exhaust if leads were found but genuinely all duplicates
+              # AND we've been in this county for multiple runs
+              total_found_today = len(added) + skipped
+              print(f"  County summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
+              if not found_any:
+                  print(f"  ℹ️ No leads found for {county} — keeping county, will retry tomorrow")
+              elif found_any and len(added) == 0 and skipped > 5:
+                  print(f"  ⚠️ {county} likely exhausted (all duplicates) — moving on")
+                  state[ae_name]["exhausted"].append(county)
+                  next_county = next_county_for_ae(ae_name, state)
+                  if next_county:
+                      state[ae_name]["county"] = next_county
+                      print(f"  ➡️ Next county for {ae_name}: {next_county}")
+                  else:
+                      print(f"  🚨 All counties exhausted for {ae_name}!")
+                      state[ae_name]["county"] = None
                   # Don't mark exhausted — parsing may have failed
                   # Just keep the county for next run
                   print(f"  ℹ️ No leads parsed for {county} — keeping county for next run")

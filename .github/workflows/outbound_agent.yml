@@ -25,8 +25,7 @@ jobs:
           SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
           SLACK_USER       = "U08JJMM2QSW"
           PORTAL_ID        = "21451281"
-          LEADS_PER_AE     = 50   # 50 per AE = 150 total/day
-          MIN_LEADS_THRESH = 1    # only exhaust county if literally 0 leads found ever
+          LEADS_PER_AE     = 50
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -36,7 +35,6 @@ jobs:
               "anthropic-version": "2023-06-01"
           }
 
-          # ── Tier 2/3 CA Counties (100k–800k population) ───────────
           TIER_COUNTIES = [
               "Stanislaus", "Sonoma", "Tulare", "Santa Barbara", "Solano",
               "Monterey", "San Luis Obispo", "Santa Cruz", "Merced", "Butte",
@@ -59,6 +57,36 @@ jobs:
               "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
           }
 
+          PERSONA_ANGLES = {
+              "Sheriff": {
+                  "pain":     "managing body cam footage and interrogation recordings manually",
+                  "use_case": "body cam transcription and interrogation documentation",
+                  "proof":    "departments using Rev.ai cut documentation time by 60%"
+              },
+              "District Attorney": {
+                  "pain":     "preparing court proceedings and managing evidence documentation",
+                  "use_case": "court proceeding transcription and evidence documentation",
+                  "proof":    "DA offices using Rev.ai reduce case prep time significantly"
+              },
+              "Public Defender": {
+                  "pain":     "transcribing client interviews and case preparation recordings",
+                  "use_case": "client interview transcription and case prep documentation",
+                  "proof":    "public defender offices using Rev.ai improve case turnaround"
+              },
+              "Police Department": {
+                  "pain":     "manually processing 911 calls and incident report recordings",
+                  "use_case": "911 call transcription and incident report automation",
+                  "proof":    "police departments using Rev.ai process calls 3x faster"
+              },
+          }
+
+          DEPT_MAP = {
+              "Sheriff":           "Sheriff Dept",
+              "District Attorney": "DA Office",
+              "Public Defender":   "Public Defender",
+              "Police Department": "Police Dept",
+          }
+
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
               r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
@@ -72,13 +100,12 @@ jobs:
           # ── Get owner map ─────────────────────────────────────────
           owners    = hs_get("/crm/v3/owners").get("results", [])
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+          print(f"Owners: {list(owner_map.keys())}")
 
-          # ── State management via HubSpot notes ───────────────────
-          # We store agent state as a special note so it persists across runs
+          # ── State management ──────────────────────────────────────
           STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
 
           def load_state():
-              """Load persisted state from HubSpot notes."""
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
                       "filterGroups": [{"filters": [
@@ -92,7 +119,7 @@ jobs:
                   })
                   results = resp.get("results", [])
                   if results:
-                      body = results[0]["properties"]["hs_note_body"]
+                      body     = results[0]["properties"]["hs_note_body"]
                       json_str = body.split(STATE_MARKER)[1].strip()
                       return json.loads(json_str)
               except Exception as e:
@@ -100,7 +127,6 @@ jobs:
               return None
 
           def save_state(state):
-              """Save state as a HubSpot note."""
               try:
                   hs_post("/crm/v3/objects/notes", {
                       "properties": {
@@ -112,7 +138,6 @@ jobs:
                   print(f"State save error: {e}")
 
           def init_state():
-              """Create fresh state — assign first 3 different counties to AEs."""
               return {
                   "Dillon DeWitt":  {"county": TIER_COUNTIES[0], "exhausted": []},
                   "Will Weis":      {"county": TIER_COUNTIES[1], "exhausted": []},
@@ -120,48 +145,62 @@ jobs:
               }
 
           def next_county_for_ae(ae_name, state):
-              """Pick next available county not assigned to ANY other AE and not exhausted."""
               other_counties = [state[a]["county"] for a in AES if a != ae_name and state[a]["county"]]
               exhausted      = state[ae_name]["exhausted"]
               for county in TIER_COUNTIES:
                   if county not in exhausted and county not in other_counties:
                       return county
-              return None  # All counties exhausted
+              return None
 
-          # ── Load or init state ────────────────────────────────────
+          # ── Always start fresh (clean state) ──────────────────────
           state = load_state()
           if not state:
-              print("No state found — initializing fresh state")
+              print("No state — initializing fresh")
               state = init_state()
           else:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
 
-          # ── Get or create dynamic HubSpot list per AE ─────────────
+          # ── Get or create HubSpot list per AE (v3 API) ────────────
           def get_or_create_list(ae_name):
               list_name = f"Outbound — {ae_name}"
               try:
                   resp = requests.get(
-                      "https://api.hubapi.com/contacts/v1/lists?count=250",
+                      "https://api.hubapi.com/crm/v3/lists?listType=STATIC&count=100",
                       headers=HS_HEADERS)
                   for lst in resp.json().get("lists", []):
                       if lst.get("name") == list_name:
-                          print(f"Found existing list: {list_name} → {lst['listId']}")
-                          return lst["listId"]
+                          lid = lst.get("listId") or lst.get("id")
+                          print(f"Found list: {list_name} → {lid}")
+                          return lid
               except Exception as e:
                   print(f"List search error: {e}")
-
-              # Create static list (more reliable than dynamic)
               try:
                   resp = requests.post(
-                      "https://api.hubapi.com/contacts/v1/lists",
+                      "https://api.hubapi.com/crm/v3/lists",
                       headers=HS_HEADERS,
-                      json={"name": list_name, "dynamic": False})
-                  list_id = resp.json().get("listId")
-                  print(f"Created list: {list_name} → {list_id}")
-                  return list_id
+                      json={
+                          "name": list_name,
+                          "objectTypeId": "0-1",
+                          "processingType": "MANUAL"
+                      })
+                  result = resp.json()
+                  lid = result.get("list", {}).get("listId") or result.get("listId")
+                  print(f"Created list: {list_name} → {lid}")
+                  return lid
               except Exception as e:
                   print(f"List creation error: {e}")
                   return None
+
+          def add_to_list(list_id, contact_id):
+              if not list_id or not contact_id: return
+              try:
+                  resp = requests.put(
+                      f"https://api.hubapi.com/crm/v3/lists/{list_id}/memberships/add",
+                      headers=HS_HEADERS,
+                      json=[int(contact_id)])
+                  print(f"    Added to list: {resp.status_code}")
+              except Exception as e:
+                  print(f"    List add error: {e}")
 
           list_ids = {ae: get_or_create_list(ae) for ae in AES}
           print(f"HubSpot lists: {list_ids}")
@@ -198,7 +237,7 @@ jobs:
               "organization": "{county} County Sheriff's Office",
               "county": "{county}",
               "org_type": "{org_type}",
-              "website": "https://sheriff.{county.lower().replace(' ','')}county.gov",
+              "website": "https://sheriff.gov",
               "email": "",
               "phone": "",
               "address": ""
@@ -208,50 +247,21 @@ jobs:
           Return ONLY the JSON array starting with [ and ending with ]. No other text."""
 
               text = claude(prompt, max_tokens=2000, use_search=True)
-              print(f"    Raw response (first 500 chars): {text[:500]}")
-              print(f"    Raw response (last 200 chars): {text[-200:]}")
+              print(f"    Raw response (first 200 chars): {text[:200]}")
 
-              # Try multiple parsing strategies
-              # Strategy 1: Direct parse
-              try:
-                  cleaned = text.strip()
-                  if cleaned.startswith("["):
-                      return json.loads(cleaned)
-              except: pass
+              for attempt in [
+                  lambda t: json.loads(t.strip()),
+                  lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
+                  lambda t: json.loads(t.replace("```json","").replace("```","").strip()[t.replace("```json","").replace("```","").strip().find("["):]),
+              ]:
+                  try:
+                      result = attempt(text)
+                      if isinstance(result, list):
+                          print(f"    Parsed {len(result)} leads")
+                          return result
+                  except: pass
 
-              # Strategy 2: Extract JSON array
-              try:
-                  start = text.find("[")
-                  end   = text.rfind("]") + 1
-                  if start != -1 and end > start:
-                      return json.loads(text[start:end])
-              except: pass
-
-              # Strategy 3: Strip markdown
-              try:
-                  cleaned = text.replace("```json","").replace("```","").strip()
-                  start = cleaned.find("[")
-                  end   = cleaned.rfind("]") + 1
-                  if start != -1 and end > start:
-                      return json.loads(cleaned[start:end])
-              except: pass
-
-              # Strategy 4: Ask Claude to fix it
-              try:
-                  fix_prompt = f"""Convert this text into a valid JSON array of contacts.
-          Extract any person names, titles, organizations mentioned.
-          Text: {text[:1000]}
-          Return ONLY a valid JSON array starting with ["""
-                  fixed = claude(fix_prompt, max_tokens=1000)
-                  start = fixed.find("[")
-                  end   = fixed.rfind("]") + 1
-                  if start != -1 and end > start:
-                      result = json.loads(fixed[start:end])
-                      print(f"    Fixed JSON — found {len(result)} leads")
-                      return result
-              except: pass
-
-              print(f"    ⚠️ Could not parse leads for {org_type} in {county}")
+              print(f"    ⚠️ Could not parse JSON")
               return []
 
           # ── Duplicate check ───────────────────────────────────────
@@ -269,32 +279,7 @@ jobs:
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
 
-          # ── Generate email + subject ──────────────────────────────
-          # ── Persona angle by org type ─────────────────────────────
-          PERSONA_ANGLES = {
-              "Sheriff": {
-                  "pain":    "managing body cam footage and interrogation recordings manually",
-                  "use_case": "body cam transcription and interrogation documentation",
-                  "proof":   "departments using Rev.ai cut documentation time by 60%"
-              },
-              "District Attorney": {
-                  "pain":    "preparing court proceedings and managing evidence documentation",
-                  "use_case": "court proceeding transcription and evidence documentation",
-                  "proof":   "DA offices using Rev.ai reduce case prep time significantly"
-              },
-              "Public Defender": {
-                  "pain":    "transcribing client interviews and case preparation recordings",
-                  "use_case": "client interview transcription and case prep documentation",
-                  "proof":   "public defender offices using Rev.ai improve case turnaround"
-              },
-              "Police Department": {
-                  "pain":    "manually processing 911 calls and incident report recordings",
-                  "use_case": "911 call transcription and incident report automation",
-                  "proof":   "police departments using Rev.ai process calls 3x faster"
-              },
-          }
-
-          # ── Generate all 4 emails per contact ────────────────────
+          # ── Generate email sequence ───────────────────────────────
           def gen_email_sequence(contact, ae_name):
               meeting_link = MEETING_LINKS[ae_name]
               ae_first     = ae_name.split()[0]
@@ -303,67 +288,33 @@ jobs:
               name         = f"{contact['title']} {contact['last_name']}"
               org          = contact["organization"]
               county       = contact["county"]
+              emails       = {}
 
-              emails = {}
-
-              # Email 1 — Cold intro
-              emails["email_1"] = claude(f"""Write a cold outreach Email 1 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
-
-          Their pain point: {angles['pain']}
-          Use case to highlight: {angles['use_case']}
-          Meeting link: {meeting_link}
-
-          Rules:
-          - Professional but warm, 150-200 words
-          - Open with something specific to their role as {contact['title']}
-          - Highlight the use case above
-          - CTA: Book a 15-min demo at {meeting_link}
-          - Sign off: "{ae_first} from Rev.ai"
-          - No "I hope this finds you well", no pricing
+              emails["email_1"] = claude(f"""Write cold outreach Email 1 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
+          Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {meeting_link}
+          Rules: Professional but warm, 150-200 words, open with something specific to their role as {contact['title']},
+          CTA: Book 15-min demo at {meeting_link}, sign off "{ae_first} from Rev.ai", no pricing.
           Return ONLY the email body.""", max_tokens=400)
-
               time.sleep(1)
 
-              # Email 2 — Follow up Day 3
-              emails["email_2"] = claude(f"""Write a follow-up Email 2 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
-          They didn't respond to the first email about {angles['use_case']}.
-
-          Rules:
-          - Professional but warm, 100-150 words
-          - Different angle — lead with a specific result: {angles['proof']}
-          - Ask if this is a priority for them right now
-          - CTA: Book a 15-min demo at {meeting_link}
-          - Sign off: "{ae_first} from Rev.ai"
-          - No "just following up", no pricing
+              emails["email_2"] = claude(f"""Write follow-up Email 2 of 4 from {ae_first} at Rev.ai to {name} at {org}.
+          No response to first email about {angles['use_case']}.
+          Rules: 100-150 words, lead with: {angles['proof']}, ask if priority now,
+          CTA: {meeting_link}, sign off "{ae_first} from Rev.ai", no "just following up".
           Return ONLY the email body.""", max_tokens=350)
-
               time.sleep(1)
 
-              # Email 3 — Value add Day 7
-              emails["email_3"] = claude(f"""Write a value-add Email 3 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
-          They haven't responded to 2 emails about {angles['use_case']}.
-
-          Rules:
-          - Professional but warm, 100-150 words
-          - Lead with a specific insight or stat about AI transcription in law enforcement
-          - Make it feel like a helpful resource, not a sales pitch
-          - CTA: "Would a quick 15-min call be worth your time?" + {meeting_link}
-          - Sign off: "{ae_first} from Rev.ai"
-          Return ONLY the email body.""", max_tokens=350)
-
+              emails["email_3"] = claude(f"""Write value-add Email 3 of 4 from {ae_first} at Rev.ai to {name} at {org}.
+          No response to 2 emails about {angles['use_case']}.
+          Rules: 100-150 words, lead with insight about AI transcription in law enforcement,
+          feel like helpful resource not sales pitch, CTA: "Worth a quick 15-min call?" + {meeting_link},
+          sign off "{ae_first} from Rev.ai". Return ONLY the email body.""", max_tokens=350)
               time.sleep(1)
 
-              # Email 4 — Break up Day 14
-              emails["email_4"] = claude(f"""Write a break-up Email 4 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
-          This is the final email in the sequence about {angles['use_case']}.
-
-          Rules:
-          - Professional but warm, 75-100 words
-          - Acknowledge they're busy, no hard feelings
-          - Leave the door open — "if timing changes"
-          - One last soft CTA: {meeting_link}
-          - Sign off: "{ae_first} from Rev.ai"
-          - Warm, human, not passive aggressive
+              emails["email_4"] = claude(f"""Write break-up Email 4 of 4 from {ae_first} at Rev.ai to {name} at {org}.
+          Final email about {angles['use_case']}.
+          Rules: 75-100 words, acknowledge they're busy, leave door open "if timing changes",
+          soft CTA: {meeting_link}, sign off "{ae_first} from Rev.ai", warm not passive aggressive.
           Return ONLY the email body.""", max_tokens=250)
 
               return emails
@@ -373,35 +324,24 @@ jobs:
               angles   = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
               prompts  = {
                   1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev.ai {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
-                  2: f"Follow-up subject line for {contact['title']} at {contact['organization']} — 2nd email about {angles['use_case']}. Under 8 words. Not 'Following up'.",
-                  3: f"Value-add subject line for {contact['title']} at {contact['organization']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
-                  4: f"Break-up email subject for {contact['title']} at {contact['organization']} — final email. Under 8 words. Warm, closing tone.",
+                  2: f"Follow-up subject for {contact['title']} — 2nd email about {angles['use_case']}. Under 8 words. Not 'Following up'.",
+                  3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
+                  4: f"Break-up subject for {contact['title']} — final email. Under 8 words. Warm closing tone.",
               }
               return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
 
-          # ── Buying role mapping by title ──────────────────────────
+          # ── Buying role mapping ───────────────────────────────────
           def get_buying_role(title):
               t = title.lower()
-              if any(x in t for x in ["sheriff", "district attorney", "chief of police",
-                                       "public defender", "chief deputy"]):
+              if any(x in t for x in ["sheriff", "district attorney", "chief of police", "public defender", "chief deputy"]):
                   return "DECISION_MAKER"
               if any(x in t for x in ["commander", "captain", "lieutenant"]):
                   return "INFLUENCER"
               if any(x in t for x in ["investigator", "detective", "analyst"]):
                   return "END_USER"
-              if any(x in t for x in ["budget", "finance", "admin"]):
-                  return "BUDGET_HOLDER"
               if any(x in t for x in ["legal", "compliance"]):
                   return "LEGAL_AND_COMPLIANCE"
               return "BUDGET_HOLDER"
-
-          # ── Dept mapping by org type ──────────────────────────────
-          DEPT_MAP = {
-              "Sheriff":           "Sheriff Dept",
-              "District Attorney": "DA Office",
-              "Public Defender":   "Public Defender",
-              "Police Department": "Police Dept",
-          }
 
           # ── Create HubSpot contact ────────────────────────────────
           def create_contact(contact, email_body, subject, ae_name):
@@ -409,7 +349,6 @@ jobs:
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
 
               props = {
-                  # Standard HubSpot fields
                   "firstname":        contact["first_name"],
                   "lastname":         contact["last_name"],
                   "jobtitle":         contact["title"],
@@ -419,14 +358,10 @@ jobs:
                   "hs_lead_status":   "NEW",
                   "leadsource":       "Claude",
                   "icp":              "Law",
-
-                  # ⚠️ Verify these custom property internal names in HubSpot
-                  "county":           contact.get("county", ""),       # County (single text)
-                  "department":       dept,                             # Dept
-                  "role__c":          contact.get("title", ""),         # Role
-                  "hs_buying_role":   buying_role,                      # Buying Role
+                  "county":           contact.get("county", ""),
+                  "department":       dept,
+                  "hs_buying_role":   buying_role,
               }
-
               if owner_map.get(ae_name):      props["hubspot_owner_id"] = owner_map[ae_name]
               if contact.get("email"):        props["email"]            = contact["email"]
               if contact.get("phone"):        props["phone"]            = contact["phone"]
@@ -435,37 +370,35 @@ jobs:
 
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
+              if not contact_id:
+                  print(f"    ❌ Contact creation failed: {resp}")
+                  return None
 
-              if contact_id:
-                  # Save outbound email as note
-                  note = (
-                      f"OUTBOUND EMAIL\n"
-                      f"Subject: {subject}\n"
-                      f"County: {contact.get('county','')}\n"
-                      f"Dept: {dept}\n"
-                      f"Buying Role: {buying_role}\n"
-                      f"Lead Source: Claude\n\n"
-                      f"{email_body}"
-                  )
-                  hs_post("/crm/v3/objects/notes", {
-                      "properties": {
-                          "hs_note_body": note,
-                          "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000))
-                      },
-                      "associations": [{"to": {"id": contact_id},
-                          "types": [{"associationCategory": "HUBSPOT_DEFINED",
-                                     "associationTypeId": 202}]}]
-                  })
+              # Save all 4 emails as note
+              note = (
+                  f"OUTBOUND EMAIL\nSubject: {subject}\n"
+                  f"County: {contact.get('county','')}\nDept: {dept}\n"
+                  f"Buying Role: {buying_role}\nLead Source: Claude\n\n"
+                  f"{email_body}"
+              )
+              hs_post("/crm/v3/objects/notes", {
+                  "properties": {
+                      "hs_note_body": note,
+                      "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000))
+                  },
+                  "associations": [{"to": {"id": contact_id},
+                      "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
+              })
               return contact_id
 
-          # ── Main loop — process each AE ───────────────────────────
+          # ── Main loop ─────────────────────────────────────────────
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
           results   = {}
 
           for ae_name in AES:
-              county  = state[ae_name]["county"]
-              added   = []
-              skipped = 0
+              county    = state[ae_name]["county"]
+              added     = []
+              skipped   = 0
               found_any = False
 
               print(f"\n{'='*50}")
@@ -476,7 +409,7 @@ jobs:
                   print(f"  Searching {org['type']}...")
                   try:
                       leads = find_leads(county, org["type"], org["titles"])
-                      if leads: 
+                      if leads:
                           found_any = True
                           print(f"    Found {len(leads)} leads")
                       for lead in leads:
@@ -488,14 +421,11 @@ jobs:
                               skipped += 1
                               print(f"    ↩ Duplicate: {fn} {ln}")
                               continue
-                          # Generate all 4 emails
                           emails   = gen_email_sequence(lead, ae_name)
                           subject1 = gen_subject(lead, 1)
                           subject2 = gen_subject(lead, 2)
                           subject3 = gen_subject(lead, 3)
                           subject4 = gen_subject(lead, 4)
-
-                          # Build combined note with all 4 emails
                           email_body = (
                               f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
                               f"Subject: {subject1}\n\n{emails['email_1']}\n\n"
@@ -506,8 +436,7 @@ jobs:
                               f"━━━ EMAIL 4 — Day 14 (Break Up) ━━━\n"
                               f"Subject: {subject4}\n\n{emails['email_4']}"
                           )
-                          subject = subject1  # Use Email 1 subject as primary
-                          contact_id = create_contact(lead, email_body, subject, ae_name)
+                          contact_id = create_contact(lead, email_body, subject1, ae_name)
                           if contact_id:
                               add_to_list(list_ids[ae_name], contact_id)
                               added.append({
@@ -515,61 +444,29 @@ jobs:
                                   "title":   lead.get("title",""),
                                   "org":     lead.get("organization",""),
                                   "id":      contact_id,
-                                  "subject": subject
+                                  "subject": subject1
                               })
-                              print(f"    ✅ {fn} {ln} — {lead.get('title')}")
+                              print(f"    ✅ Added: {fn} {ln} — {lead.get('title')}")
                           time.sleep(1)
                   except Exception as e:
                       print(f"    Error: {e}")
                   time.sleep(2)
 
-              # ── Check if county is exhausted ──────────────────────
-              # Only exhaust if leads were found but genuinely all duplicates
-              # AND we've been in this county for multiple runs
-              total_found_today = len(added) + skipped
-              print(f"  County summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
+              # County exhaustion logic
+              print(f"  Summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
               if not found_any:
-                  print(f"  ℹ️ No leads found for {county} — keeping county, will retry tomorrow")
+                  print(f"  ℹ️ No leads parsed — keeping {county} for next run")
               elif found_any and len(added) == 0 and skipped > 5:
-                  print(f"  ⚠️ {county} likely exhausted (all duplicates) — moving on")
+                  print(f"  ⚠️ {county} exhausted — moving on")
                   state[ae_name]["exhausted"].append(county)
                   next_county = next_county_for_ae(ae_name, state)
+                  state[ae_name]["county"] = next_county or None
                   if next_county:
-                      state[ae_name]["county"] = next_county
-                      print(f"  ➡️ Next county for {ae_name}: {next_county}")
-                  else:
-                      print(f"  🚨 All counties exhausted for {ae_name}!")
-                      state[ae_name]["county"] = None
-                  # Don't mark exhausted — parsing may have failed
-                  # Just keep the county for next run
-                  print(f"  ℹ️ No leads parsed for {county} — keeping county for next run")
-              elif len(added) + skipped < MIN_LEADS_THRESH and found_any:
-                  print(f"  ⚠️ {county} truly exhausted — moving to next county")
-                  state[ae_name]["exhausted"].append(county)
-                  next_county = next_county_for_ae(ae_name, state)
-                  if next_county:
-                      state[ae_name]["county"] = next_county
-                      print(f"  ➡️ Next county for {ae_name}: {next_county}")
-                  else:
-                      print(f"  🚨 All counties exhausted for {ae_name}!")
-                      state[ae_name]["county"] = None
-                  print(f"  ⚠️ {county} exhausted — moving to next county")
-                  state[ae_name]["exhausted"].append(county)
-                  next_county = next_county_for_ae(ae_name, state)
-                  if next_county:
-                      state[ae_name]["county"] = next_county
-                      print(f"  ➡️ Next county for {ae_name}: {next_county}")
-                  else:
-                      print(f"  🚨 All counties exhausted for {ae_name}!")
-                      state[ae_name]["county"] = None
+                      print(f"  ➡️ Next county: {next_county}")
 
-              results[ae_name] = {
-                  "county":  county,
-                  "added":   added,
-                  "skipped": skipped
-              }
+              results[ae_name] = {"county": county, "added": added, "skipped": skipped}
 
-          # ── Save updated state ────────────────────────────────────
+          # ── Save state ────────────────────────────────────────────
           save_state(state)
           print(f"\nState saved: {json.dumps(state, indent=2)}")
 
@@ -585,24 +482,23 @@ jobs:
               county   = data["county"]
               added    = data["added"]
               list_id  = list_ids[ae_name]
-              list_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/{list_id}"
               next_c   = state[ae_name].get("county","")
-              next_str = f" → moving to *{next_c}* tomorrow" if next_c != county else ""
+              next_str = f" → moving to *{next_c}* tomorrow" if next_c and next_c != county else ""
+              list_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/{list_id}" if list_id else ""
 
-              msg += f"*👤 {ae_name}* — 📍 {county} County{next_str} | <{list_url}|View Segment>\n"
+              msg += f"*👤 {ae_name}* — 📍 {county} County{next_str}"
+              msg += f" | <{list_url}|View Segment>\n" if list_url else "\n"
               msg += f"*{len(added)} leads added*\n"
+              for c in added:
+                  hs_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
+                  msg += f"  • <{hs_url}|{c['name']}> — {c['title']} @ {c['org']}\n"
+                  msg += f"    _{c['subject']}_\n"
               if not added:
-                  msg += "  No new leads found today\n"
-              else:
-                  for c in added:
-                      hs_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
-                      msg += f"  • <{hs_url}|{c['name']}> — {c['title']} @ {c['org']}\n"
-                      msg += f"    _{c['subject']}_\n"
+                  msg += "  No new leads added today\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v3_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v4_"
 
-          # Send DM to Jeremy
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})
           dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")

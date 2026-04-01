@@ -2,7 +2,7 @@ name: Daily Revenue Briefing
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'  # 8:00 AM ET (UTC-5), Mon–Fri
+    - cron: '0 13 * * 1-5'  # 8:00 AM ET, Mon–Fri
   workflow_dispatch:          # Manual trigger from GitHub Actions tab
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
         run: |
           pip install matplotlib pytz --quiet
           python3 - <<'EOF'
-          import urllib.request, json, os, datetime, pytz, matplotlib
+          import urllib.request, urllib.parse, json, os, datetime, pytz, matplotlib, base64
           matplotlib.use('Agg')
           import matplotlib.pyplot as plt
 
@@ -141,55 +141,51 @@ jobs:
                       msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
                   msg += "\n"
 
-          # ── Post text message first ────────────────────────────────
+          # ── Upload chart to imgbb (free image host) ───────────────
+          import base64
+          with open(chart_path, "rb") as f:
+              img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+          # Upload to imgbb
+          imgbb_resp = urllib.request.urlopen(urllib.request.Request(
+              "https://api.imgbb.com/1/upload?expiration=86400&key=public",
+              data=urllib.parse.urlencode({
+                  "image": img_b64,
+                  "name": "daily_pipe_chart"
+              }).encode(),
+              method="POST"
+          ))
+          imgbb_data = json.loads(imgbb_resp.read())
+          img_url = imgbb_data.get("data", {}).get("url", "")
+          print(f"Image URL: {img_url}")
+
+          # ── Post text + image as Slack blocks ─────────────────────
+          if img_url:
+              blocks = [
+                  {
+                      "type": "section",
+                      "text": {"type": "mrkdwn", "text": msg}
+                  },
+                  {
+                      "type": "image",
+                      "image_url": img_url,
+                      "alt_text": "Daily Pipe Chart"
+                  }
+              ]
+              payload = {"channel": SLACK_CHANNEL, "blocks": blocks, "text": msg}
+          else:
+              payload = {"channel": SLACK_CHANNEL, "text": msg}
+
           req = urllib.request.Request(
               "https://slack.com/api/chat.postMessage",
-              data=json.dumps({"channel": SLACK_CHANNEL, "text": msg}).encode(),
+              data=json.dumps(payload).encode(),
               headers=SLACK_HEADERS, method="POST")
           with urllib.request.urlopen(req) as r:
-              text_result = json.loads(r.read())
-              print("Text posted:", text_result.get("ok"))
-
-          # ── Upload chart using new Slack file upload API ───────────
-          with open(chart_path, "rb") as f:
-              chart_data = f.read()
-          file_size = len(chart_data)
-
-          # Step 1: Get upload URL
-          upload_url_req = urllib.request.Request(
-              f"https://slack.com/api/files.getUploadURLExternal?filename=daily_pipe_chart.png&length={file_size}",
-              headers={"Authorization": f"Bearer {SLACK_TOKEN}"}, method="GET")
-          with urllib.request.urlopen(upload_url_req) as r:
-              upload_url_result = json.loads(r.read())
-
-          if not upload_url_result.get("ok"):
-              print(f"⚠️ Could not get upload URL: {upload_url_result.get('error')}")
-          else:
-              upload_url = upload_url_result["upload_url"]
-              file_id    = upload_url_result["file_id"]
-
-              # Step 2: Upload file content
-              upload_req = urllib.request.Request(
-                  upload_url, data=chart_data,
-                  headers={"Content-Type": "image/png"}, method="POST")
-              with urllib.request.urlopen(upload_req) as r:
-                  r.read()
-
-              # Step 3: Complete upload and share to channel
-              complete_payload = json.dumps({
-                  "files": [{"id": file_id}],
-                  "channel_id": SLACK_CHANNEL,
-                  "initial_comment": "📊 ACV by Rep"
-              }).encode()
-              complete_req = urllib.request.Request(
-                  "https://slack.com/api/files.completeUploadExternal",
-                  data=complete_payload, headers=SLACK_HEADERS, method="POST")
-              with urllib.request.urlopen(complete_req) as r:
-                  complete_result = json.loads(r.read())
-                  if complete_result.get("ok"):
-                      print("✅ Chart uploaded successfully!")
-                  else:
-                      print(f"⚠️ Chart upload failed: {complete_result.get('error')}")
+              result = json.loads(r.read())
+              if result.get("ok"):
+                  print("✅ Message + chart posted!")
+              else:
+                  print(f"⚠️ Slack error: {result.get('error')}")
           EOF
 
       - name: Post Daily CS Brief

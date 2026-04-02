@@ -2,7 +2,7 @@ name: Daily Outbound Agent — CA Law Enforcement
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'  # 8:00 AM ET (UTC-5), Mon–Fri v2
+    - cron: '0 14 * * 1-5'  # 9:00 AM ET, Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -356,7 +356,7 @@ jobs:
                   "state":            "California",
                   "city":             f"{contact['county']} County",
                   "hs_lead_status":   "NEW",
-                  "leadsource":       "OTHER",  # Safe fallback
+                  "leadsource":       "Claude",
               }
               if owner_map.get(ae_name):  props["hubspot_owner_id"] = owner_map[ae_name]
               if contact.get("email"):    props["email"]   = contact["email"]

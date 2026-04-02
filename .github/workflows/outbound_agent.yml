@@ -36,8 +36,7 @@ jobs:
           }
 
           TIER_COUNTIES = [
-              "Stanislaus", "Sonoma", "Tulare", "Santa Barbara", "Solano",
-              "Monterey", "San Luis Obispo", "Santa Cruz", "Merced", "Butte",
+              "Sonoma", "Solano", "Santa Cruz", "Merced", "Butte",
               "Yolo", "El Dorado", "Imperial", "Kings", "Madera",
               "Napa", "Placer", "Shasta", "Nevada", "Sutter"
           ]
@@ -324,7 +323,9 @@ jobs:
 
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
-              print(f"    Contact API response: {json.dumps(resp)[:300]}")
+              print(f"    Contact API response: {json.dumps(resp)[:500]}")
+              if not contact_id:
+                  print(f"    ❌ Full error: {json.dumps(resp)}")
               if not contact_id:
                   print(f"    ❌ Contact creation failed: {resp}")
                   return None
@@ -406,17 +407,21 @@ jobs:
                       print(f"    Error: {e}")
                   time.sleep(2)
 
-              # County exhaustion logic
+              # County exhaustion logic — only move when ALL leads are duplicates
               print(f"  Summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
               if not found_any:
-                  print(f"  ℹ️ No leads parsed — keeping {county} for next run")
-              elif found_any and len(added) == 0 and skipped > 5:
-                  print(f"  ⚠️ {county} exhausted — moving on")
+                  print(f"  ℹ️ No leads found — keeping {county} for next run")
+              elif found_any and len(added) == 0 and skipped > 0:
+                  print(f"  ⚠️ {county} fully exhausted — moving on")
                   state[ae_name]["exhausted"].append(county)
                   next_county = next_county_for_ae(ae_name, state)
                   state[ae_name]["county"] = next_county or None
                   if next_county:
                       print(f"  ➡️ Next county: {next_county}")
+                  else:
+                      print(f"  ⚠️ No more counties available for {ae_name}")
+              else:
+                  print(f"  ℹ️ {county} still has leads — staying for next run")
 
               results[ae_name] = {"county": county, "added": added, "skipped": skipped}
 
@@ -456,7 +461,7 @@ jobs:
                   msg += "  No new leads added today\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v6_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v7_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

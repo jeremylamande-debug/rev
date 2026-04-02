@@ -151,9 +151,15 @@ jobs:
               other_counties = [state[a]["county"] for a in AES if a != ae_name and state[a]["county"]]
               exhausted      = state[ae_name]["exhausted"]
               for county in TIER_COUNTIES:
-                  if county not in exhausted and county not in other_counties:
+                  if county not in exhausted and county not in other_counties and county not in EXCLUDED_COUNTIES:
                       return county
               return None
+
+          # ── Excluded counties (already enriched) ─────────────────
+          EXCLUDED_COUNTIES = [
+              "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
+              "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
+          ]
 
           # ── Load or init state ────────────────────────────────────
           state = load_state()
@@ -162,6 +168,13 @@ jobs:
               state = init_state()
           else:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
+              # Clear excluded counties from saved state
+              for ae in AES:
+                  if state[ae].get("county") in EXCLUDED_COUNTIES:
+                      print(f"  ⚠️ {ae} was on excluded county {state[ae]['county']} — reassigning")
+                      state[ae]["exhausted"] = [c for c in state[ae].get("exhausted", []) if c not in EXCLUDED_COUNTIES]
+                      state[ae]["county"] = next_county_for_ae(ae, state)
+                      print(f"  ➡️ Reassigned to: {state[ae]['county']}")
 
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
@@ -461,7 +474,7 @@ jobs:
                   msg += "  No new leads added today\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v7_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v8_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

@@ -2,7 +2,7 @@ name: Daily Outbound Agent — CA Law Enforcement
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'  # 8:00 AM ET (UTC-4 EDT), Mon–Fri — buffer for GH Actions delay
+    - cron: '0 12 * * 1-5'  # 8:00 AM ET (UTC-4 EDT), Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -102,6 +102,28 @@ jobs:
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
 
+          # ── Verify leadsource enum value ──────────────────────────
+          def get_leadsource_value():
+              try:
+                  r = requests.get(
+                      "https://api.hubapi.com/crm/v3/properties/contacts/hs_analytics_source",
+                      headers=HS_HEADERS)
+                  # Use custom leadsource property
+                  r2 = requests.get(
+                      "https://api.hubapi.com/crm/v3/properties/contacts/leadsource",
+                      headers=HS_HEADERS)
+                  opts = r2.json().get("options", [])
+                  for o in opts:
+                      if o.get("label","").lower() == "claude" or o.get("value","").lower() == "claude":
+                          print(f"leadsource internal value: {o['value']}")
+                          return o["value"]
+              except Exception as e:
+                  print(f"leadsource lookup error: {e}")
+              return "Claude"
+
+          LEADSOURCE_VALUE = get_leadsource_value()
+          print(f"Using leadsource: {LEADSOURCE_VALUE}")
+
           # ── State management ──────────────────────────────────────
           STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
 
@@ -152,34 +174,13 @@ jobs:
                       return county
               return None
 
-          # ── Always start fresh (clean state) ──────────────────────
+          # ── Load or init state ────────────────────────────────────
           state = load_state()
           if not state:
               print("No state — initializing fresh")
               state = init_state()
           else:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
-
-          # ── Hardcoded HubSpot list IDs ────────────────────────────
-          list_ids = {
-              "James Gregory":  9563,
-              "Will Weis":      9562,
-              "Dillon DeWitt":  9561,
-          }
-          print(f"HubSpot lists: {list_ids}")
-
-          # ── Add contact to static list ────────────────────────────
-          def add_to_list(list_id, contact_id):
-              if not list_id or not contact_id: return
-              try:
-                  resp = requests.put(
-                      f"https://api.hubapi.com/crm/v3/lists/{list_id}/memberships/add",
-                      headers=HS_HEADERS,
-                      json={"recordIdsToAdd": [str(contact_id)]}
-                  )
-                  print(f"    List add: {resp.status_code} {resp.text[:200]}")
-              except Exception as e:
-                  print(f"    List add error: {e}")
 
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
@@ -332,7 +333,7 @@ jobs:
                   "state":            "California",
                   "city":             f"{contact['county']} County",
                   "hs_lead_status":   "NEW",
-                  "leadsource":       "Claude",
+                  "leadsource":       LEADSOURCE_VALUE,
               }
               if owner_map.get(ae_name):  props["hubspot_owner_id"] = owner_map[ae_name]
               if contact.get("email"):    props["email"]   = contact["email"]
@@ -410,7 +411,6 @@ jobs:
                           )
                           contact_id = create_contact(lead, email_body, subject1, ae_name)
                           if contact_id:
-                              add_to_list(list_ids[ae_name], contact_id)
                               added.append({
                                   "name":    f"{fn} {ln}",
                                   "title":   lead.get("title",""),
@@ -443,6 +443,12 @@ jobs:
           print(f"\nState saved: {json.dumps(state, indent=2)}")
 
           # ── Slack summary ─────────────────────────────────────────
+          LIST_URLS = {
+              "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
+              "Will Weis":      f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9562",
+              "Dillon DeWitt":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9561",
+          }
+
           total_added = sum(len(r["added"]) for r in results.values())
           total_skip  = sum(r["skipped"]    for r in results.values())
 
@@ -453,13 +459,12 @@ jobs:
           for ae_name, data in results.items():
               county   = data["county"]
               added    = data["added"]
-              list_id  = list_ids[ae_name]
               next_c   = state[ae_name].get("county","")
               next_str = f" → moving to *{next_c}* tomorrow" if next_c and next_c != county else ""
-              list_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/{list_id}" if list_id else ""
+              list_url = LIST_URLS[ae_name]
 
               msg += f"*👤 {ae_name}* — 📍 {county} County{next_str}"
-              msg += f" | <{list_url}|View Segment>\n" if list_url else "\n"
+              msg += f" | <{list_url}|View Segment>\n"
               msg += f"*{len(added)} leads added*\n"
               for c in added:
                   hs_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
@@ -469,7 +474,7 @@ jobs:
                   msg += "  No new leads added today\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v4_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v5_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

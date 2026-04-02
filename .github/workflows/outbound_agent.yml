@@ -2,7 +2,7 @@ name: Daily Outbound Agent — CA Law Enforcement
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'  # 9:00 AM ET, Mon–Fri
+    - cron: '0 13 * * 1-5'  # 8:00 AM ET (UTC-5), Mon–Fri v2
   workflow_dispatch:
 
 jobs:

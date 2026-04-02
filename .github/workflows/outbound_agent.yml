@@ -102,26 +102,8 @@ jobs:
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
 
-          # ── Verify leadsource enum value ──────────────────────────
-          def get_leadsource_value():
-              try:
-                  r = requests.get(
-                      "https://api.hubapi.com/crm/v3/properties/contacts/hs_analytics_source",
-                      headers=HS_HEADERS)
-                  # Use custom leadsource property
-                  r2 = requests.get(
-                      "https://api.hubapi.com/crm/v3/properties/contacts/leadsource",
-                      headers=HS_HEADERS)
-                  opts = r2.json().get("options", [])
-                  for o in opts:
-                      if o.get("label","").lower() == "claude" or o.get("value","").lower() == "claude":
-                          print(f"leadsource internal value: {o['value']}")
-                          return o["value"]
-              except Exception as e:
-                  print(f"leadsource lookup error: {e}")
-              return "Claude"
-
-          LEADSOURCE_VALUE = get_leadsource_value()
+          # ── Lead source (internal name confirmed in HubSpot) ─────
+          LEADSOURCE_VALUE = "Claude"
           print(f"Using leadsource: {LEADSOURCE_VALUE}")
 
           # ── State management ──────────────────────────────────────
@@ -474,7 +456,7 @@ jobs:
                   msg += "  No new leads added today\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v5_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v6_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

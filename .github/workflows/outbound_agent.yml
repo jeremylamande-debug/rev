@@ -23,7 +23,8 @@ jobs:
           ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
           HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
-          SLACK_USER       = "U08JJMM2QSW"
+          GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+          GIST_ID    = os.environ.get("GIST_ID", "")  # set after first run
           PORTAL_ID        = "21451281"
           LEADS_PER_AE     = 50
 
@@ -106,7 +107,8 @@ jobs:
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
 
-          # ── Lead source (internal name confirmed in HubSpot) ─────
+          # ── Test mode (set to True to skip lead scraping & HubSpot writes) ──
+          TEST_MODE = True
           LEADSOURCE_VALUE = "Claude"
           print(f"Using leadsource: {LEADSOURCE_VALUE}")
 
@@ -453,7 +455,25 @@ jobs:
           save_state(state)
           print(f"\nState saved: {json.dumps(state, indent=2)}")
 
-          # ── Slack summary ─────────────────────────────────────────
+          # ── Publish state to GitHub Gist ─────────────────────────
+          def publish_gist(state):
+              if not GIST_TOKEN:
+                  print("No GIST_TOKEN — skipping gist publish")
+                  return
+              payload = {"files": {"ob_agent_state.json": {"content": json.dumps(state, indent=2)}}}
+              headers = {"Authorization": f"token {GIST_TOKEN}", "Content-Type": "application/json"}
+              if GIST_ID:
+                  r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
+              else:
+                  payload["description"] = "OB Agent County State"
+                  payload["public"] = True
+                  r = requests.post("https://api.github.com/gists", headers=headers, json=payload)
+              data = r.json()
+              gist_url = data.get("html_url", "")
+              raw_url  = data.get("files", {}).get("ob_agent_state.json", {}).get("raw_url", "")
+              print(f"Gist published: {gist_url}")
+              print(f"Raw URL: {raw_url}")
+              return raw_url
           LIST_URLS = {
               "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
               "Will Weis":      f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9562",
@@ -493,7 +513,7 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v11_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v12_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

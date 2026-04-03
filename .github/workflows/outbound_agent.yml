@@ -147,9 +147,9 @@ jobs:
 
           def init_state():
               return {
-                  "Dillon DeWitt":  {"county": TIER_COUNTIES[0], "exhausted": []},
-                  "Will Weis":      {"county": TIER_COUNTIES[1], "exhausted": []},
-                  "James Gregory":  {"county": TIER_COUNTIES[2], "exhausted": []},
+                  "Dillon DeWitt":  {"county": TIER_COUNTIES[0], "exhausted": [], "county_leads": {}},
+                  "Will Weis":      {"county": TIER_COUNTIES[1], "exhausted": [], "county_leads": {}},
+                  "James Gregory":  {"county": TIER_COUNTIES[2], "exhausted": [], "county_leads": {}},
               }
 
           # ── Excluded counties (already enriched) ─────────────────
@@ -175,7 +175,9 @@ jobs:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
               # Clear excluded counties from saved state
               for ae in AES:
-                  if state[ae].get("county") in EXCLUDED_COUNTIES:
+                  # Ensure county_leads exists for older states
+              if "county_leads" not in state[ae_name]:
+                  state[ae_name]["county_leads"] = {}
                       print(f"  ⚠️ {ae} was on excluded county {state[ae]['county']} — reassigning")
                       state[ae]["exhausted"] = [c for c in state[ae].get("exhausted", []) if c not in EXCLUDED_COUNTIES]
                       state[ae]["county"] = next_county_for_ae(ae, state)
@@ -420,6 +422,9 @@ jobs:
                                   "id":      contact_id,
                                   "subject": subject1
                               })
+                              # Track county-level lead count
+                              cl = state[ae_name]["county_leads"]
+                              cl[county] = cl.get(county, 0) + 1
                               print(f"    ✅ Added: {fn} {ln} — {lead.get('title')}")
                           time.sleep(1)
                   except Exception as e:
@@ -478,9 +483,17 @@ jobs:
                   msg += f"    _{c['subject']}_\n"
               if not added:
                   msg += "  No new leads added today\n"
+
+              # County breakdown table
+              county_leads = state[ae_name].get("county_leads", {})
+              if county_leads:
+                  msg += f"  *📊 County Breakdown:*\n"
+                  for c, count in county_leads.items():
+                      status = "✅ exhausted" if c in state[ae_name]["exhausted"] else "🔄 active"
+                      msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v10_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v11_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

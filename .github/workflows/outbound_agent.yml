@@ -21,13 +21,14 @@ jobs:
           python3 - <<'EOF'
           import requests, json, os, time, datetime
 
-          ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
-          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
-          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
-          GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
-          GIST_ID    = os.environ.get("GIST_ID", "")  # set after first run
-          PORTAL_ID        = "21451281"
-          LEADS_PER_AE     = 50
+          ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
+          HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+          GIST_TOKEN    = os.environ.get("GIST_TOKEN", "")
+          GIST_ID       = os.environ.get("GIST_ID", "")
+          PORTAL_ID     = "21451281"
+          LEADS_PER_AE  = 50
+          SLACK_USER    = "U08JJMM2QSW"
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -48,6 +49,11 @@ jobs:
               "Marin", "Contra Costa", "Alameda", "San Mateo", "Santa Clara"
           ]
 
+          EXCLUDED_COUNTIES = [
+              "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
+              "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
+          ]
+
           ORG_TYPES = [
               {"type": "Sheriff",           "titles": ["Sheriff", "Undersheriff", "Chief Deputy Sheriff", "Commander", "Captain", "Lieutenant", "Sergeant"]},
               {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Chief Investigator", "Senior Investigator"]},
@@ -61,6 +67,12 @@ jobs:
               "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
               "Will Weis":      "https://meetings.hubspot.com/will-weis",
               "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
+          }
+
+          LIST_URLS = {
+              "Dillon DeWitt":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9561",
+              "Will Weis":      f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9562",
+              "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
           }
 
           PERSONA_ANGLES = {
@@ -99,17 +111,15 @@ jobs:
               return r.json()
 
           def hs_post(path, payload):
-              r = requests.post(f"https://api.hubapi.com{path}",
-                  headers=HS_HEADERS, json=payload)
+              r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r.json()
 
-          # ── Get owner map ─────────────────────────────────────────
+          # ── Owner map ─────────────────────────────────────────────
           owners    = hs_get("/crm/v3/owners").get("results", [])
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
 
-          # ── Test mode (set to True to skip lead scraping & HubSpot writes) ──
-          TEST_MODE = True
+          # ── Lead source ───────────────────────────────────────────
           LEADSOURCE_VALUE = "Claude"
           print(f"Using leadsource: {LEADSOURCE_VALUE}")
 
@@ -120,9 +130,7 @@ jobs:
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
                       "filterGroups": [{"filters": [
-                          {"propertyName": "hs_note_body",
-                           "operator": "CONTAINS_TOKEN",
-                           "value": STATE_MARKER}
+                          {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN", "value": STATE_MARKER}
                       ]}],
                       "properties": ["hs_note_body", "hs_timestamp"],
                       "sorts": [{"propertyName": "hs_timestamp", "direction": "DESCENDING"}],
@@ -130,7 +138,7 @@ jobs:
                   })
                   results = resp.get("results", [])
                   if results:
-                      body     = results[0]["properties"]["hs_note_body"]
+                      body = results[0]["properties"]["hs_note_body"]
                       json_str = body.split(STATE_MARKER)[1].strip()
                       return json.loads(json_str)
               except Exception as e:
@@ -155,33 +163,26 @@ jobs:
                   "James Gregory":  {"county": TIER_COUNTIES[2], "exhausted": [], "county_leads": {}},
               }
 
-          # ── Excluded counties (already enriched) ─────────────────
-          EXCLUDED_COUNTIES = [
-              "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
-              "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
-          ]
-
           def next_county_for_ae(ae_name, state):
               other_counties = [state[a]["county"] for a in AES if a != ae_name and state[a]["county"]]
-              exhausted      = state[ae_name]["exhausted"]
+              exhausted = state[ae_name]["exhausted"]
               for county in TIER_COUNTIES:
                   if county not in exhausted and county not in other_counties and county not in EXCLUDED_COUNTIES:
                       return county
               return None
 
-          # ── Load or init state ────────────────────────────────────
+          # ── Load / init state ─────────────────────────────────────
           state = load_state()
           if not state:
               print("No state — initializing fresh")
               state = init_state()
           else:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
-              # Clear excluded counties from saved state
               for ae in AES:
-                  # Ensure county_leads exists for older states
-              if "county_leads" not in state[ae_name]:
-                  state[ae_name]["county_leads"] = {}
-                      print(f"  ⚠️ {ae} was on excluded county {state[ae]['county']} — reassigning")
+                  if "county_leads" not in state[ae]:
+                      state[ae]["county_leads"] = {}
+                  if state[ae].get("county") in EXCLUDED_COUNTIES:
+                      print(f"  ⚠️ {ae} on excluded county {state[ae]['county']} — reassigning")
                       state[ae]["exhausted"] = [c for c in state[ae].get("exhausted", []) if c not in EXCLUDED_COUNTIES]
                       state[ae]["county"] = next_county_for_ae(ae, state)
                       print(f"  ➡️ Reassigned to: {state[ae]['county']}")
@@ -195,41 +196,28 @@ jobs:
               }
               if use_search:
                   body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
-              resp = requests.post("https://api.anthropic.com/v1/messages",
-                  headers=ANTH_HEADERS, json=body)
+              resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
-              return "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text").strip()
+              return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
 
           # ── Find leads ────────────────────────────────────────────
           def find_leads(county, org_type, titles):
               prompt = f"""Search for real decision makers at the {org_type} in {county} County, California.
           Find people with these titles: {', '.join(titles)}
           Look at official government websites and public records.
-
           Return a JSON array. Each item must have these exact keys:
           first_name, last_name, title, organization, county, org_type, website, email, phone, address
-
           Example format:
           [
             {{
-              "first_name": "John",
-              "last_name": "Smith",
-              "title": "Sheriff",
-              "organization": "{county} County Sheriff's Office",
-              "county": "{county}",
-              "org_type": "{org_type}",
-              "website": "https://sheriff.gov",
-              "email": "",
-              "phone": "",
-              "address": ""
+              "first_name": "John", "last_name": "Smith", "title": "Sheriff",
+              "organization": "{county} County Sheriff's Office", "county": "{county}",
+              "org_type": "{org_type}", "website": "", "email": "", "phone": "", "address": ""
             }}
           ]
-
           Return ONLY the JSON array starting with [ and ending with ]. No other text."""
-
               text = claude(prompt, max_tokens=2000, use_search=True)
               print(f"    Raw response (first 200 chars): {text[:200]}")
-
               for attempt in [
                   lambda t: json.loads(t.strip()),
                   lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
@@ -241,7 +229,6 @@ jobs:
                           print(f"    Parsed {len(result)} leads")
                           return result
                   except: pass
-
               print(f"    ⚠️ Could not parse JSON")
               return []
 
@@ -249,9 +236,8 @@ jobs:
           def is_duplicate(email, first_name, last_name):
               if email:
                   r = hs_post("/crm/v3/objects/contacts/search", {
-                      "filterGroups": [{"filters": [
-                          {"propertyName": "email", "operator": "EQ", "value": email}
-                      ]}], "limit": 1})
+                      "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
+                      "limit": 1})
                   if r.get("total", 0) > 0: return True
               r = hs_post("/crm/v3/objects/contacts/search", {
                   "filterGroups": [{"filters": [
@@ -260,7 +246,7 @@ jobs:
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
 
-          # ── Generate email sequence ───────────────────────────────
+          # ── Email sequence ────────────────────────────────────────
           def gen_email_sequence(contact, ae_name):
               meeting_link = MEETING_LINKS[ae_name]
               ae_first     = ae_name.split()[0]
@@ -270,34 +256,29 @@ jobs:
               org          = contact["organization"]
               county       = contact["county"]
               emails       = {}
-
               emails["email_1"] = claude(f"""Write cold outreach Email 1 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {meeting_link}
           Rules: Professional but warm, 150-200 words, open with something specific to their role as {contact['title']},
           CTA: Book 15-min demo at {meeting_link}, sign off "{ae_first} from Rev.ai", no pricing.
           Return ONLY the email body.""", max_tokens=400)
               time.sleep(1)
-
               emails["email_2"] = claude(f"""Write follow-up Email 2 of 4 from {ae_first} at Rev.ai to {name} at {org}.
           No response to first email about {angles['use_case']}.
           Rules: 100-150 words, lead with: {angles['proof']}, ask if priority now,
           CTA: {meeting_link}, sign off "{ae_first} from Rev.ai", no "just following up".
           Return ONLY the email body.""", max_tokens=350)
               time.sleep(1)
-
               emails["email_3"] = claude(f"""Write value-add Email 3 of 4 from {ae_first} at Rev.ai to {name} at {org}.
           No response to 2 emails about {angles['use_case']}.
           Rules: 100-150 words, lead with insight about AI transcription in law enforcement,
           feel like helpful resource not sales pitch, CTA: "Worth a quick 15-min call?" + {meeting_link},
           sign off "{ae_first} from Rev.ai". Return ONLY the email body.""", max_tokens=350)
               time.sleep(1)
-
               emails["email_4"] = claude(f"""Write break-up Email 4 of 4 from {ae_first} at Rev.ai to {name} at {org}.
           Final email about {angles['use_case']}.
           Rules: 75-100 words, acknowledge they're busy, leave door open "if timing changes",
           soft CTA: {meeting_link}, sign off "{ae_first} from Rev.ai", warm not passive aggressive.
           Return ONLY the email body.""", max_tokens=250)
-
               return emails
 
           def gen_subject(contact, email_num=1):
@@ -311,7 +292,7 @@ jobs:
               }
               return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
 
-          # ── Buying role mapping ───────────────────────────────────
+          # ── Buying role ───────────────────────────────────────────
           def get_buying_role(title):
               t = title.lower()
               if any(x in t for x in ["sheriff", "district attorney", "chief of police", "public defender", "chief deputy"]):
@@ -328,33 +309,27 @@ jobs:
           def create_contact(contact, email_body, subject, ae_name):
               buying_role = get_buying_role(contact.get("title", ""))
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
-
               props = {
-                  "firstname":              contact["first_name"],
-                  "lastname":               contact["last_name"],
-                  "jobtitle":               contact["title"],
-                  "company":                contact["organization"],
-                  "state":                  "California",
-                  "city":                   f"{contact['county']} County",
-                  "hs_lead_status":         "NEW",
-                  "leadsource":             LEADSOURCE_VALUE,
-                  "lead_source_details":    "JL OB",
+                  "firstname":           contact["first_name"],
+                  "lastname":            contact["last_name"],
+                  "jobtitle":            contact["title"],
+                  "company":             contact["organization"],
+                  "state":               "California",
+                  "city":                f"{contact['county']} County",
+                  "hs_lead_status":      "NEW",
+                  "leadsource":          LEADSOURCE_VALUE,
+                  "lead_source_details": "JL OB",
               }
-              if owner_map.get(ae_name):  props["hubspot_owner_id"] = owner_map[ae_name]
-              if contact.get("email"):    props["email"]   = contact["email"]
-              if contact.get("phone"):    props["phone"]   = contact["phone"]
-              if contact.get("website"):  props["website"] = contact["website"]
-
+              if owner_map.get(ae_name): props["hubspot_owner_id"] = owner_map[ae_name]
+              if contact.get("email"):   props["email"]   = contact["email"]
+              if contact.get("phone"):   props["phone"]   = contact["phone"]
+              if contact.get("website"): props["website"] = contact["website"]
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
               print(f"    Contact API response: {json.dumps(resp)[:500]}")
               if not contact_id:
-                  print(f"    ❌ Full error: {json.dumps(resp)}")
-              if not contact_id:
-                  print(f"    ❌ Contact creation failed: {resp}")
+                  print(f"    ❌ Contact creation failed: {json.dumps(resp)}")
                   return None
-
-              # Save all 4 emails as note
               note = (
                   f"OUTBOUND EMAIL\nSubject: {subject}\n"
                   f"County: {contact.get('county','')}\nDept: {dept}\n"
@@ -370,6 +345,26 @@ jobs:
                       "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
               })
               return contact_id
+
+          # ── Publish state to GitHub Gist ─────────────────────────
+          def publish_gist(state):
+              if not GIST_TOKEN:
+                  print("No GIST_TOKEN — skipping gist publish")
+                  return None
+              headers = {"Authorization": f"token {GIST_TOKEN}", "Content-Type": "application/json"}
+              payload = {"files": {"ob_agent_state.json": {"content": json.dumps(state, indent=2)}}}
+              if GIST_ID:
+                  r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
+              else:
+                  payload["description"] = "OB Agent County State"
+                  payload["public"] = True
+                  r = requests.post("https://api.github.com/gists", headers=headers, json=payload)
+              data = r.json()
+              gist_url = data.get("html_url", "")
+              raw_url  = data.get("files", {}).get("ob_agent_state.json", {}).get("raw_url", "")
+              print(f"✅ Gist published: {gist_url}")
+              print(f"📄 Raw URL: {raw_url}")
+              return raw_url
 
           # ── Main loop ─────────────────────────────────────────────
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
@@ -394,10 +389,10 @@ jobs:
                           print(f"    Found {len(leads)} leads")
                       for lead in leads:
                           if len(added) >= LEADS_PER_AE: break
-                          fn = lead.get("first_name","")
-                          ln = lead.get("last_name","")
+                          fn = lead.get("first_name", "")
+                          ln = lead.get("last_name", "")
                           if not fn or not ln: continue
-                          if is_duplicate(lead.get("email",""), fn, ln):
+                          if is_duplicate(lead.get("email", ""), fn, ln):
                               skipped += 1
                               print(f"    ↩ Duplicate: {fn} {ln}")
                               continue
@@ -420,21 +415,18 @@ jobs:
                           if contact_id:
                               added.append({
                                   "name":    f"{fn} {ln}",
-                                  "title":   lead.get("title",""),
-                                  "org":     lead.get("organization",""),
+                                  "title":   lead.get("title", ""),
+                                  "org":     lead.get("organization", ""),
                                   "id":      contact_id,
                                   "subject": subject1
                               })
-                              # Track county-level lead count
-                              cl = state[ae_name]["county_leads"]
-                              cl[county] = cl.get(county, 0) + 1
+                              state[ae_name]["county_leads"][county] = state[ae_name]["county_leads"].get(county, 0) + 1
                               print(f"    ✅ Added: {fn} {ln} — {lead.get('title')}")
                           time.sleep(1)
                   except Exception as e:
                       print(f"    Error: {e}")
                   time.sleep(2)
 
-              # County exhaustion logic — only move when ALL leads are duplicates
               print(f"  Summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
               if not found_any:
                   print(f"  ℹ️ No leads found — keeping {county} for next run")
@@ -456,31 +448,10 @@ jobs:
           save_state(state)
           print(f"\nState saved: {json.dumps(state, indent=2)}")
 
-          # ── Publish state to GitHub Gist ─────────────────────────
-          def publish_gist(state):
-              if not GIST_TOKEN:
-                  print("No GIST_TOKEN — skipping gist publish")
-                  return
-              payload = {"files": {"ob_agent_state.json": {"content": json.dumps(state, indent=2)}}}
-              headers = {"Authorization": f"token {GIST_TOKEN}", "Content-Type": "application/json"}
-              if GIST_ID:
-                  r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
-              else:
-                  payload["description"] = "OB Agent County State"
-                  payload["public"] = True
-                  r = requests.post("https://api.github.com/gists", headers=headers, json=payload)
-              data = r.json()
-              gist_url = data.get("html_url", "")
-              raw_url  = data.get("files", {}).get("ob_agent_state.json", {}).get("raw_url", "")
-              print(f"Gist published: {gist_url}")
-              print(f"Raw URL: {raw_url}")
-              return raw_url
-          LIST_URLS = {
-              "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
-              "Will Weis":      f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9562",
-              "Dillon DeWitt":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9561",
-          }
+          # ── Publish to Gist ───────────────────────────────────────
+          publish_gist(state)
 
+          # ── Slack summary ─────────────────────────────────────────
           total_added = sum(len(r["added"]) for r in results.values())
           total_skip  = sum(r["skipped"]    for r in results.values())
 
@@ -491,7 +462,7 @@ jobs:
           for ae_name, data in results.items():
               county   = data["county"]
               added    = data["added"]
-              next_c   = state[ae_name].get("county","")
+              next_c   = state[ae_name].get("county", "")
               next_str = f" → moving to *{next_c}* tomorrow" if next_c and next_c != county else ""
               list_url = LIST_URLS[ae_name]
 
@@ -505,7 +476,6 @@ jobs:
               if not added:
                   msg += "  No new leads added today\n"
 
-              # County breakdown table
               county_leads = state[ae_name].get("county_leads", {})
               if county_leads:
                   msg += f"  *📊 County Breakdown:*\n"

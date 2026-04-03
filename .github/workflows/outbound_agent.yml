@@ -38,14 +38,19 @@ jobs:
           TIER_COUNTIES = [
               "Sonoma", "Solano", "Santa Cruz", "Merced", "Butte",
               "Yolo", "El Dorado", "Imperial", "Kings", "Madera",
-              "Napa", "Placer", "Shasta", "Nevada", "Sutter"
+              "Napa", "Placer", "Shasta", "Nevada", "Sutter",
+              "Tehama", "Lake", "Calaveras", "Amador", "Tuolumne",
+              "San Benito", "Colusa", "Glenn", "Lassen", "Modoc",
+              "Trinity", "Siskiyou", "Del Norte", "Humboldt", "Mendocino",
+              "Plumas", "Sierra", "Alpine", "Mono", "Inyo",
+              "Marin", "Contra Costa", "Alameda", "San Mateo", "Santa Clara"
           ]
 
           ORG_TYPES = [
-              {"type": "Sheriff",           "titles": ["Sheriff", "Chief Deputy Sheriff", "Commander", "Captain"]},
-              {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Chief Investigator"]},
-              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Deputy Public Defender"]},
-              {"type": "Police Department", "titles": ["Chief of Police", "Deputy Chief", "Commander"]},
+              {"type": "Sheriff",           "titles": ["Sheriff", "Undersheriff", "Chief Deputy Sheriff", "Commander", "Captain", "Lieutenant", "Sergeant"]},
+              {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Chief Investigator", "Senior Investigator"]},
+              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender"]},
+              {"type": "Police Department", "titles": ["Chief of Police", "Deputy Chief", "Assistant Chief", "Commander", "Captain", "Lieutenant"]},
           ]
 
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
@@ -147,6 +152,12 @@ jobs:
                   "James Gregory":  {"county": TIER_COUNTIES[2], "exhausted": []},
               }
 
+          # ── Excluded counties (already enriched) ─────────────────
+          EXCLUDED_COUNTIES = [
+              "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
+              "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
+          ]
+
           def next_county_for_ae(ae_name, state):
               other_counties = [state[a]["county"] for a in AES if a != ae_name and state[a]["county"]]
               exhausted      = state[ae_name]["exhausted"]
@@ -154,12 +165,6 @@ jobs:
                   if county not in exhausted and county not in other_counties and county not in EXCLUDED_COUNTIES:
                       return county
               return None
-
-          # ── Excluded counties (already enriched) ─────────────────
-          EXCLUDED_COUNTIES = [
-              "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
-              "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
-          ]
 
           # ── Load or init state ────────────────────────────────────
           state = load_state()
@@ -320,14 +325,15 @@ jobs:
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
 
               props = {
-                  "firstname":        contact["first_name"],
-                  "lastname":         contact["last_name"],
-                  "jobtitle":         contact["title"],
-                  "company":          contact["organization"],
-                  "state":            "California",
-                  "city":             f"{contact['county']} County",
-                  "hs_lead_status":   "NEW",
-                  "leadsource":       LEADSOURCE_VALUE,
+                  "firstname":              contact["first_name"],
+                  "lastname":               contact["last_name"],
+                  "jobtitle":               contact["title"],
+                  "company":                contact["organization"],
+                  "state":                  "California",
+                  "city":                   f"{contact['county']} County",
+                  "hs_lead_status":         "NEW",
+                  "leadsource":             LEADSOURCE_VALUE,
+                  "lead_source_details":    "JL OB",
               }
               if owner_map.get(ae_name):  props["hubspot_owner_id"] = owner_map[ae_name]
               if contact.get("email"):    props["email"]   = contact["email"]
@@ -474,7 +480,7 @@ jobs:
                   msg += "  No new leads added today\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v8_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v10_"
 
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})

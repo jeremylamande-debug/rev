@@ -1,0 +1,78 @@
+name: OB Dashboard Test — Mock Data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish-mock-dashboard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Publish Mock State to Gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, json
+
+          GIST_TOKEN = "${{ secrets.GIST_TOKEN }}"
+
+          # ── Mock state (simulates real county_leads data) ─────────
+          mock_state = {
+              "Dillon DeWitt": {
+                  "county": "El Dorado",
+                  "exhausted": ["Merced", "Butte", "Yolo"],
+                  "county_leads": {
+                      "Merced": 45,
+                      "Butte":  50,
+                      "Yolo":   13,
+                      "El Dorado": 8
+                  }
+              },
+              "Will Weis": {
+                  "county": "Napa",
+                  "exhausted": ["Santa Cruz", "Solano"],
+                  "county_leads": {
+                      "Santa Cruz": 38,
+                      "Solano":     50,
+                      "Napa":       22
+                  }
+              },
+              "James Gregory": {
+                  "county": "Placer",
+                  "exhausted": ["Butte", "Santa Cruz"],
+                  "county_leads": {
+                      "Butte":      50,
+                      "Santa Cruz": 19,
+                      "Placer":     6
+                  }
+              }
+          }
+
+          # ── Publish to Gist ───────────────────────────────────────
+          headers = {
+              "Authorization": f"token {GIST_TOKEN}",
+              "Content-Type": "application/json"
+          }
+
+          payload = {
+              "description": "OB Agent County State — TEST",
+              "public": True,
+              "files": {
+                  "ob_agent_state.json": {
+                      "content": json.dumps(mock_state, indent=2)
+                  }
+              }
+          }
+
+          r = requests.post("https://api.github.com/gists", headers=headers, json=payload)
+          data = r.json()
+
+          gist_url = data.get("html_url", "")
+          raw_url  = data.get("files", {}).get("ob_agent_state.json", {}).get("raw_url", "")
+
+          print(f"\n✅ Gist created!")
+          print(f"🔗 Gist URL: {gist_url}")
+          print(f"📄 Raw URL (paste into dashboard): {raw_url}")
+          EOF

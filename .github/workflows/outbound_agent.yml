@@ -80,6 +80,8 @@ jobs:
               "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
           }
 
+          ACTIVE_COLOR = "#7c3aed"  # Purple — consistent across all AEs
+
           AE_COLORS = {
               "Dillon DeWitt":  "#2563eb",
               "Will Weis":      "#7c3aed",
@@ -397,7 +399,7 @@ jobs:
                   else:
                       counties = list(county_leads.keys())
                       counts   = list(county_leads.values())
-                      bar_colors = ['#4ade80' if c in exhausted else color for c in counties]
+                      bar_colors = ['#4ade80' if c in exhausted else ACTIVE_COLOR for c in counties]
                       bars = ax.barh(counties, counts, color=bar_colors, height=0.6)
 
                       for bar, county, count in zip(bars, counties, counts):
@@ -419,7 +421,7 @@ jobs:
                   # Legend
                   patches = [
                       mpatches.Patch(color='#4ade80', label='Exhausted'),
-                      mpatches.Patch(color=color, label='Active'),
+                      mpatches.Patch(color=ACTIVE_COLOR, label='Active'),
                   ]
                   ax.legend(handles=patches, loc='lower right', fontsize=8,
                             facecolor='#333', labelcolor='white', edgecolor='#555')
@@ -604,7 +606,7 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v16_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v17_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})

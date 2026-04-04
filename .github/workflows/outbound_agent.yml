@@ -33,6 +33,7 @@ jobs:
           PORTAL_ID     = "21451281"
           LEADS_PER_AE  = 50
           SLACK_USER    = "U08JJMM2QSW"
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -373,7 +374,7 @@ jobs:
               return data.get("html_url", "")
 
           # ── Generate county chart ─────────────────────────────────
-          def generate_chart(state, today_str):
+          def generate_chart(state, results, today_str):
               fig, axes = plt.subplots(1, 3, figsize=(18, 6))
               fig.patch.set_facecolor('#1a1d21')
               fig.suptitle(f'OB Agent — County Breakdown\n{today_str}',
@@ -387,7 +388,7 @@ jobs:
 
                   county_leads = state[ae_name].get("county_leads", {})
                   exhausted    = state[ae_name].get("exhausted", [])
-                  active       = state[ae_name].get("county", "")
+                  active       = results[ae_name]["county"]
                   color        = AE_COLORS[ae_name]
 
                   if not county_leads:
@@ -566,11 +567,11 @@ jobs:
               headers=SLACK_HEADERS, json={"users": SLACK_USER})
           dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")
 
-          # ── Generate & upload chart ───────────────────────────────
-          chart_path = generate_chart(state, today_str)
-          upload_chart_to_slack(chart_path, dm_ch, today_str)
+          # ── Generate & upload chart to #daily-ob ──────────────────
+          chart_path = generate_chart(state, results, today_str)
+          upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
 
-          # ── Slack text summary ────────────────────────────────────
+          # ── Slack text summary → #daily-ob ────────────────────────
           total_added = sum(len(r["added"]) for r in results.values())
           total_skip  = sum(r["skipped"]    for r in results.values())
 
@@ -603,10 +604,10 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v14_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v16_"
 
           requests.post("https://slack.com/api/chat.postMessage",
-              headers=SLACK_HEADERS, json={"channel": dm_ch, "text": msg})
+              headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
 
           print(f"\n✅ Done! {total_added} leads added today.")
           EOF

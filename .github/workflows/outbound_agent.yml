@@ -434,26 +434,32 @@ jobs:
           # ── Upload chart to Slack ─────────────────────────────────
           def upload_chart_to_slack(chart_path, channel_id, today_str):
               try:
+                  file_size = os.path.getsize(chart_path)
+                  print(f"Chart file size: {file_size} bytes")
+
                   # Step 1: Get upload URL
                   r = requests.get(
                       "https://slack.com/api/files.getUploadURLExternal",
                       headers=SLACK_HEADERS,
-                      params={"filename": "ob_chart.png", "length": os.path.getsize(chart_path)}
+                      params={"filename": "ob_chart.png", "length": file_size}
                   )
                   data = r.json()
+                  print(f"Upload URL response: {json.dumps(data)}")
                   if not data.get("ok"):
-                      print(f"Failed to get upload URL: {data}")
+                      print(f"❌ Failed to get upload URL: {data.get('error')}")
                       return None
                   upload_url = data["upload_url"]
                   file_id    = data["file_id"]
 
-                  # Step 2: Upload file
+                  # Step 2: Upload file bytes
                   with open(chart_path, "rb") as f:
-                      requests.post(upload_url, data=f,
-                                    headers={"Content-Type": "application/octet-stream"})
+                      file_bytes = f.read()
+                  r2 = requests.post(upload_url, data=file_bytes,
+                                     headers={"Content-Type": "application/octet-stream"})
+                  print(f"Upload response status: {r2.status_code}")
 
-                  # Step 3: Complete upload
-                  r = requests.post(
+                  # Step 3: Complete upload and share to channel
+                  r3 = requests.post(
                       "https://slack.com/api/files.completeUploadExternal",
                       headers=SLACK_HEADERS,
                       json={
@@ -461,8 +467,12 @@ jobs:
                           "channel_id": channel_id
                       }
                   )
-                  result = r.json()
-                  print(f"Chart upload: {result.get('ok')} {result.get('error','')}")
+                  result = r3.json()
+                  print(f"Complete upload response: {json.dumps(result)}")
+                  if result.get("ok"):
+                      print(f"✅ Chart uploaded successfully")
+                  else:
+                      print(f"❌ Chart upload failed: {result.get('error')}")
                   return file_id
               except Exception as e:
                   print(f"Chart upload error: {e}")
@@ -593,7 +603,7 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v13_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v14_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": dm_ch, "text": msg})

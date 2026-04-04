@@ -2,7 +2,7 @@ name: Daily Revenue Briefing
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'  # 8:00 AM ET (UTC-5), Mon–Fri v2
+    - cron: '0 13 * * 1-5'  # 9:00 AM ET (UTC-4 EDT), Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Post Daily Pipe Update with Chart
+      - name: Post Daily Pipe Update with QMH
         env:
           HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -26,18 +26,29 @@ jobs:
           SELLERS       = ["Dillon DeWitt", "Will Weis", "Isabella Simpatico", "James Gregory"]
           PORTAL_ID     = "21451281"
 
+          LEGAL_INDUSTRIES = {"Government", "Legal", "Law Enforcement"}
+          CORE_INDUSTRIES  = {"Marketing", "Technology", "Finance", "Consulting", "Media",
+                               "Healthcare", "Content Creation", "Education", "Research", "Other"}
+
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
 
-          # ── Date range: previous calendar day ET ──────────────────
+          # ── Date ranges ───────────────────────────────────────────
           et        = pytz.timezone("America/New_York")
           now_et    = datetime.datetime.now(et)
           yesterday = now_et - datetime.timedelta(days=1)
+
+          # Yesterday window (for daily deals)
           start_et  = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0))
           end_et    = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59))
           start_ms  = int(start_et.timestamp() * 1000)
           end_ms    = int(end_et.timestamp() * 1000)
           date_label = yesterday.strftime("%A, %B %d, %Y")
+
+          # MTD window (for QMH MTD)
+          mtd_start = et.localize(datetime.datetime(now_et.year, now_et.month, 1, 0, 0, 0))
+          mtd_start_ms = int(mtd_start.timestamp() * 1000)
+          now_ms    = int(now_et.timestamp() * 1000)
 
           # ── HubSpot helpers ────────────────────────────────────────
           def hs_get(path):
@@ -45,15 +56,34 @@ jobs:
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
 
           def hs_post(path, payload):
-              req = urllib.request.Request(
+              data = json.dumps(payload).encode()
+              req  = urllib.request.Request(
                   f"https://api.hubapi.com{path}",
-                  data=json.dumps(payload).encode(), headers=HS_HEADERS, method="POST")
+                  data=data, headers=HS_HEADERS, method="POST")
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
 
+          def hs_post_all(path, payload, limit=100):
+              """Paginate through all results."""
+              all_results = []
+              offset = 0
+              while True:
+                  payload["limit"]  = limit
+                  payload["after"]  = offset
+                  resp = hs_post(path, payload)
+                  results = resp.get("results", [])
+                  all_results.extend(results)
+                  paging = resp.get("paging", {}).get("next", {})
+                  offset = paging.get("after")
+                  if not offset or len(results) < limit:
+                      break
+              return all_results
+
           # ── Get owners ─────────────────────────────────────────────
-          owners = hs_get("/crm/v3/owners").get("results", [])
+          owners    = hs_get("/crm/v3/owners").get("results", [])
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+          id_to_name = {o["id"]: f"{o['firstName']} {o['lastName']}" for o in owners}
           seller_ids = {name: owner_map.get(name) for name in SELLERS}
+          print(f"Seller IDs: {seller_ids}")
 
           # ── Fetch yesterday's deals ────────────────────────────────
           deals = hs_post("/crm/v3/objects/deals/search", {
@@ -66,7 +96,7 @@ jobs:
               "limit": 100
           }).get("results", [])
 
-          # ── Map deals to sellers ───────────────────────────────────
+          # ── Helpers ────────────────────────────────────────────────
           def fmt_currency(val):
               try: return f"${float(val):,.0f}"
               except: return "$0"
@@ -78,9 +108,10 @@ jobs:
                   return d.strftime("%b %d, %Y")
               except: return iso
 
+          # ── Map deals to sellers ───────────────────────────────────
           seller_deals = {s: [] for s in SELLERS}
           for deal in deals:
-              p = deal.get("properties", {})
+              p   = deal.get("properties", {})
               oid = p.get("hubspot_owner_id")
               for name, sid in seller_ids.items():
                   if str(oid) == str(sid):
@@ -88,16 +119,96 @@ jobs:
 
           total_deals = sum(len(v) for v in seller_deals.values())
           total_acv   = sum(float(d.get("amount") or 0) for v in seller_deals.values() for d in v)
-
-          # ── ACV values per seller for chart ───────────────────────
           acv_vals    = [sum(float(d.get("amount") or 0) for d in seller_deals[s]) for s in SELLERS]
           short_names = [s.split()[0] for s in SELLERS]
 
-          # ── Build Slack text message ───────────────────────────────
-          msg  = f"<@{SLACK_USER}>\n"
-          msg += f"*Daily Pipe Update — {date_label}*\n"
-          msg += f"*{total_deals} new deal{'s' if total_deals != 1 else ''} created | Total ACV: {fmt_currency(total_acv)}*\n\n"
+          # ── Fetch QMH meetings ────────────────────────────────────
+          def fetch_qmh_meetings(start_ms, end_ms):
+              """Fetch Held Qualified + Intro/Discovery meetings in time window."""
+              return hs_post_all("/crm/v3/objects/meetings/search", {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "hs_meeting_outcome",  "operator": "EQ",  "value": "HELD QUALIFIED"},
+                      {"propertyName": "hs_activity_type",    "operator": "EQ",  "value": "Intro/Discovery"},
+                      {"propertyName": "hs_meeting_end_time", "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_meeting_end_time", "operator": "LTE", "value": str(end_ms)},
+                  ]}],
+                  "properties": ["hs_meeting_outcome", "hs_activity_type",
+                                 "hs_meeting_end_time", "hubspot_owner_id"],
+              })
 
+          # ── Get industry group for a meeting via associated contact ─
+          contact_industry_cache = {}
+
+          def get_industry_for_meeting(meeting_id):
+              if meeting_id in contact_industry_cache:
+                  return contact_industry_cache[meeting_id]
+              try:
+                  resp = hs_get(f"/crm/v3/objects/meetings/{meeting_id}/associations/contacts")
+                  contacts = resp.get("results", [])
+                  if not contacts:
+                      contact_industry_cache[meeting_id] = None
+                      return None
+                  contact_id = contacts[0]["id"]
+                  c = hs_get(f"/crm/v3/objects/contacts/{contact_id}?properties=industry_group,industry")
+                  props = c.get("properties", {})
+                  industry = props.get("industry_group") or props.get("industry") or ""
+                  contact_industry_cache[meeting_id] = industry
+                  return industry
+              except Exception as e:
+                  print(f"Industry lookup error for meeting {meeting_id}: {e}")
+                  contact_industry_cache[meeting_id] = None
+                  return None
+
+          def classify_industry(industry):
+              if not industry: return "unknown"
+              for legal in LEGAL_INDUSTRIES:
+                  if legal.lower() in industry.lower(): return "legal"
+              for core in CORE_INDUSTRIES:
+                  if core.lower() in industry.lower(): return "core"
+              return "unknown"
+
+          # ── Build QMH counts ──────────────────────────────────────
+          def build_qmh_counts(meetings):
+              """Returns {seller_name: {"legal": n, "core": n, "total": n}}"""
+              counts = {s: {"legal": 0, "core": 0, "total": 0} for s in SELLERS}
+              for m in meetings:
+                  props = m.get("properties", {})
+                  oid   = props.get("hubspot_owner_id")
+                  owner_name = id_to_name.get(oid, "")
+                  if owner_name not in SELLERS:
+                      continue
+                  industry = get_industry_for_meeting(m["id"])
+                  bucket   = classify_industry(industry)
+                  if bucket in ("legal", "core"):
+                      counts[owner_name][bucket] += 1
+                  counts[owner_name]["total"] += 1
+              return counts
+
+          print("Fetching daily QMH meetings...")
+          daily_meetings = fetch_qmh_meetings(start_ms, end_ms)
+          print(f"Daily QMH meetings found: {len(daily_meetings)}")
+          daily_qmh = build_qmh_counts(daily_meetings)
+
+          print("Fetching MTD QMH meetings...")
+          mtd_meetings = fetch_qmh_meetings(mtd_start_ms, now_ms)
+          print(f"MTD QMH meetings found: {len(mtd_meetings)}")
+          mtd_qmh = build_qmh_counts(mtd_meetings)
+
+          # ── ASCII bar chart helper ─────────────────────────────────
+          def ascii_chart(names, values, max_bar=20):
+              max_val = max(values) if max(values) > 0 else 1
+              lines   = []
+              for name, val in zip(names, values):
+                  bar = "█" * int((val / max_val) * max_bar)
+                  lines.append(f"{name:<12} {str(val):>6}  {bar}")
+              return lines
+
+          # ── Build Slack message ───────────────────────────────────
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*📊 Daily Pipe Update — {date_label}*\n"
+          msg += f"*{total_deals} new deal{'s' if total_deals != 1 else ''} | Total ACV: {fmt_currency(total_acv)}*\n\n"
+
+          # Deal details per seller
           for seller in SELLERS:
               sd = seller_deals[seller]
               if not sd:
@@ -116,23 +227,52 @@ jobs:
                       msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
                   msg += "\n"
 
-          # ── Build ASCII bar chart for Slack ───────────────────────
-          max_bar = 20  # max bar width in chars
-          max_acv = max(acv_vals) if max(acv_vals) > 0 else 1
-          chart_lines = ["```"]
-          chart_lines.append(f"{'Rep':<12} {'ACV':>10}  Chart")
-          chart_lines.append("─" * 45)
+          # ACV chart
+          msg += "```\n"
+          msg += f"{'Rep':<12} {'ACV':>10}  Chart\n"
+          msg += "─" * 45 + "\n"
           for name, val in zip(short_names, acv_vals):
-              bar_len = int((val / max_acv) * max_bar)
-              bar     = "█" * bar_len
-              chart_lines.append(f"{name:<12} {fmt_currency(val):>10}  {bar}")
-          chart_lines.append("```")
-          chart_str = "\n".join(chart_lines)
+              max_acv = max(acv_vals) if max(acv_vals) > 0 else 1
+              bar     = "█" * int((val / max_acv) * 20)
+              msg    += f"{name:<12} {fmt_currency(val):>10}  {bar}\n"
+          msg += "```\n\n"
 
-          # ── Post message + chart ───────────────────────────────────
-          full_msg = msg + "\n" + chart_str
-          payload  = {"channel": SLACK_CHANNEL, "text": full_msg}
+          # QMH Daily chart
+          daily_legal  = [daily_qmh[s]["legal"] for s in SELLERS]
+          daily_core   = [daily_qmh[s]["core"]  for s in SELLERS]
+          daily_totals = [daily_qmh[s]["total"] for s in SELLERS]
+          total_daily_qmh = sum(daily_totals)
 
+          msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified)*\n"
+          msg += f"*{total_daily_qmh} total qualified meetings*\n"
+          msg += "```\n"
+          msg += f"{'Rep':<12} {'Legal':>6}  {'Core':>6}  {'Total':>6}  Chart\n"
+          msg += "─" * 55 + "\n"
+          max_daily = max(daily_totals) if max(daily_totals) > 0 else 1
+          for s, legal, core, total in zip(short_names, daily_legal, daily_core, daily_totals):
+              bar = "█" * int((total / max_daily) * 15)
+              msg += f"{s:<12} {legal:>6}  {core:>6}  {total:>6}  {bar}\n"
+          msg += "```\n\n"
+
+          # QMH MTD chart
+          mtd_legal  = [mtd_qmh[s]["legal"] for s in SELLERS]
+          mtd_core   = [mtd_qmh[s]["core"]  for s in SELLERS]
+          mtd_totals = [mtd_qmh[s]["total"] for s in SELLERS]
+          total_mtd_qmh = sum(mtd_totals)
+
+          msg += f"*📅 QMH — MTD (Month to Date)*\n"
+          msg += f"*{total_mtd_qmh} total qualified meetings this month*\n"
+          msg += "```\n"
+          msg += f"{'Rep':<12} {'Legal':>6}  {'Core':>6}  {'Total':>6}  Chart\n"
+          msg += "─" * 55 + "\n"
+          max_mtd = max(mtd_totals) if max(mtd_totals) > 0 else 1
+          for s, legal, core, total in zip(short_names, mtd_legal, mtd_core, mtd_totals):
+              bar = "█" * int((total / max_mtd) * 15)
+              msg += f"{s:<12} {legal:>6}  {core:>6}  {total:>6}  {bar}\n"
+          msg += "```\n"
+
+          # ── Post to Slack ──────────────────────────────────────────
+          payload = {"channel": SLACK_CHANNEL, "text": msg}
           req = urllib.request.Request(
               "https://slack.com/api/chat.postMessage",
               data=json.dumps(payload).encode(),
@@ -140,7 +280,7 @@ jobs:
           with urllib.request.urlopen(req) as r:
               result = json.loads(r.read())
               if result.get("ok"):
-                  print("✅ Message + chart posted!")
+                  print("✅ Daily Pipe Update + QMH posted!")
               else:
                   print(f"⚠️ Slack error: {result.get('error')}")
           EOF

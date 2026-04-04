@@ -61,9 +61,11 @@ jobs:
 
           ORG_TYPES = [
               {"type": "Sheriff",           "titles": ["Sheriff", "Undersheriff", "Chief Deputy Sheriff", "Commander", "Captain", "Lieutenant", "Sergeant"]},
-              {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Chief Investigator", "Senior Investigator"]},
+              {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Deputy District Attorney", "Chief Investigator", "Senior Investigator"]},
               {"type": "Public Defender",   "titles": ["Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender"]},
               {"type": "Police Department", "titles": ["Chief of Police", "Deputy Chief", "Assistant Chief", "Commander", "Captain", "Lieutenant"]},
+              {"type": "City Attorney",     "titles": ["City Attorney", "Deputy City Attorney", "Assistant City Attorney"]},
+              {"type": "Court",             "titles": ["Court Administrator", "Clerk of Court", "Chief Court Administrator", "Presiding Judge"]},
           ]
 
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
@@ -109,6 +111,16 @@ jobs:
                   "use_case": "911 call transcription and incident report automation",
                   "proof":    "police departments using Rev.ai process calls 3x faster"
               },
+              "City Attorney": {
+                  "pain":     "transcribing depositions, hearings and legal proceedings manually",
+                  "use_case": "legal proceeding transcription and deposition documentation",
+                  "proof":    "city attorney offices using Rev.ai reduce documentation time significantly"
+              },
+              "Court": {
+                  "pain":     "managing court proceeding recordings and transcription backlogs",
+                  "use_case": "court proceeding transcription and record management",
+                  "proof":    "court administrators using Rev.ai process hearings 3x faster"
+              },
           }
 
           DEPT_MAP = {
@@ -116,6 +128,8 @@ jobs:
               "District Attorney": "DA Office",
               "Public Defender":   "Public Defender",
               "Police Department": "Police Dept",
+              "City Attorney":     "City Attorney",
+              "Court":             "Court",
           }
 
           # ── HubSpot helpers ───────────────────────────────────────
@@ -486,78 +500,91 @@ jobs:
           results   = {}
 
           for ae_name in AES:
-              county    = state[ae_name]["county"]
               added     = []
               skipped   = 0
-              found_any = False
+              counties_searched = 0
+              MAX_COUNTIES_PER_RUN = 2
 
-              print(f"\n{'='*50}")
-              print(f"👤 {ae_name} → 📍 {county} County")
+              while len(added) < LEADS_PER_AE and counties_searched < MAX_COUNTIES_PER_RUN:
+                  county    = state[ae_name]["county"]
+                  found_any = False
 
-              for org in ORG_TYPES:
-                  if len(added) >= LEADS_PER_AE: break
-                  print(f"  Searching {org['type']}...")
-                  try:
-                      leads = find_leads(county, org["type"], org["titles"])
-                      if leads:
-                          found_any = True
-                          print(f"    Found {len(leads)} leads")
-                      for lead in leads:
-                          if len(added) >= LEADS_PER_AE: break
-                          fn = lead.get("first_name", "")
-                          ln = lead.get("last_name", "")
-                          if not fn or not ln: continue
-                          if is_duplicate(lead.get("email", ""), fn, ln):
-                              skipped += 1
-                              print(f"    ↩ Duplicate: {fn} {ln}")
-                              continue
-                          emails   = gen_email_sequence(lead, ae_name)
-                          subject1 = gen_subject(lead, 1)
-                          subject2 = gen_subject(lead, 2)
-                          subject3 = gen_subject(lead, 3)
-                          subject4 = gen_subject(lead, 4)
-                          email_body = (
-                              f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
-                              f"Subject: {subject1}\n\n{emails['email_1']}\n\n"
-                              f"━━━ EMAIL 2 — Day 3 (Follow Up) ━━━\n"
-                              f"Subject: {subject2}\n\n{emails['email_2']}\n\n"
-                              f"━━━ EMAIL 3 — Day 7 (Value Add) ━━━\n"
-                              f"Subject: {subject3}\n\n{emails['email_3']}\n\n"
-                              f"━━━ EMAIL 4 — Day 14 (Break Up) ━━━\n"
-                              f"Subject: {subject4}\n\n{emails['email_4']}"
-                          )
-                          contact_id = create_contact(lead, email_body, subject1, ae_name)
-                          if contact_id:
-                              added.append({
-                                  "name":    f"{fn} {ln}",
-                                  "title":   lead.get("title", ""),
-                                  "org":     lead.get("organization", ""),
-                                  "id":      contact_id,
-                                  "subject": subject1
-                              })
-                              state[ae_name]["county_leads"][county] = state[ae_name]["county_leads"].get(county, 0) + 1
-                              print(f"    ✅ Added: {fn} {ln} — {lead.get('title')}")
-                          time.sleep(1)
-                  except Exception as e:
-                      print(f"    Error: {e}")
-                  time.sleep(2)
+                  if not county:
+                      print(f"  ⚠️ No more counties for {ae_name}")
+                      break
 
-              print(f"  Summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
-              if not found_any:
-                  print(f"  ℹ️ No leads found — keeping {county} for next run")
-              elif found_any and len(added) == 0 and skipped > 0:
-                  print(f"  ⚠️ {county} fully exhausted — moving on")
-                  state[ae_name]["exhausted"].append(county)
-                  next_county = next_county_for_ae(ae_name, state)
-                  state[ae_name]["county"] = next_county or None
-                  if next_county:
-                      print(f"  ➡️ Next county: {next_county}")
+                  print(f"\n{'='*50}")
+                  print(f"👤 {ae_name} → 📍 {county} County (county {counties_searched + 1} of {MAX_COUNTIES_PER_RUN})")
+
+                  for org in ORG_TYPES:
+                      if len(added) >= LEADS_PER_AE: break
+                      print(f"  Searching {org['type']}...")
+                      try:
+                          leads = find_leads(county, org["type"], org["titles"])
+                          if leads:
+                              found_any = True
+                              print(f"    Found {len(leads)} leads")
+                          for lead in leads:
+                              if len(added) >= LEADS_PER_AE: break
+                              fn = lead.get("first_name", "")
+                              ln = lead.get("last_name", "")
+                              if not fn or not ln: continue
+                              if is_duplicate(lead.get("email", ""), fn, ln):
+                                  skipped += 1
+                                  print(f"    ↩ Duplicate: {fn} {ln}")
+                                  continue
+                              emails   = gen_email_sequence(lead, ae_name)
+                              subject1 = gen_subject(lead, 1)
+                              subject2 = gen_subject(lead, 2)
+                              subject3 = gen_subject(lead, 3)
+                              subject4 = gen_subject(lead, 4)
+                              email_body = (
+                                  f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
+                                  f"Subject: {subject1}\n\n{emails['email_1']}\n\n"
+                                  f"━━━ EMAIL 2 — Day 3 (Follow Up) ━━━\n"
+                                  f"Subject: {subject2}\n\n{emails['email_2']}\n\n"
+                                  f"━━━ EMAIL 3 — Day 7 (Value Add) ━━━\n"
+                                  f"Subject: {subject3}\n\n{emails['email_3']}\n\n"
+                                  f"━━━ EMAIL 4 — Day 14 (Break Up) ━━━\n"
+                                  f"Subject: {subject4}\n\n{emails['email_4']}"
+                              )
+                              contact_id = create_contact(lead, email_body, subject1, ae_name)
+                              if contact_id:
+                                  added.append({
+                                      "name":    f"{fn} {ln}",
+                                      "title":   lead.get("title", ""),
+                                      "org":     lead.get("organization", ""),
+                                      "id":      contact_id,
+                                      "subject": subject1
+                                  })
+                                  state[ae_name]["county_leads"][county] = state[ae_name]["county_leads"].get(county, 0) + 1
+                                  print(f"    ✅ Added: {fn} {ln} — {lead.get('title')}")
+                              time.sleep(1)
+                      except Exception as e:
+                          print(f"    Error: {e}")
+                      time.sleep(2)
+
+                  print(f"  Summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
+                  if not found_any:
+                      print(f"  ℹ️ No leads found — keeping {county} for next run")
+                      break
+                  elif found_any and len(added) == 0 and skipped > 0:
+                      print(f"  ⚠️ {county} fully exhausted — moving to next county")
+                      state[ae_name]["exhausted"].append(county)
+                      next_county = next_county_for_ae(ae_name, state)
+                      state[ae_name]["county"] = next_county or None
+                      if next_county:
+                          print(f"  ➡️ Moving to: {next_county}")
+                      else:
+                          print(f"  ⚠️ No more counties available for {ae_name}")
+                          break
                   else:
-                      print(f"  ⚠️ No more counties available for {ae_name}")
-              else:
-                  print(f"  ℹ️ {county} still has leads — staying for next run")
+                      print(f"  ℹ️ {county} still has leads — staying for next run")
+                      break
 
-              results[ae_name] = {"county": county, "added": added, "skipped": skipped}
+                  counties_searched += 1
+
+              results[ae_name] = {"county": state[ae_name]["county"] or county, "added": added, "skipped": skipped}
 
           # ── Save state & publish Gist ─────────────────────────────
           save_state(state)
@@ -606,7 +633,7 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v17_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v18_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})

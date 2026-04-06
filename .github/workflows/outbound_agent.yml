@@ -34,6 +34,7 @@ jobs:
           LEADS_PER_AE  = 50
           SLACK_USER    = "U08JJMM2QSW"
           DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
+          SEQUENCE_ID   = "304238924"
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -70,11 +71,17 @@ jobs:
 
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
 
+          # Keyed by AE name — looked up dynamically via owner_map at runtime
           MEETING_LINKS = {
               "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
               "Will Weis":      "https://meetings.hubspot.com/will-weis",
               "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
           }
+
+          def get_meeting_link(ae_name):
+              """Returns the meeting link for the contact's assigned AE.
+              Falls back to Dillon's link if AE not found."""
+              return MEETING_LINKS.get(ae_name, MEETING_LINKS["Dillon DeWitt"])
 
           LIST_URLS = {
               "Dillon DeWitt":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9561",
@@ -82,7 +89,7 @@ jobs:
               "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
           }
 
-          ACTIVE_COLOR = "#7c3aed"  # Purple — consistent across all AEs
+          ACTIVE_COLOR = "#7c3aed"
 
           AE_COLORS = {
               "Dillon DeWitt":  "#2563eb",
@@ -94,32 +101,32 @@ jobs:
               "Sheriff": {
                   "pain":     "managing body cam footage and interrogation recordings manually",
                   "use_case": "body cam transcription and interrogation documentation",
-                  "proof":    "departments using Rev.ai cut documentation time by 60%"
+                  "proof":    "departments using Rev cut documentation time by 60%"
               },
               "District Attorney": {
                   "pain":     "preparing court proceedings and managing evidence documentation",
                   "use_case": "court proceeding transcription and evidence documentation",
-                  "proof":    "DA offices using Rev.ai reduce case prep time significantly"
+                  "proof":    "DA offices using Rev reduce case prep time significantly"
               },
               "Public Defender": {
                   "pain":     "transcribing client interviews and case preparation recordings",
                   "use_case": "client interview transcription and case prep documentation",
-                  "proof":    "public defender offices using Rev.ai improve case turnaround"
+                  "proof":    "public defender offices using Rev improve case turnaround"
               },
               "Police Department": {
                   "pain":     "manually processing 911 calls and incident report recordings",
                   "use_case": "911 call transcription and incident report automation",
-                  "proof":    "police departments using Rev.ai process calls 3x faster"
+                  "proof":    "police departments using Rev process calls 3x faster"
               },
               "City Attorney": {
                   "pain":     "transcribing depositions, hearings and legal proceedings manually",
                   "use_case": "legal proceeding transcription and deposition documentation",
-                  "proof":    "city attorney offices using Rev.ai reduce documentation time significantly"
+                  "proof":    "city attorney offices using Rev reduce documentation time significantly"
               },
               "Court": {
                   "pain":     "managing court proceeding recordings and transcription backlogs",
                   "use_case": "court proceeding transcription and record management",
-                  "proof":    "court administrators using Rev.ai process hearings 3x faster"
+                  "proof":    "court administrators using Rev process hearings 3x faster"
               },
           }
 
@@ -141,13 +148,18 @@ jobs:
               r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r.json()
 
+          # All 8 ob_email_* properties confirmed created in HubSpot:
+          # ob_email_1_subject, ob_email_1_body
+          # ob_email_2_subject, ob_email_2_body
+          # ob_email_3_subject, ob_email_3_body
+          # ob_email_4_subject, ob_email_4_body
+
           # ── Owner map ─────────────────────────────────────────────
           owners    = hs_get("/crm/v3/owners").get("results", [])
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
 
           LEADSOURCE_VALUE = "Claude"
-          print(f"Using leadsource: {LEADSOURCE_VALUE}")
 
           # ── State management ──────────────────────────────────────
           STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
@@ -274,47 +286,72 @@ jobs:
 
           # ── Email sequence ────────────────────────────────────────
           def gen_email_sequence(contact, ae_name):
-              meeting_link = MEETING_LINKS[ae_name]
-              ae_first     = ae_name.split()[0]
+              meeting_link = get_meeting_link(ae_name)
               org_type     = contact.get("org_type", "Sheriff")
               angles       = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
               name         = f"{contact['title']} {contact['last_name']}"
               org          = contact["organization"]
               county       = contact["county"]
               emails       = {}
-              emails["email_1"] = claude(f"""Write cold outreach Email 1 of 4 from {ae_first} at Rev.ai to {name} at {org} in {county} County, CA.
+              emails["email_1"] = claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {county} County, CA.
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {meeting_link}
-          Rules: Professional but warm, 150-200 words, open with something specific to their role as {contact['title']},
-          CTA: Book 15-min demo at {meeting_link}, sign off "{ae_first} from Rev.ai", no pricing.
-          Return ONLY the email body.""", max_tokens=400)
+          Rules:
+          - Professional but warm, 100-130 words
+          - Open with something specific to their role as {contact['title']}
+          - Never use em dashes (—), use commas or periods instead
+          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - CTA: book 15-min demo at {meeting_link}
+          - No sign-off name, the sender is automated
+          - No pricing
+          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=400)
               time.sleep(1)
-              emails["email_2"] = claude(f"""Write follow-up Email 2 of 4 from {ae_first} at Rev.ai to {name} at {org}.
+              emails["email_2"] = claude(f"""Write follow-up Email 2 of 4 from Rev to {name} at {org}.
           No response to first email about {angles['use_case']}.
-          Rules: 100-150 words, lead with: {angles['proof']}, ask if priority now,
-          CTA: {meeting_link}, sign off "{ae_first} from Rev.ai", no "just following up".
-          Return ONLY the email body.""", max_tokens=350)
+          Rules:
+          - 75-100 words (short and punchy)
+          - Lead with: {angles['proof']}
+          - Never use em dashes (—), use commas or periods instead
+          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Ask if this is a priority right now
+          - CTA: {meeting_link}
+          - No sign-off name, the sender is automated
+          - No "just following up"
+          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=350)
               time.sleep(1)
-              emails["email_3"] = claude(f"""Write value-add Email 3 of 4 from {ae_first} at Rev.ai to {name} at {org}.
+              emails["email_3"] = claude(f"""Write value-add Email 3 of 4 from Rev to {name} at {org}.
           No response to 2 emails about {angles['use_case']}.
-          Rules: 100-150 words, lead with insight about AI transcription in law enforcement,
-          feel like helpful resource not sales pitch, CTA: "Worth a quick 15-min call?" + {meeting_link},
-          sign off "{ae_first} from Rev.ai". Return ONLY the email body.""", max_tokens=350)
+          Rules:
+          - 75-100 words
+          - Lead with an insight about AI transcription in law enforcement
+          - Never use em dashes (—), use commas or periods instead
+          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Feel like a helpful resource not a sales pitch
+          - CTA: "Worth a quick 15-min call?" + {meeting_link}
+          - No sign-off name, the sender is automated
+          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=350)
               time.sleep(1)
-              emails["email_4"] = claude(f"""Write break-up Email 4 of 4 from {ae_first} at Rev.ai to {name} at {org}.
+              emails["email_4"] = claude(f"""Write break-up Email 4 of 4 from Rev to {name} at {org}.
           Final email about {angles['use_case']}.
-          Rules: 75-100 words, acknowledge they're busy, leave door open "if timing changes",
-          soft CTA: {meeting_link}, sign off "{ae_first} from Rev.ai", warm not passive aggressive.
-          Return ONLY the email body.""", max_tokens=250)
+          Rules:
+          - 60-75 words
+          - Acknowledge they're busy, leave door open "if timing changes"
+          - Never use em dashes (—), use commas or periods instead
+          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Soft CTA: {meeting_link}
+          - No sign-off name, the sender is automated
+          - Warm not passive aggressive
+          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=250)
               return emails
 
           def gen_subject(contact, email_num=1):
+              # Emails 2 and 4 are threaded replies — no subject needed
+              if email_num in (2, 4):
+                  return ""
               org_type = contact.get("org_type", "Sheriff")
               angles   = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
               prompts  = {
-                  1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev.ai {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
-                  2: f"Follow-up subject for {contact['title']} — 2nd email about {angles['use_case']}. Under 8 words. Not 'Following up'.",
+                  1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
                   3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
-                  4: f"Break-up subject for {contact['title']} — final email. Under 8 words. Warm closing tone.",
               }
               return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
 
@@ -331,36 +368,88 @@ jobs:
                   return "LEGAL_AND_COMPLIANCE"
               return "BUDGET_HOLDER"
 
+          # ── Enroll contact in HubSpot Sequence ───────────────────
+          def enroll_in_sequence(contact_id, ae_name, contact_email):
+              if not contact_email:
+                  print(f"    ⚠️ No email — skipping sequence enrollment for contact {contact_id}")
+                  return False
+
+              sender_id = owner_map.get(ae_name)
+              if not sender_id:
+                  print(f"    ⚠️ No owner ID for {ae_name} — skipping enrollment")
+                  return False
+
+              payload = {
+                  "sequenceId":       SEQUENCE_ID,
+                  "contactId":        contact_id,
+                  "enrolledByUserId": sender_id,
+              }
+              resp = requests.post(
+                  "https://api.hubapi.com/automation/v4/sequences/enrollments",
+                  headers=HS_HEADERS,
+                  json=payload
+              )
+              if resp.status_code in (200, 201, 204):
+                  print(f"    ✅ Enrolled in sequence: contact {contact_id}")
+                  return True
+              else:
+                  print(f"    ⚠️ Sequence enrollment failed ({resp.status_code}): {resp.text[:300]}")
+                  return False
+
           # ── Create HubSpot contact ────────────────────────────────
-          def create_contact(contact, email_body, subject, ae_name):
+          def create_contact(contact, email_body, subject, ae_name, emails=None, subjects=None):
+              emails   = emails   or {}
+              subjects = subjects or {}
               buying_role = get_buying_role(contact.get("title", ""))
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
               props = {
-                  "firstname":           contact["first_name"],
-                  "lastname":            contact["last_name"],
-                  "jobtitle":            contact["title"],
-                  "company":             contact["organization"],
-                  "state":               "California",
-                  "city":                f"{contact['county']} County",
-                  "hs_lead_status":      "NEW",
-                  "leadsource":          LEADSOURCE_VALUE,
-                  "lead_source_details": "JL OB",
+                  "firstname":             contact["first_name"],
+                  "lastname":              contact["last_name"],
+                  "jobtitle":              contact["title"],
+                  "company":               contact["organization"],
+                  "state":                 "California",
+                  "city":                  f"{contact['county']} County",
+                  "hs_lead_status":        "NEW",
+                  "leadsource":            LEADSOURCE_VALUE,
+                  "lead_source_details":   "JL OB",
+                  # Email 1
+                  "ob_email_1_subject":    subjects.get(1, ""),
+                  "ob_email_1_body":       emails.get("email_1", ""),
+                  # Email 2
+                  "ob_email_2_subject":    subjects.get(2, ""),
+                  "ob_email_2_body":       emails.get("email_2", ""),
+                  # Email 3
+                  "ob_email_3_subject":    subjects.get(3, ""),
+                  "ob_email_3_body":       emails.get("email_3", ""),
+                  # Email 4
+                  "ob_email_4_subject":    subjects.get(4, ""),
+                  "ob_email_4_body":       emails.get("email_4", ""),
               }
-              if owner_map.get(ae_name): props["hubspot_owner_id"] = owner_map[ae_name]
-              if contact.get("email"):   props["email"]   = contact["email"]
-              if contact.get("phone"):   props["phone"]   = contact["phone"]
-              if contact.get("website"): props["website"] = contact["website"]
+              if owner_map.get(ae_name):       props["hubspot_owner_id"] = owner_map[ae_name]
+              if contact.get("email"):         props["email"]   = contact["email"]
+              if contact.get("phone"):         props["phone"]   = contact["phone"]
+              if contact.get("website"):       props["website"] = contact["website"]
+
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
               print(f"    Contact API response: {json.dumps(resp)[:500]}")
               if not contact_id:
                   print(f"    ❌ Contact creation failed: {json.dumps(resp)}")
                   return None
+
+              # ── Note with full sequence preview ──────────────────
               note = (
-                  f"OUTBOUND EMAIL\nSubject: {subject}\n"
+                  f"OUTBOUND EMAIL SEQUENCE\n"
                   f"County: {contact.get('county','')}\nDept: {dept}\n"
                   f"Buying Role: {buying_role}\nLead Source: Claude\n\n"
-                  f"{email_body}"
+                  f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
+                  f"Subject: {subjects.get(1,'')}\n\n{emails.get('email_1','')}\n\n"
+                  f"━━━ EMAIL 2 — Day 3 (Follow Up) ━━━\n"
+                  f"Subject: {subjects.get(2,'')}\n\n{emails.get('email_2','')}\n\n"
+                  f"━━━ EMAIL 3 — Day 7 (Value Add) ━━━\n"
+                  f"Subject: {subjects.get(3,'')}\n\n{emails.get('email_3','')}\n\n"
+                  f"━━━ EMAIL 4 — Day 14 (Break Up) ━━━\n"
+                  f"Subject: {subjects.get(4,'')}\n\n{emails.get('email_4','')}"
               )
               hs_post("/crm/v3/objects/notes", {
                   "properties": {
@@ -370,7 +459,11 @@ jobs:
                   "associations": [{"to": {"id": contact_id},
                       "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
               })
-              return contact_id
+
+              # ── Enroll in sequence if email exists ────────────────
+              enrolled = enroll_in_sequence(contact_id, ae_name, contact.get("email", ""))
+
+              return {"id": contact_id, "enrolled": enrolled}
 
           # ── Publish state to GitHub Gist ─────────────────────────
           def publish_gist(state):
@@ -405,7 +498,6 @@ jobs:
                   county_leads = state[ae_name].get("county_leads", {})
                   exhausted    = state[ae_name].get("exhausted", [])
                   active       = results[ae_name]["county"]
-                  color        = AE_COLORS[ae_name]
 
                   if not county_leads:
                       ax.text(0.5, 0.5, 'No data yet', ha='center', va='center',
@@ -432,7 +524,6 @@ jobs:
                   ax.set_title(f'{ae_name}\n{total} total · {active} active',
                                color='white', fontsize=10, fontweight='bold', pad=10)
 
-                  # Legend
                   patches = [
                       mpatches.Patch(color='#4ade80', label='Exhausted'),
                       mpatches.Patch(color=ACTIVE_COLOR, label='Active'),
@@ -452,30 +543,21 @@ jobs:
           def upload_chart_to_slack(chart_path, channel_id, today_str):
               try:
                   file_size = os.path.getsize(chart_path)
-                  print(f"Chart file size: {file_size} bytes")
-
-                  # Step 1: Get upload URL
                   r = requests.get(
                       "https://slack.com/api/files.getUploadURLExternal",
                       headers=SLACK_HEADERS,
                       params={"filename": "ob_chart.png", "length": file_size}
                   )
                   data = r.json()
-                  print(f"Upload URL response: {json.dumps(data)}")
                   if not data.get("ok"):
                       print(f"❌ Failed to get upload URL: {data.get('error')}")
                       return None
                   upload_url = data["upload_url"]
                   file_id    = data["file_id"]
-
-                  # Step 2: Upload file bytes
                   with open(chart_path, "rb") as f:
                       file_bytes = f.read()
-                  r2 = requests.post(upload_url, data=file_bytes,
-                                     headers={"Content-Type": "application/octet-stream"})
-                  print(f"Upload response status: {r2.status_code}")
-
-                  # Step 3: Complete upload and share to channel
+                  requests.post(upload_url, data=file_bytes,
+                                headers={"Content-Type": "application/octet-stream"})
                   r3 = requests.post(
                       "https://slack.com/api/files.completeUploadExternal",
                       headers=SLACK_HEADERS,
@@ -485,7 +567,6 @@ jobs:
                       }
                   )
                   result = r3.json()
-                  print(f"Complete upload response: {json.dumps(result)}")
                   if result.get("ok"):
                       print(f"✅ Chart uploaded successfully")
                   else:
@@ -533,32 +614,39 @@ jobs:
                                   skipped += 1
                                   print(f"    ↩ Duplicate: {fn} {ln}")
                                   continue
-                              emails   = gen_email_sequence(lead, ae_name)
-                              subject1 = gen_subject(lead, 1)
-                              subject2 = gen_subject(lead, 2)
-                              subject3 = gen_subject(lead, 3)
-                              subject4 = gen_subject(lead, 4)
-                              email_body = (
-                                  f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
-                                  f"Subject: {subject1}\n\n{emails['email_1']}\n\n"
-                                  f"━━━ EMAIL 2 — Day 3 (Follow Up) ━━━\n"
-                                  f"Subject: {subject2}\n\n{emails['email_2']}\n\n"
-                                  f"━━━ EMAIL 3 — Day 7 (Value Add) ━━━\n"
-                                  f"Subject: {subject3}\n\n{emails['email_3']}\n\n"
-                                  f"━━━ EMAIL 4 — Day 14 (Break Up) ━━━\n"
-                                  f"Subject: {subject4}\n\n{emails['email_4']}"
+
+                              emails_body = gen_email_sequence(lead, ae_name)
+                              subjects = {
+                                  1: gen_subject(lead, 1),
+                                  2: gen_subject(lead, 2),
+                                  3: gen_subject(lead, 3),
+                                  4: gen_subject(lead, 4),
+                              }
+
+                              result = create_contact(
+                                  lead,
+                                  email_body="",
+                                  subject=subjects[1],
+                                  ae_name=ae_name,
+                                  emails=emails_body,
+                                  subjects=subjects,
                               )
-                              contact_id = create_contact(lead, email_body, subject1, ae_name)
-                              if contact_id:
+
+                              if result and result.get("id"):
+                                  contact_id = result["id"]
+                                  enrolled   = result.get("enrolled", False)
                                   added.append({
-                                      "name":    f"{fn} {ln}",
-                                      "title":   lead.get("title", ""),
-                                      "org":     lead.get("organization", ""),
-                                      "id":      contact_id,
-                                      "subject": subject1
+                                      "name":     f"{fn} {ln}",
+                                      "title":    lead.get("title", ""),
+                                      "org":      lead.get("organization", ""),
+                                      "id":       contact_id,
+                                      "subject":  subjects[1],
+                                      "enrolled": enrolled,
+                                      "email":    lead.get("email", ""),
                                   })
                                   state[ae_name]["county_leads"][county] = state[ae_name]["county_leads"].get(county, 0) + 1
-                                  print(f"    ✅ Added: {fn} {ln} — {lead.get('title')}")
+                                  enroll_icon = "📧" if enrolled else "📭"
+                                  print(f"    ✅ Added: {fn} {ln} — {lead.get('title')} {enroll_icon}")
                               time.sleep(1)
                       except Exception as e:
                           print(f"    Error: {e}")
@@ -596,17 +684,18 @@ jobs:
               headers=SLACK_HEADERS, json={"users": SLACK_USER})
           dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")
 
-          # ── Generate & upload chart to #daily-ob ──────────────────
+          # ── Generate & upload chart ───────────────────────────────
           chart_path = generate_chart(state, results, today_str)
           upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
 
-          # ── Slack text summary → #daily-ob ────────────────────────
-          total_added = sum(len(r["added"]) for r in results.values())
-          total_skip  = sum(r["skipped"]    for r in results.values())
+          # ── Slack summary → #daily-ob ─────────────────────────────
+          total_added    = sum(len(r["added"]) for r in results.values())
+          total_skip     = sum(r["skipped"]    for r in results.values())
+          total_enrolled = sum(1 for r in results.values() for c in r["added"] if c.get("enrolled"))
 
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — {today_str}*\n"
-          msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n\n"
+          msg += f"*{total_added} new leads added | {total_enrolled} enrolled in sequence | {total_skip} duplicates skipped*\n\n"
 
           for ae_name, data in results.items():
               county   = data["county"]
@@ -619,8 +708,9 @@ jobs:
               msg += f" | <{list_url}|View Segment>\n"
               msg += f"*{len(added)} leads added*\n"
               for c in added:
-                  hs_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
-                  msg += f"  • <{hs_url}|{c['name']}> — {c['title']} @ {c['org']}\n"
+                  hs_url       = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
+                  enroll_label = "📧 enrolled" if c.get("enrolled") else "📭 no email"
+                  msg += f"  • <{hs_url}|{c['name']}> — {c['title']} @ {c['org']} _{enroll_label}_\n"
                   msg += f"    _{c['subject']}_\n"
               if not added:
                   msg += "  No new leads added today\n"
@@ -633,10 +723,10 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v18_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v22_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
 
-          print(f"\n✅ Done! {total_added} leads added today.")
+          print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")
           EOF

@@ -2,7 +2,7 @@ name: Daily Revenue Briefing
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'  # 9:00 AM ET (UTC-4 EDT), Mon–Fri
+    - cron: '0 7 * * 2-6'  # 3:00 AM ET (UTC-4 EDT), Tue–Sat
   workflow_dispatch:
 
 jobs:

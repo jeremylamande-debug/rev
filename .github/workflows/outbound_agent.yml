@@ -2,7 +2,7 @@ name: Daily Outbound Agent — CA Law Enforcement
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'  # 8:00 AM ET (UTC-4 EDT), Mon–Fri
+    - cron: '0 6 * * 1-5'  # 2:00 AM ET (UTC-4 EDT), Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -71,7 +71,6 @@ jobs:
 
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
 
-          # Keyed by AE name — looked up dynamically via owner_map at runtime
           MEETING_LINKS = {
               "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
               "Will Weis":      "https://meetings.hubspot.com/will-weis",
@@ -79,8 +78,6 @@ jobs:
           }
 
           def get_meeting_link(ae_name):
-              """Returns the meeting link for the contact's assigned AE.
-              Falls back to Dillon's link if AE not found."""
               return MEETING_LINKS.get(ae_name, MEETING_LINKS["Dillon DeWitt"])
 
           LIST_URLS = {
@@ -147,12 +144,6 @@ jobs:
           def hs_post(path, payload):
               r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r.json()
-
-          # All 8 ob_email_* properties confirmed created in HubSpot:
-          # ob_email_1_subject, ob_email_1_body
-          # ob_email_2_subject, ob_email_2_body
-          # ob_email_3_subject, ob_email_3_body
-          # ob_email_4_subject, ob_email_4_body
 
           # ── Owner map ─────────────────────────────────────────────
           owners    = hs_get("/crm/v3/owners").get("results", [])
@@ -344,7 +335,6 @@ jobs:
               return emails
 
           def gen_subject(contact, email_num=1):
-              # Emails 2 and 4 are threaded replies — no subject needed
               if email_num in (2, 4):
                   return ""
               org_type = contact.get("org_type", "Sheriff")
@@ -373,12 +363,10 @@ jobs:
               if not contact_email:
                   print(f"    ⚠️ No email — skipping sequence enrollment for contact {contact_id}")
                   return False
-
               sender_id = owner_map.get(ae_name)
               if not sender_id:
                   print(f"    ⚠️ No owner ID for {ae_name} — skipping enrollment")
                   return False
-
               payload = {
                   "sequenceId":       SEQUENCE_ID,
                   "contactId":        contact_id,
@@ -412,16 +400,12 @@ jobs:
                   "hs_lead_status":        "NEW",
                   "leadsource":            LEADSOURCE_VALUE,
                   "lead_source_details":   "JL OB",
-                  # Email 1
                   "ob_email_1_subject":    subjects.get(1, ""),
                   "ob_email_1_body":       emails.get("email_1", ""),
-                  # Email 2
                   "ob_email_2_subject":    subjects.get(2, ""),
                   "ob_email_2_body":       emails.get("email_2", ""),
-                  # Email 3
                   "ob_email_3_subject":    subjects.get(3, ""),
                   "ob_email_3_body":       emails.get("email_3", ""),
-                  # Email 4
                   "ob_email_4_subject":    subjects.get(4, ""),
                   "ob_email_4_body":       emails.get("email_4", ""),
               }
@@ -437,7 +421,6 @@ jobs:
                   print(f"    ❌ Contact creation failed: {json.dumps(resp)}")
                   return None
 
-              # ── Note with full sequence preview ──────────────────
               note = (
                   f"OUTBOUND EMAIL SEQUENCE\n"
                   f"County: {contact.get('county','')}\nDept: {dept}\n"
@@ -460,9 +443,7 @@ jobs:
                       "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
               })
 
-              # ── Enroll in sequence if email exists ────────────────
               enrolled = enroll_in_sequence(contact_id, ae_name, contact.get("email", ""))
-
               return {"id": contact_id, "enrolled": enrolled}
 
           # ── Publish state to GitHub Gist ─────────────────────────
@@ -581,36 +562,43 @@ jobs:
           results   = {}
 
           for ae_name in AES:
-              added     = []
-              skipped   = 0
-              counties_searched = 0
-              MAX_COUNTIES_PER_RUN = 2
+              added   = []
+              skipped = 0
 
-              while len(added) < LEADS_PER_AE and counties_searched < MAX_COUNTIES_PER_RUN:
-                  county    = state[ae_name]["county"]
-                  found_any = False
+              while len(added) < LEADS_PER_AE:
+                  county = state[ae_name]["county"]
 
                   if not county:
-                      print(f"  ⚠️ No more counties for {ae_name}")
+                      alert = f"⚠️ *{ae_name}* has exhausted all available counties. Please add more counties to TIER_COUNTIES."
+                      requests.post("https://slack.com/api/chat.postMessage",
+                          headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})
+                      print(f"  ⚠️ {ae_name} — all counties exhausted, alert sent")
                       break
 
                   print(f"\n{'='*50}")
-                  print(f"👤 {ae_name} → 📍 {county} County (county {counties_searched + 1} of {MAX_COUNTIES_PER_RUN})")
+                  print(f"👤 {ae_name} → 📍 {county} County ({len(added)}/{LEADS_PER_AE} leads so far)")
+
+                  county_new      = 0
+                  county_skipped  = 0
+                  found_any_leads = False
 
                   for org in ORG_TYPES:
-                      if len(added) >= LEADS_PER_AE: break
+                      if len(added) >= LEADS_PER_AE:
+                          break
                       print(f"  Searching {org['type']}...")
                       try:
                           leads = find_leads(county, org["type"], org["titles"])
                           if leads:
-                              found_any = True
-                              print(f"    Found {len(leads)} leads")
+                              found_any_leads = True
                           for lead in leads:
-                              if len(added) >= LEADS_PER_AE: break
+                              if len(added) >= LEADS_PER_AE:
+                                  break
                               fn = lead.get("first_name", "")
                               ln = lead.get("last_name", "")
-                              if not fn or not ln: continue
+                              if not fn or not ln:
+                                  continue
                               if is_duplicate(lead.get("email", ""), fn, ln):
+                                  county_skipped += 1
                                   skipped += 1
                                   print(f"    ↩ Duplicate: {fn} {ln}")
                                   continue
@@ -644,6 +632,7 @@ jobs:
                                       "enrolled": enrolled,
                                       "email":    lead.get("email", ""),
                                   })
+                                  county_new += 1
                                   state[ae_name]["county_leads"][county] = state[ae_name]["county_leads"].get(county, 0) + 1
                                   enroll_icon = "📧" if enrolled else "📭"
                                   print(f"    ✅ Added: {fn} {ln} — {lead.get('title')} {enroll_icon}")
@@ -652,27 +641,35 @@ jobs:
                           print(f"    Error: {e}")
                       time.sleep(2)
 
-                  print(f"  Summary: {len(added)} added, {skipped} skipped, found_any={found_any}")
-                  if not found_any:
-                      print(f"  ℹ️ No leads found — keeping {county} for next run")
-                      break
-                  elif found_any and len(added) == 0 and skipped > 0:
-                      print(f"  ⚠️ {county} fully exhausted — moving to next county")
-                      state[ae_name]["exhausted"].append(county)
+                  print(f"  County pass: {county_new} new, {county_skipped} dupes, found_any={found_any_leads}")
+
+                  # County fully exhausted — all results were dupes
+                  if found_any_leads and county_new == 0 and county_skipped > 0:
+                      print(f"  ⚠️ {county} fully exhausted (all dupes) — moving to next county")
+                      if county not in state[ae_name]["exhausted"]:
+                          state[ae_name]["exhausted"].append(county)
                       next_county = next_county_for_ae(ae_name, state)
                       state[ae_name]["county"] = next_county or None
                       if next_county:
                           print(f"  ➡️ Moving to: {next_county}")
                       else:
-                          print(f"  ⚠️ No more counties available for {ae_name}")
-                          break
-                  else:
-                      print(f"  ℹ️ {county} still has leads — staying for next run")
+                          print(f"  ⚠️ No more counties for {ae_name}")
+                      continue
+
+                  # Claude found nobody — don't exhaust, retry next run
+                  if not found_any_leads:
+                      print(f"  ℹ️ No leads found in {county} — keeping for next run")
                       break
 
-                  counties_searched += 1
+                  # Found new leads but not at 50 yet — loop again in same county
+                  if len(added) < LEADS_PER_AE:
+                      print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{LEADS_PER_AE})")
 
-              results[ae_name] = {"county": state[ae_name]["county"] or county, "added": added, "skipped": skipped}
+              results[ae_name] = {
+                  "county":  state[ae_name]["county"] or county,
+                  "added":   added,
+                  "skipped": skipped,
+              }
 
           # ── Save state & publish Gist ─────────────────────────────
           save_state(state)
@@ -723,7 +720,7 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v22_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v26_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})

@@ -1,0 +1,87 @@
+name: Backfill County Property
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Backfill county from city field
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        run: |
+          python3 - <<'EOF'
+          import requests, time, os
+
+          HUBSPOT_KEY = os.environ["HUBSPOT_API_KEY"]
+          HS_HEADERS  = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+
+          def hs_post(path, payload):
+              r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r.json()
+
+          def hs_patch(path, payload):
+              r = requests.patch(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r.json()
+
+          # Fetch all contacts with leadsource = Claude
+          after = None
+          updated = 0
+          skipped = 0
+
+          while True:
+              body = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "leadsource", "operator": "EQ", "value": "Claude"}
+                  ]}],
+                  "properties": ["firstname", "lastname", "city", "county"],
+                  "limit": 100,
+              }
+              if after:
+                  body["after"] = after
+
+              resp = hs_post("/crm/v3/objects/contacts/search", body)
+              contacts = resp.get("results", [])
+              if not contacts:
+                  break
+
+              for c in contacts:
+                  contact_id = c["id"]
+                  props      = c["properties"]
+                  city       = props.get("city", "") or ""
+                  county     = props.get("county", "") or ""
+
+                  # Skip if county already populated
+                  if county.strip():
+                      skipped += 1
+                      continue
+
+                  # Parse county from city field — format is "X County"
+                  if city.endswith(" County"):
+                      county_val = city.replace(" County", "").strip()
+                  elif city:
+                      county_val = city.strip()
+                  else:
+                      skipped += 1
+                      continue
+
+                  # Update the county property
+                  r = hs_patch(f"/crm/v3/objects/contacts/{contact_id}", {
+                      "properties": {"county": county_val}
+                  })
+                  if r.get("id"):
+                      updated += 1
+                      print(f"  ✅ {props.get('firstname')} {props.get('lastname')} → {county_val}")
+                  else:
+                      print(f"  ❌ Failed: {contact_id} — {r}")
+
+                  time.sleep(0.1)
+
+              paging = resp.get("paging", {})
+              after  = paging.get("next", {}).get("after")
+              if not after:
+                  break
+
+          print(f"\n✅ Done! {updated} updated, {skipped} skipped.")
+          EOF

@@ -44,15 +44,26 @@ jobs:
               "anthropic-version": "2023-06-01"
           }
 
-          TIER_COUNTIES = [
-              "Sonoma", "Solano", "Santa Cruz", "Merced", "Butte",
-              "Yolo", "El Dorado", "Imperial", "Kings", "Madera",
-              "Napa", "Placer", "Shasta", "Nevada", "Sutter",
-              "Tehama", "Lake", "Calaveras", "Amador", "Tuolumne",
-              "San Benito", "Colusa", "Glenn", "Lassen", "Modoc",
-              "Trinity", "Siskiyou", "Del Norte", "Humboldt", "Mendocino",
-              "Plumas", "Sierra", "Alpine", "Mono", "Inyo",
-              "Marin", "Contra Costa", "Alameda", "San Mateo", "Santa Clara"
+          # ── Per-AE county assignments (no overlap ever) ───────────
+          AE_COUNTIES = {
+              "Dillon DeWitt": [
+                  "Santa Clara", "Nevada", "Shasta", "Napa", "Imperial",
+                  "Amador", "Siskiyou", "Humboldt", "Mono", "Sierra",
+              ],
+              "Will Weis": [
+                  "Contra Costa", "Placer", "Merced", "Kings", "Tehama",
+                  "San Benito", "Del Norte", "Mendocino", "Inyo", "Alpine",
+              ],
+              "James Gregory": [
+                  "Alameda", "Solano", "Butte", "Madera", "Lake",
+                  "Colusa", "Trinity", "Plumas", "Modoc", "Lassen",
+              ],
+          }
+
+          # Overflow — shared pool, first-come first-served
+          OVERFLOW_COUNTIES = [
+              "San Mateo", "Marin", "Santa Cruz", "Sonoma", "Yolo",
+              "El Dorado", "Calaveras", "Tuolumne", "Glenn", "Sutter",
           ]
 
           EXCLUDED_COUNTIES = [
@@ -187,18 +198,26 @@ jobs:
 
           def init_state():
               return {
-                  "Dillon DeWitt":  {"county": TIER_COUNTIES[0], "exhausted": [], "county_leads": {}},
-                  "Will Weis":      {"county": TIER_COUNTIES[1], "exhausted": [], "county_leads": {}},
-                  "James Gregory":  {"county": TIER_COUNTIES[2], "exhausted": [], "county_leads": {}},
+                  "Dillon DeWitt":  {"county": AE_COUNTIES["Dillon DeWitt"][0],  "exhausted": [], "county_leads": {}},
+                  "Will Weis":      {"county": AE_COUNTIES["Will Weis"][0],       "exhausted": [], "county_leads": {}},
+                  "James Gregory":  {"county": AE_COUNTIES["James Gregory"][0],   "exhausted": [], "county_leads": {}},
               }
 
           def next_county_for_ae(ae_name, state):
-              other_counties = [state[a]["county"] for a in AES if a != ae_name and state[a]["county"]]
-              exhausted = state[ae_name]["exhausted"]
-              for county in TIER_COUNTIES:
-                  if county not in exhausted and county not in other_counties and county not in EXCLUDED_COUNTIES:
+              exhausted_self = set(state[ae_name].get("exhausted", []))
+              # 1. Try AE's own assigned counties first
+              for county in AE_COUNTIES[ae_name]:
+                  if county not in exhausted_self:
                       return county
-              return None
+              # 2. All assigned exhausted — pull from shared overflow
+              other_active    = {state[a]["county"] for a in AES if a != ae_name and state[a]["county"]}
+              other_exhausted = {c for a in AES if a != ae_name for c in state[a].get("exhausted", [])}
+              other_assigned  = {c for a in AES if a != ae_name for c in AE_COUNTIES[a]}
+              blocked = exhausted_self | other_active | other_exhausted | other_assigned | set(EXCLUDED_COUNTIES)
+              for county in OVERFLOW_COUNTIES:
+                  if county not in blocked:
+                      return county
+              return None  # truly exhausted — triggers Slack alert
 
           # ── Load / init state ─────────────────────────────────────
           state = load_state()
@@ -210,11 +229,6 @@ jobs:
               for ae in AES:
                   if "county_leads" not in state[ae]:
                       state[ae]["county_leads"] = {}
-                  if state[ae].get("county") in EXCLUDED_COUNTIES:
-                      print(f"  ⚠️ {ae} on excluded county {state[ae]['county']} — reassigning")
-                      state[ae]["exhausted"] = [c for c in state[ae].get("exhausted", []) if c not in EXCLUDED_COUNTIES]
-                      state[ae]["county"] = next_county_for_ae(ae, state)
-                      print(f"  ➡️ Reassigned to: {state[ae]['county']}")
 
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
@@ -397,6 +411,7 @@ jobs:
                   "company":               contact["organization"],
                   "state":                 "California",
                   "city":                  f"{contact['county']} County",
+                  "county":                contact["county"],
                   "hs_lead_status":        "NEW",
                   "leadsource":            LEADSOURCE_VALUE,
                   "lead_source_details":   "JL OB",
@@ -569,7 +584,7 @@ jobs:
                   county = state[ae_name]["county"]
 
                   if not county:
-                      alert = f"⚠️ *{ae_name}* has exhausted all available counties. Please add more counties to TIER_COUNTIES."
+                      alert = f"⚠️ *{ae_name}* has exhausted all available counties. Please add more counties to AE_COUNTIES."
                       requests.post("https://slack.com/api/chat.postMessage",
                           headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})
                       print(f"  ⚠️ {ae_name} — all counties exhausted, alert sent")
@@ -643,7 +658,6 @@ jobs:
 
                   print(f"  County pass: {county_new} new, {county_skipped} dupes, found_any={found_any_leads}")
 
-                  # County fully exhausted — all results were dupes
                   if found_any_leads and county_new == 0 and county_skipped > 0:
                       print(f"  ⚠️ {county} fully exhausted (all dupes) — moving to next county")
                       if county not in state[ae_name]["exhausted"]:
@@ -656,12 +670,10 @@ jobs:
                           print(f"  ⚠️ No more counties for {ae_name}")
                       continue
 
-                  # Claude found nobody — don't exhaust, retry next run
                   if not found_any_leads:
                       print(f"  ℹ️ No leads found in {county} — keeping for next run")
                       break
 
-                  # Found new leads but not at 50 yet — loop again in same county
                   if len(added) < LEADS_PER_AE:
                       print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{LEADS_PER_AE})")
 
@@ -720,7 +732,7 @@ jobs:
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v26_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v27_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})

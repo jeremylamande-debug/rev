@@ -1,0 +1,135 @@
+name: Fix County Ownership
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix-ownership:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reassign contacts to correct AE based on county
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        run: |
+          python3 - <<'EOF'
+          import requests, time, os
+
+          HUBSPOT_KEY = os.environ["HUBSPOT_API_KEY"]
+          HS_HEADERS  = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          PORTAL_ID   = "21451281"
+
+          def hs_post(path, payload):
+              r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r.json()
+
+          def hs_patch(path, payload):
+              r = requests.patch(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r.json()
+
+          def hs_get(path):
+              r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
+              return r.json()
+
+          # ── Owner map ─────────────────────────────────────────────
+          owners    = hs_get("/crm/v3/owners").get("results", [])
+          owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+          print(f"Owners: {list(owner_map.keys())}")
+
+          DILLON_ID = owner_map.get("Dillon DeWitt")
+          WILL_ID   = owner_map.get("Will Weis")
+          JAMES_ID  = owner_map.get("James Gregory")
+
+          # ── County → AE assignments ───────────────────────────────
+          COUNTY_TO_AE = {}
+
+          DILLON_COUNTIES = [
+              "Santa Clara", "Nevada", "Shasta", "Napa", "Imperial",
+              "Amador", "Siskiyou", "Humboldt", "Mono", "Sierra",
+          ]
+          WILL_COUNTIES = [
+              "Contra Costa", "Placer", "Merced", "Kings", "Tehama",
+              "San Benito", "Del Norte", "Mendocino", "Inyo", "Alpine",
+          ]
+          JAMES_COUNTIES = [
+              "Alameda", "Solano", "Butte", "Madera", "Lake",
+              "Colusa", "Trinity", "Plumas", "Modoc", "Lassen",
+          ]
+          OVERFLOW_COUNTIES = [
+              "San Mateo", "Marin", "Santa Cruz", "Sonoma", "Yolo",
+              "El Dorado", "Calaveras", "Tuolumne", "Glenn", "Sutter",
+          ]
+
+          for c in DILLON_COUNTIES: COUNTY_TO_AE[c] = ("Dillon DeWitt", DILLON_ID)
+          for c in WILL_COUNTIES:   COUNTY_TO_AE[c] = ("Will Weis",     WILL_ID)
+          for c in JAMES_COUNTIES:  COUNTY_TO_AE[c] = ("James Gregory", JAMES_ID)
+          # Overflow counties — assign to AE with fewest leads (static split for now)
+          for c in OVERFLOW_COUNTIES[:4]:  COUNTY_TO_AE[c] = ("Dillon DeWitt", DILLON_ID)
+          for c in OVERFLOW_COUNTIES[4:7]: COUNTY_TO_AE[c] = ("Will Weis",     WILL_ID)
+          for c in OVERFLOW_COUNTIES[7:]:  COUNTY_TO_AE[c] = ("James Gregory", JAMES_ID)
+
+          print(f"\nCounty assignments loaded: {len(COUNTY_TO_AE)} counties mapped")
+
+          # ── Fetch all Claude-sourced contacts ─────────────────────
+          after     = None
+          updated   = 0
+          skipped   = 0
+          not_found = 0
+
+          while True:
+              body = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "leadsource", "operator": "EQ", "value": "Claude"}
+                  ]}],
+                  "properties": ["firstname", "lastname", "county", "hubspot_owner_id"],
+                  "limit": 100,
+              }
+              if after:
+                  body["after"] = after
+
+              resp     = hs_post("/crm/v3/objects/contacts/search", body)
+              contacts = resp.get("results", [])
+              if not contacts:
+                  break
+
+              for c in contacts:
+                  contact_id    = c["id"]
+                  props         = c["properties"]
+                  county        = (props.get("county") or "").strip()
+                  current_owner = props.get("hubspot_owner_id") or ""
+                  name          = f"{props.get('firstname','')} {props.get('lastname','')}".strip()
+
+                  if not county:
+                      not_found += 1
+                      print(f"  ⚠️ No county: {name} ({contact_id})")
+                      continue
+
+                  assignment = COUNTY_TO_AE.get(county)
+                  if not assignment:
+                      not_found += 1
+                      print(f"  ⚠️ County not in assignment map: {county} — {name}")
+                      continue
+
+                  ae_name, owner_id = assignment
+
+                  if str(current_owner) == str(owner_id):
+                      skipped += 1
+                      continue
+
+                  r = hs_patch(f"/crm/v3/objects/contacts/{contact_id}", {
+                      "properties": {"hubspot_owner_id": owner_id}
+                  })
+                  if r.get("id"):
+                      updated += 1
+                      print(f"  ✅ {name} ({county}) → {ae_name}")
+                  else:
+                      print(f"  ❌ Failed: {name} — {r}")
+
+                  time.sleep(0.1)
+
+              paging = resp.get("paging", {})
+              after  = paging.get("next", {}).get("after")
+              if not after:
+                  break
+
+          print(f"\n✅ Done! {updated} reassigned, {skipped} already correct, {not_found} missing county.")
+          EOF

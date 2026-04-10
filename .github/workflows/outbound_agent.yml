@@ -27,7 +27,11 @@ jobs:
           GIST_TOKEN    = os.environ.get("GIST_TOKEN", "")
           GIST_ID       = os.environ.get("GIST_ID", "")
           PORTAL_ID     = "21451281"
-          LEADS_PER_AE  = 50
+          LEADS_PER_AE  = {
+              "Dillon DeWitt":  50,
+              "Will Weis":      25,
+              "James Gregory":  50,
+          }
           SLACK_USER    = "U08JJMM2QSW"
           DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
           SEQUENCE_ID   = "304238924"
@@ -569,9 +573,10 @@ jobs:
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
           results   = {}
           for ae_name in AES:
-              added   = []
-              skipped = 0
-              while len(added) < LEADS_PER_AE:
+              added        = []
+              skipped      = 0
+              ae_leads_cap = LEADS_PER_AE[ae_name]
+              while len(added) < ae_leads_cap:
                   county = state[ae_name]["county"]
                   if not county:
                       alert = f"⚠️ *{ae_name}* has exhausted all available counties. Please add more counties to AE_COUNTIES."
@@ -587,14 +592,14 @@ jobs:
                   MAX_BATCHES_PER_ORG = 4   # up to 4 search batches per org type per county
                   MAX_EMPTY_PASSES    = 2   # require 2 consecutive all-dupe passes before exhausting county
                   for org in ORG_TYPES:
-                      if len(added) >= LEADS_PER_AE:
+                      if len(added) >= ae_leads_cap:
                           break
                       print(f"  Searching {org['type']}...")
                       # Track names found for this org type to enable pagination
                       org_found_names  = []
                       org_new_this_run = 0
                       for batch_num in range(1, MAX_BATCHES_PER_ORG + 1):
-                          if len(added) >= LEADS_PER_AE:
+                          if len(added) >= ae_leads_cap:
                               break
                           try:
                               leads = find_leads(
@@ -606,7 +611,7 @@ jobs:
                                   found_any_leads = True
                               batch_new = 0
                               for lead in leads:
-                                  if len(added) >= LEADS_PER_AE:
+                                  if len(added) >= ae_leads_cap:
                                       break
                                   fn = lead.get("first_name", "")
                                   ln = lead.get("last_name", "")
@@ -682,8 +687,8 @@ jobs:
                   if not found_any_leads:
                       print(f"  ℹ️ No leads found in {county} — keeping for next run")
                       break
-                  if len(added) < LEADS_PER_AE:
-                      print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{LEADS_PER_AE})")
+                  if len(added) < ae_leads_cap:
+                      print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{ae_leads_cap})")
               results[ae_name] = {
                   "county":  state[ae_name]["county"] or county,
                   "added":   added,
@@ -725,7 +730,7 @@ jobs:
               msg += f"*👤 {ae_name}* — 📍 {county} County{next_str} | <{list_url}|View Segment>\n"
               msg += f"  {len(added)} leads added · {ae_skipped} dupes skipped · {len(county_leads)} counties checked\n"
               msg += f"{county_line}\n\n"
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v30_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v31_"
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")

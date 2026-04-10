@@ -1,14 +1,11 @@
 name: Daily Outbound Agent — CA Law Enforcement
-
 on:
   schedule:
     - cron: '0 6 * * 1-5'  # 2:00 AM ET (UTC-4 EDT), Mon–Fri
   workflow_dispatch:
-
 jobs:
   run-outbound-agent:
     runs-on: ubuntu-latest
-
     steps:
       - name: Run Outbound Agent
         env:
@@ -24,7 +21,6 @@ jobs:
           import matplotlib.pyplot as plt
           import matplotlib.patches as mpatches
           import numpy as np
-
           ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
           HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
@@ -35,7 +31,6 @@ jobs:
           SLACK_USER    = "U08JJMM2QSW"
           DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
           SEQUENCE_ID   = "304238924"
-
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
           ANTH_HEADERS  = {
@@ -43,7 +38,6 @@ jobs:
               "x-api-key": ANTHROPIC_KEY,
               "anthropic-version": "2023-06-01"
           }
-
           # ── Per-AE county assignments (no overlap ever) ───────────
           AE_COUNTIES = {
               "Dillon DeWitt": [
@@ -59,52 +53,48 @@ jobs:
                   "Colusa", "Trinity", "Plumas", "Modoc", "Lassen",
               ],
           }
-
           # Overflow — shared pool, first-come first-served
           OVERFLOW_COUNTIES = [
               "San Mateo", "Marin", "Santa Cruz", "Sonoma", "Yolo",
               "El Dorado", "Calaveras", "Tuolumne", "Glenn", "Sutter",
           ]
-
           EXCLUDED_COUNTIES = [
               "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
               "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
           ]
-
+          # ── Org types & titles (10 sequences) ────────────────────
           ORG_TYPES = [
               {"type": "Sheriff",           "titles": ["Sheriff", "Undersheriff", "Chief Deputy Sheriff", "Commander", "Captain", "Lieutenant", "Sergeant"]},
               {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Deputy District Attorney", "Chief Investigator", "Senior Investigator"]},
               {"type": "Public Defender",   "titles": ["Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender"]},
               {"type": "Police Department", "titles": ["Chief of Police", "Deputy Chief", "Assistant Chief", "Commander", "Captain", "Lieutenant"]},
               {"type": "City Attorney",     "titles": ["City Attorney", "Deputy City Attorney", "Assistant City Attorney"]},
-              {"type": "Court",             "titles": ["Court Administrator", "Clerk of Court", "Chief Court Administrator", "Presiding Judge"]},
+              {"type": "Court",             "titles": ["Court Administrator", "Court Executive Officer", "Clerk of Court", "Chief Court Administrator", "Presiding Judge", "Assistant Presiding Judge"]},
+              {"type": "Investigator",      "titles": ["Chief Investigator", "Senior Investigator", "Criminal Investigator", "Detective Investigator", "Special Investigator", "Investigator"]},
+              {"type": "Corrections",       "titles": ["Corrections Investigator", "Correctional Investigative Officer", "Inspector General Corrections", "Internal Affairs Corrections", "Chief of Investigations"]},
+              {"type": "Internal Affairs",  "titles": ["Internal Affairs Director", "Internal Affairs Lieutenant", "Internal Affairs Sergeant", "Professional Standards Director", "Professional Standards Captain", "Professional Standards Lieutenant"]},
+              {"type": "Human Resources",   "titles": ["HR Director", "Chief Human Resources Officer", "HR Manager", "Employee Relations Manager", "Labor Relations Director", "HR Investigations Manager"]},
           ]
-
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
-
           MEETING_LINKS = {
               "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
               "Will Weis":      "https://meetings.hubspot.com/will-weis",
               "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
           }
-
           def get_meeting_link(ae_name):
               return MEETING_LINKS.get(ae_name, MEETING_LINKS["Dillon DeWitt"])
-
           LIST_URLS = {
               "Dillon DeWitt":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9561",
               "Will Weis":      f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9562",
               "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
           }
-
           ACTIVE_COLOR = "#7c3aed"
-
           AE_COLORS = {
               "Dillon DeWitt":  "#2563eb",
               "Will Weis":      "#7c3aed",
               "James Gregory":  "#059669",
           }
-
+          # ── Persona angles (10 sequences) ────────────────────────
           PERSONA_ANGLES = {
               "Sheriff": {
                   "pain":     "managing body cam footage and interrogation recordings manually",
@@ -136,8 +126,27 @@ jobs:
                   "use_case": "court proceeding transcription and record management",
                   "proof":    "court administrators using Rev process hearings 3x faster"
               },
+              "Investigator": {
+                  "pain":     "manually transcribing witness interviews, recorded statements and investigative recordings",
+                  "use_case": "witness interview transcription and investigative documentation",
+                  "proof":    "investigative units using Rev cut interview documentation time by 60%"
+              },
+              "Corrections": {
+                  "pain":     "documenting inmate incidents, staff misconduct investigations and internal case recordings manually",
+                  "use_case": "corrections investigation transcription and incident documentation",
+                  "proof":    "corrections agencies using Rev reduce investigation documentation time significantly"
+              },
+              "Internal Affairs": {
+                  "pain":     "transcribing officer interviews, use-of-force recordings and misconduct investigation files manually",
+                  "use_case": "internal affairs interview transcription and misconduct investigation documentation",
+                  "proof":    "internal affairs units using Rev cut investigation documentation time by 50%"
+              },
+              "Human Resources": {
+                  "pain":     "manually transcribing harassment complaints, termination meetings and employee investigation recordings",
+                  "use_case": "HR investigation transcription and employee relations documentation",
+                  "proof":    "county HR departments using Rev reduce documentation risk and investigation turnaround significantly"
+              },
           }
-
           DEPT_MAP = {
               "Sheriff":           "Sheriff Dept",
               "District Attorney": "DA Office",
@@ -145,27 +154,25 @@ jobs:
               "Police Department": "Police Dept",
               "City Attorney":     "City Attorney",
               "Court":             "Court",
+              "Investigator":      "Investigations",
+              "Corrections":       "Corrections",
+              "Internal Affairs":  "Internal Affairs",
+              "Human Resources":   "Human Resources",
           }
-
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
               r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
               return r.json()
-
           def hs_post(path, payload):
               r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r.json()
-
           # ── Owner map ─────────────────────────────────────────────
           owners    = hs_get("/crm/v3/owners").get("results", [])
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
-
           LEADSOURCE_VALUE = "Claude"
-
           # ── State management ──────────────────────────────────────
           STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
-
           def load_state():
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
@@ -184,7 +191,6 @@ jobs:
               except Exception as e:
                   print(f"State load error: {e}")
               return None
-
           def save_state(state):
               try:
                   hs_post("/crm/v3/objects/notes", {
@@ -195,14 +201,12 @@ jobs:
                   })
               except Exception as e:
                   print(f"State save error: {e}")
-
           def init_state():
               return {
                   "Dillon DeWitt":  {"county": AE_COUNTIES["Dillon DeWitt"][0],  "exhausted": [], "county_leads": {}},
                   "Will Weis":      {"county": AE_COUNTIES["Will Weis"][0],       "exhausted": [], "county_leads": {}},
                   "James Gregory":  {"county": AE_COUNTIES["James Gregory"][0],   "exhausted": [], "county_leads": {}},
               }
-
           def next_county_for_ae(ae_name, state):
               exhausted_self = set(state[ae_name].get("exhausted", []))
               # 1. Try AE's own assigned counties first
@@ -218,7 +222,6 @@ jobs:
                   if county not in blocked:
                       return county
               return None  # truly exhausted — triggers Slack alert
-
           # ── Load / init state ─────────────────────────────────────
           state = load_state()
           if not state:
@@ -229,7 +232,6 @@ jobs:
               for ae in AES:
                   if "county_leads" not in state[ae]:
                       state[ae]["county_leads"] = {}
-
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
               body = {
@@ -242,7 +244,6 @@ jobs:
               resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
               return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
-
           # ── Find leads ────────────────────────────────────────────
           def find_leads(county, org_type, titles):
               prompt = f"""Search for real decision makers at the {org_type} in {county} County, California.
@@ -274,7 +275,6 @@ jobs:
                   except: pass
               print(f"    ⚠️ Could not parse JSON")
               return []
-
           # ── Duplicate check ───────────────────────────────────────
           def is_duplicate(email, first_name, last_name):
               if email:
@@ -288,7 +288,6 @@ jobs:
                       {"propertyName": "lastname",  "operator": "EQ", "value": last_name}
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
-
           # ── Email sequence ────────────────────────────────────────
           def gen_email_sequence(contact, ae_name):
               meeting_link = get_meeting_link(ae_name)
@@ -347,7 +346,6 @@ jobs:
           - Warm not passive aggressive
           Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=250)
               return emails
-
           def gen_subject(contact, email_num=1):
               if email_num in (2, 4):
                   return ""
@@ -358,11 +356,15 @@ jobs:
                   3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
               }
               return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
-
           # ── Buying role ───────────────────────────────────────────
           def get_buying_role(title):
               t = title.lower()
-              if any(x in t for x in ["sheriff", "district attorney", "chief of police", "public defender", "chief deputy"]):
+              if any(x in t for x in [
+                  "sheriff", "district attorney", "chief of police", "public defender", "chief deputy",
+                  "internal affairs director", "professional standards director",
+                  "hr director", "chief human resources", "chief of investigations",
+                  "inspector general", "corrections director"
+              ]):
                   return "DECISION_MAKER"
               if any(x in t for x in ["commander", "captain", "lieutenant"]):
                   return "INFLUENCER"
@@ -371,7 +373,6 @@ jobs:
               if any(x in t for x in ["legal", "compliance"]):
                   return "LEGAL_AND_COMPLIANCE"
               return "BUDGET_HOLDER"
-
           # ── Enroll contact in HubSpot Sequence ───────────────────
           def enroll_in_sequence(contact_id, ae_name, contact_email):
               if not contact_email:
@@ -397,7 +398,6 @@ jobs:
               else:
                   print(f"    ⚠️ Sequence enrollment failed ({resp.status_code}): {resp.text[:300]}")
                   return False
-
           # ── Create HubSpot contact ────────────────────────────────
           def create_contact(contact, email_body, subject, ae_name, emails=None, subjects=None):
               emails   = emails   or {}
@@ -428,14 +428,12 @@ jobs:
               if contact.get("email"):         props["email"]   = contact["email"]
               if contact.get("phone"):         props["phone"]   = contact["phone"]
               if contact.get("website"):       props["website"] = contact["website"]
-
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
               print(f"    Contact API response: {json.dumps(resp)[:500]}")
               if not contact_id:
                   print(f"    ❌ Contact creation failed: {json.dumps(resp)}")
                   return None
-
               note = (
                   f"OUTBOUND EMAIL SEQUENCE\n"
                   f"County: {contact.get('county','')}\nDept: {dept}\n"
@@ -457,10 +455,8 @@ jobs:
                   "associations": [{"to": {"id": contact_id},
                       "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
               })
-
               enrolled = enroll_in_sequence(contact_id, ae_name, contact.get("email", ""))
               return {"id": contact_id, "enrolled": enrolled}
-
           # ── Publish state to GitHub Gist ─────────────────────────
           def publish_gist(state):
               if not GIST_TOKEN:
@@ -477,24 +473,20 @@ jobs:
               data = r.json()
               print(f"✅ Gist published: {data.get('html_url', '')}")
               return data.get("html_url", "")
-
           # ── Generate county chart ─────────────────────────────────
           def generate_chart(state, results, today_str):
               fig, axes = plt.subplots(1, 3, figsize=(18, 6))
               fig.patch.set_facecolor('#1a1d21')
               fig.suptitle(f'OB Agent — County Breakdown\n{today_str}',
                            color='white', fontsize=14, fontweight='bold', y=1.02)
-
               for idx, ae_name in enumerate(AES):
                   ax = axes[idx]
                   ax.set_facecolor('#222529')
                   for spine in ax.spines.values():
                       spine.set_edgecolor('#444')
-
                   county_leads = state[ae_name].get("county_leads", {})
                   exhausted    = state[ae_name].get("exhausted", [])
                   active       = results[ae_name]["county"]
-
                   if not county_leads:
                       ax.text(0.5, 0.5, 'No data yet', ha='center', va='center',
                               color='#888', transform=ax.transAxes)
@@ -503,30 +495,25 @@ jobs:
                       counts   = list(county_leads.values())
                       bar_colors = ['#4ade80' if c in exhausted else ACTIVE_COLOR for c in counties]
                       bars = ax.barh(counties, counts, color=bar_colors, height=0.6)
-
                       for bar, county, count in zip(bars, counties, counts):
                           ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2,
                                   f'{count}', va='center', color='white', fontsize=9)
                           if county == active:
                               bar.set_edgecolor('white')
                               bar.set_linewidth(2)
-
                       ax.set_xlim(0, max(counts) * 1.25)
                       ax.xaxis.label.set_color('white')
                       ax.tick_params(colors='white')
                       ax.set_xlabel('Leads', color='#aaa', fontsize=9)
-
                   total = sum(county_leads.values()) if county_leads else 0
                   ax.set_title(f'{ae_name}\n{total} total · {active} active',
                                color='white', fontsize=10, fontweight='bold', pad=10)
-
                   patches = [
                       mpatches.Patch(color='#4ade80', label='Exhausted'),
                       mpatches.Patch(color=ACTIVE_COLOR, label='Active'),
                   ]
                   ax.legend(handles=patches, loc='lower right', fontsize=8,
                             facecolor='#333', labelcolor='white', edgecolor='#555')
-
               plt.tight_layout()
               chart_path = '/tmp/ob_chart.png'
               plt.savefig(chart_path, dpi=150, bbox_inches='tight',
@@ -534,7 +521,6 @@ jobs:
               plt.close()
               print(f"Chart saved: {chart_path}")
               return chart_path
-
           # ── Upload chart to Slack ─────────────────────────────────
           def upload_chart_to_slack(chart_path, channel_id, today_str):
               try:
@@ -571,32 +557,25 @@ jobs:
               except Exception as e:
                   print(f"Chart upload error: {e}")
                   return None
-
           # ── Main loop ─────────────────────────────────────────────
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
           results   = {}
-
           for ae_name in AES:
               added   = []
               skipped = 0
-
               while len(added) < LEADS_PER_AE:
                   county = state[ae_name]["county"]
-
                   if not county:
                       alert = f"⚠️ *{ae_name}* has exhausted all available counties. Please add more counties to AE_COUNTIES."
                       requests.post("https://slack.com/api/chat.postMessage",
                           headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})
                       print(f"  ⚠️ {ae_name} — all counties exhausted, alert sent")
                       break
-
                   print(f"\n{'='*50}")
                   print(f"👤 {ae_name} → 📍 {county} County ({len(added)}/{LEADS_PER_AE} leads so far)")
-
                   county_new      = 0
                   county_skipped  = 0
                   found_any_leads = False
-
                   for org in ORG_TYPES:
                       if len(added) >= LEADS_PER_AE:
                           break
@@ -617,7 +596,6 @@ jobs:
                                   skipped += 1
                                   print(f"    ↩ Duplicate: {fn} {ln}")
                                   continue
-
                               emails_body = gen_email_sequence(lead, ae_name)
                               subjects = {
                                   1: gen_subject(lead, 1),
@@ -625,7 +603,6 @@ jobs:
                                   3: gen_subject(lead, 3),
                                   4: gen_subject(lead, 4),
                               }
-
                               result = create_contact(
                                   lead,
                                   email_body="",
@@ -634,7 +611,6 @@ jobs:
                                   emails=emails_body,
                                   subjects=subjects,
                               )
-
                               if result and result.get("id"):
                                   contact_id = result["id"]
                                   enrolled   = result.get("enrolled", False)
@@ -655,9 +631,7 @@ jobs:
                       except Exception as e:
                           print(f"    Error: {e}")
                       time.sleep(2)
-
                   print(f"  County pass: {county_new} new, {county_skipped} dupes, found_any={found_any_leads}")
-
                   if found_any_leads and county_new == 0 and county_skipped > 0:
                       print(f"  ⚠️ {county} fully exhausted (all dupes) — moving to next county")
                       if county not in state[ae_name]["exhausted"]:
@@ -669,50 +643,40 @@ jobs:
                       else:
                           print(f"  ⚠️ No more counties for {ae_name}")
                       continue
-
                   if not found_any_leads:
                       print(f"  ℹ️ No leads found in {county} — keeping for next run")
                       break
-
                   if len(added) < LEADS_PER_AE:
                       print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{LEADS_PER_AE})")
-
               results[ae_name] = {
                   "county":  state[ae_name]["county"] or county,
                   "added":   added,
                   "skipped": skipped,
               }
-
           # ── Save state & publish Gist ─────────────────────────────
           save_state(state)
           print(f"\nState saved: {json.dumps(state, indent=2)}")
           publish_gist(state)
-
           # ── Open DM channel ───────────────────────────────────────
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})
           dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")
-
           # ── Generate & upload chart ───────────────────────────────
           chart_path = generate_chart(state, results, today_str)
           upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
-
           # ── Slack summary → #daily-ob ─────────────────────────────
           total_added    = sum(len(r["added"]) for r in results.values())
           total_skip     = sum(r["skipped"]    for r in results.values())
           total_enrolled = sum(1 for r in results.values() for c in r["added"] if c.get("enrolled"))
-
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — {today_str}*\n"
           msg += f"*{total_added} new leads added | {total_enrolled} enrolled in sequence | {total_skip} duplicates skipped*\n\n"
-
           for ae_name, data in results.items():
               county   = data["county"]
               added    = data["added"]
               next_c   = state[ae_name].get("county", "")
               next_str = f" → moving to *{next_c}* tomorrow" if next_c and next_c != county else ""
               list_url = LIST_URLS[ae_name]
-
               msg += f"*👤 {ae_name}* — 📍 {county} County{next_str}"
               msg += f" | <{list_url}|View Segment>\n"
               msg += f"*{len(added)} leads added*\n"
@@ -723,7 +687,6 @@ jobs:
                   msg += f"    _{c['subject']}_\n"
               if not added:
                   msg += "  No new leads added today\n"
-
               county_leads = state[ae_name].get("county_leads", {})
               if county_leads:
                   msg += f"  *📊 County Breakdown:*\n"
@@ -731,11 +694,8 @@ jobs:
                       status = "✅ exhausted" if c in state[ae_name]["exhausted"] else "🔄 active"
                       msg += f"    {c}: {count} leads {status}\n"
               msg += "\n"
-
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v27_"
-
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v28_"
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
-
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")
           EOF

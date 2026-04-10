@@ -670,31 +670,26 @@ jobs:
           total_enrolled = sum(1 for r in results.values() for c in r["added"] if c.get("enrolled"))
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — {today_str}*\n"
-          msg += f"*{total_added} new leads added | {total_enrolled} enrolled in sequence | {total_skip} duplicates skipped*\n\n"
+          msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n\n"
           for ae_name, data in results.items():
-              county   = data["county"]
-              added    = data["added"]
-              next_c   = state[ae_name].get("county", "")
-              next_str = f" → moving to *{next_c}* tomorrow" if next_c and next_c != county else ""
-              list_url = LIST_URLS[ae_name]
-              msg += f"*👤 {ae_name}* — 📍 {county} County{next_str}"
-              msg += f" | <{list_url}|View Segment>\n"
-              msg += f"*{len(added)} leads added*\n"
-              for c in added:
-                  hs_url       = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
-                  enroll_label = "📧 enrolled" if c.get("enrolled") else "📭 no email"
-                  msg += f"  • <{hs_url}|{c['name']}> — {c['title']} @ {c['org']} _{enroll_label}_\n"
-                  msg += f"    _{c['subject']}_\n"
-              if not added:
-                  msg += "  No new leads added today\n"
+              county       = data["county"]
+              added        = data["added"]
+              ae_skipped   = data["skipped"]
+              next_c       = state[ae_name].get("county", "")
+              next_str     = f" → *{next_c}* tomorrow" if next_c and next_c != county else ""
+              list_url     = LIST_URLS[ae_name]
               county_leads = state[ae_name].get("county_leads", {})
-              if county_leads:
-                  msg += f"  *📊 County Breakdown:*\n"
-                  for c, count in county_leads.items():
-                      status = "✅ exhausted" if c in state[ae_name]["exhausted"] else "🔄 active"
-                      msg += f"    {c}: {count} leads {status}\n"
-              msg += "\n"
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v28_"
+              exhausted    = state[ae_name].get("exhausted", [])
+              # Build compact county list: exhausted ✅, active 🔄
+              county_parts = []
+              for c, count in county_leads.items():
+                  icon = "✅" if c in exhausted else "🔄"
+                  county_parts.append(f"{c} {icon} ({count})")
+              county_line = "  " + "  ·  ".join(county_parts) if county_parts else "  No counties yet"
+              msg += f"*👤 {ae_name}* — 📍 {county} County{next_str} | <{list_url}|View Segment>\n"
+              msg += f"  {len(added)} leads added · {ae_skipped} dupes skipped · {len(county_leads)} counties checked\n"
+              msg += f"{county_line}\n\n"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v29_"
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")

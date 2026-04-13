@@ -1378,23 +1378,42 @@ jobs:
               list_url     = LIST_URLS[ae_name]
               county_leads = state[ae_name].get("county_leads", {})
               exhausted    = state[ae_name].get("exhausted", [])
-              # Next 2 upcoming counties
-              upcoming     = get_upcoming_counties(ae_name, state, n=2)
+              # Helper: build signal icon string from county_scores entry
+              def sig_icons(cs):
+                  icons = ""
+                  if cs.get("tier3_body_cam"):             icons += "📷"
+                  if cs.get("tier3_transcription_line"):   icons += "📝"
+                  if cs.get("tier4_arpa"):                 icons += "💰"
+                  return icons
+              # Current county — show score + icons in header
+              cs_curr    = county_scores.get(county, {})
+              curr_score = cs_curr.get("score", "?")
+              curr_icons = sig_icons(cs_curr)
+              curr_badge = f" {curr_icons} _{curr_score}/100_" if curr_score != "?" else ""
+              # Next 3 upcoming counties with signal icons + score
+              upcoming   = get_upcoming_counties(ae_name, state, n=3)
               if upcoming:
-                  upcoming_str = "  · ".join(f"*{c}*" for c in upcoming)
+                  up_parts = []
+                  for c in upcoming:
+                      cs  = county_scores.get(c, {})
+                      sc  = cs.get("score", "?")
+                      ic  = sig_icons(cs)
+                      up_parts.append(f"*{c}*{' ' + ic if ic else ''} _{sc}/100_")
+                  upcoming_str = "  ·  ".join(up_parts)
                   next_str     = f"\n  ⏭ Up next: {upcoming_str}"
               else:
                   next_str = "\n  ⚠️ All counties exhausted — add more to AE_COUNTIES"
-              # Build compact county list: exhausted ✅, active 🔄
+              # Build compact county history list: exhausted ✅, active 🔄, with signal icons
               county_parts = []
               for c, count in county_leads.items():
-                  icon = "✅" if c in exhausted else "🔄"
-                  county_parts.append(f"{c} {icon} ({count})")
+                  status = "✅" if c in exhausted else "🔄"
+                  ic     = sig_icons(county_scores.get(c, {}))
+                  county_parts.append(f"{c}{' ' + ic if ic else ''} {status} ({count})")
               county_line = "  " + "  ·  ".join(county_parts) if county_parts else "  No counties yet"
-              msg += f"*👤 {ae_name}* — 📍 {county} County | <{list_url}|View Segment>\n"
+              msg += f"*👤 {ae_name}* — 📍 {county} County{curr_badge} | <{list_url}|View Segment>\n"
               msg += f"  {len(added)} leads added · {ae_skipped} dupes skipped · {len(county_leads)} counties checked{next_str}\n"
               msg += f"{county_line}\n\n"
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v31_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v32_"
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")

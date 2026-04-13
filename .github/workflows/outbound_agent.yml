@@ -57,11 +57,12 @@ jobs:
                   "Colusa", "Trinity", "Plumas", "Modoc", "Lassen",
               ],
           }
-          # Overflow — shared pool, first-come first-served
-          OVERFLOW_COUNTIES = [
-              "San Mateo", "Marin", "Santa Cruz", "Sonoma", "Yolo",
-              "El Dorado", "Calaveras", "Tuolumne", "Glenn", "Sutter",
-          ]
+          # Overflow — partitioned per-AE (no overlap ever across sellers)
+          AE_OVERFLOW_COUNTIES = {
+              "Dillon DeWitt":  ["San Mateo", "Marin", "Santa Cruz"],
+              "Will Weis":      ["Sonoma", "Yolo", "El Dorado", "Calaveras"],
+              "James Gregory":  ["Tuolumne", "Glenn", "Sutter"],
+          }
           EXCLUDED_COUNTIES = [
               "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
               "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
@@ -175,6 +176,68 @@ jobs:
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
           LEADSOURCE_VALUE = "Claude"
+
+          # ── Ensure county signal properties exist in HubSpot ──────
+          # Runs on every boot but is idempotent — HS ignores duplicates gracefully
+          COUNTY_PROPS = [
+              {
+                  "name":        "county_signal_score",
+                  "label":       "County Signal Score",
+                  "description": "0-100 composite score based on Rev outbound signal tiers (size, tech readiness, direct pain, buying momentum).",
+                  "type":        "number",
+                  "fieldType":   "number",
+              },
+              {
+                  "name":        "county_carahsoft__naspo",
+                  "label":       "County Purchasing Vehicle",
+                  "description": "Purchasing contract vehicle reps can reference to bypass RFP. Pre-filled for all CA counties with the statewide NASPO ValuePoint contract.",
+                  "type":        "string",
+                  "fieldType":   "text",
+              },
+              {
+                  "name":        "county_transcription_budget_k",
+                  "label":       "County Transcription Budget ($k)",
+                  "description": "Dollar amount (in thousands) budgeted for transcription services in the county's law enforcement departments. 0 = no line item found.",
+                  "type":        "number",
+                  "fieldType":   "number",
+              },
+              {
+                  "name":        "county_body_cam_program",
+                  "label":       "County Body Cam Program",
+                  "description": "True if the county Sheriff or Police department has an active body-worn camera (BWC) program.",
+                  "type":        "bool",
+                  "fieldType":   "booleancheckbox",
+              },
+              {
+                  "name":        "county_signal_snippet",
+                  "label":       "County Signal Snippet",
+                  "description": "2-line rep-facing context pulled from county budget signals. Use to personalize cold outreach.",
+                  "type":        "string",
+                  "fieldType":   "textarea",
+              },
+          ]
+          for prop in COUNTY_PROPS:
+              try:
+                  r = requests.post(
+                      "https://api.hubapi.com/crm/v3/properties/contacts",
+                      headers=HS_HEADERS,
+                      json={
+                          "name":        prop["name"],
+                          "label":       prop["label"],
+                          "description": prop["description"],
+                          "type":        prop["type"],
+                          "fieldType":   prop["fieldType"],
+                          "groupName":   "contactinformation",
+                      }
+                  )
+                  status = r.status_code
+                  # 409 = already exists — that's fine
+                  if status not in (200, 201, 409):
+                      print(f"  ⚠️ Property create issue ({prop['name']}): {status} {r.text[:120]}")
+                  else:
+                      print(f"  ✅ Property ready: {prop['name']} ({status})")
+              except Exception as e:
+                  print(f"  ⚠️ Property setup error ({prop['name']}): {e}")
           # ── State management ──────────────────────────────────────
           STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
           def load_state():
@@ -217,25 +280,546 @@ jobs:
               for county in AE_COUNTIES[ae_name]:
                   if county not in exhausted_self:
                       return county
-              # 2. All assigned exhausted — pull from shared overflow
-              other_active    = {state[a]["county"] for a in AES if a != ae_name and state[a]["county"]}
-              other_exhausted = {c for a in AES if a != ae_name for c in state[a].get("exhausted", [])}
-              other_assigned  = {c for a in AES if a != ae_name for c in AE_COUNTIES[a]}
-              blocked = exhausted_self | other_active | other_exhausted | other_assigned | set(EXCLUDED_COUNTIES)
-              for county in OVERFLOW_COUNTIES:
-                  if county not in blocked:
+              # 2. All assigned exhausted — pull from this AE's dedicated overflow slice (no cross-AE sharing)
+              for county in AE_OVERFLOW_COUNTIES.get(ae_name, []):
+                  if county not in exhausted_self:
                       return county
               return None  # truly exhausted — triggers Slack alert
-          # ── Load / init state ─────────────────────────────────────
-          state = load_state()
-          if not state:
-              print("No state — initializing fresh")
-              state = init_state()
-          else:
-              print(f"Loaded state: {json.dumps(state, indent=2)}")
-              for ae in AES:
-                  if "county_leads" not in state[ae]:
-                      state[ae]["county_leads"] = {}
+
+          def get_upcoming_counties(ae_name, state, n=2):
+              """Return the next N counties after the current active one (excluding exhausted)."""
+              exhausted_self = set(state[ae_name].get("exhausted", []))
+              current        = state[ae_name].get("county")
+              full_list      = AE_COUNTIES[ae_name] + AE_OVERFLOW_COUNTIES.get(ae_name, [])
+              upcoming       = [c for c in full_list if c not in exhausted_self and c != current]
+              return upcoming[:n]
+
+          # ── County scoring (runs weekly, cached in HubSpot note) ──
+          SCORE_MARKER   = "COUNTY_SCORE_STATE_V1"
+          SCORE_MAX_DAYS = 7
+
+          # ── Seed scores (real PDF extractions + estimates) ───────
+          # 5 large counties scored from actual FY25-26 budget PDFs.
+          # All others scored by size/signals. Weekly scoring pass
+          # (triggered when HubSpot cache is stale) will refine these.
+          SEED_SCORES = {
+              # ─── PDF-extracted (real data) ───────────────────────
+              "Contra Costa": {
+                  "county": "Contra Costa", "score": 91,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 343.0,
+                  "tier2_it_pct": 2.4, "tier2_it_growing": False,
+                  "tier3_transcription_line": True, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
+                  "evidence": "Public Defender implementing new Digital Evidence Management System with automated transcription of body cam footage. 700 BWCs deployed at $1.98M/yr via Axon. $343M Sheriff budget, $71.6M DA. $7.15B total county budget.",
+                  "snippet": "Saw Contra Costa DA's new digital evidence system specifically calls out 'automated transcriptions' in FY25-26 — they're already mapping this problem.\nYou're on NASPO so there's no RFP, and body cam footage is live with 700 Axon cameras deployed.",
+              },
+              "Santa Clara": {
+                  "county": "Santa Clara", "score": 89,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 588.0,
+                  "tier2_it_pct": 3.4, "tier2_it_growing": True,
+                  "tier3_transcription_line": True, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
+                  "evidence": "DA has 5 full-time Transcriptionists on payroll. BWC program active with $3.5M+ ongoing. $588M combined Sheriff budget, $201M DA. $13B total county budget growing 8.9%.",
+                  "snippet": "Santa Clara DA has 5 full-time transcriptionists on payroll — that's a sign they're doing this manually at significant cost.\nBWC program is live and funded. You're on NASPO so procurement is a single PO via Carahsoft.",
+              },
+              "San Mateo": {
+                  "county": "San Mateo", "score": 72,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 200.0,
+                  "tier2_it_pct": 3.1, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
+                  "evidence": "Tech-forward county adjacent to Silicon Valley. Active BWC program. ~$200M Sheriff budget. Strong SaaS adoption across departments.",
+                  "snippet": "San Mateo Sheriff runs an active body-worn camera program — that footage needs to go somewhere.\nYou're on NASPO so there's no procurement cycle, Carahsoft has the contract vehicle.",
+              },
+              "Napa": {
+                  "county": "Napa", "score": 69,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 56.4,
+                  "tier2_it_pct": 7.0, "tier2_it_growing": True,
+                  "tier3_transcription_line": True, "tier3_transcription_amt_k": 8,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "DA budget explicitly lists transcription costs for upcoming trials. Axon Fleet Expansion underway with body cam equipment purchase. Sheriff budget increased 14% YoY. $56M Sheriff, $14.8M DA.",
+                  "snippet": "Napa DA's FY25-26 budget specifically calls out 'transcription costs for upcoming trials' as a line item — they're paying for this manually today.\nAxon Fleet Expansion is in this year's budget too, so body cam volume is about to go up.",
+              },
+              "Sonoma": {
+                  "county": "Sonoma", "score": 65,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 170.0,
+                  "tier2_it_pct": 2.8, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": True,
+                  "evidence": "Active BWC program. Significant post-fire tech investments. ~$170M Sheriff. ARPA-funded public safety projects. Strong law enforcement budget growth.",
+                  "snippet": "Sonoma Sheriff made significant tech investments post-wildfire — body cam program is active and funded.\nYou're on NASPO, and they've been receptive to SaaS purchases via cooperative contracts.",
+              },
+              "Alameda": {
+                  "county": "Alameda", "score": 59,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 636.4,
+                  "tier2_it_pct": 2.2, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "$636M Sheriff budget — largest in this cohort. $112M DA. $5.1B total. Budget under stress: $12.8M Sheriff cuts, ongoing deficit management. No transcription line found.",
+                  "snippet": "Alameda has one of the largest Sheriff departments in CA at $636M — there's real operational scale here even with current budget pressure.\nYou're on NASPO which matters in a procurement-cautious environment like Alameda.",
+              },
+              "Solano": {
+                  "county": "Solano", "score": 55,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 120.0,
+                  "tier2_it_pct": 2.1, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Vallejo and Fairfield operations. ~$120M Sheriff. BWC program active. Growing county budget.",
+                  "snippet": "Solano Sheriff handles Vallejo and Fairfield — high-volume patrol with an active body cam program.\nOn NASPO so procurement is straightforward.",
+              },
+              "Marin": {
+                  "county": "Marin", "score": 54,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 70.0,
+                  "tier2_it_pct": 3.2, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Affluent county, high per-capita IT spend. BWC program active. ~$70M Sheriff. Strong SaaS adoption.",
+                  "snippet": "Marin County has high per-capita tech adoption and an active BWC program.\nSmall enough that a single deal covers the whole department — and you're on NASPO.",
+              },
+              "Placer": {
+                  "county": "Placer", "score": 49,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 200.0,
+                  "tier2_it_pct": 2.6, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
+                  "evidence": "~$200M combined Sheriff budget (6 programs). $35M DA. Budget grew 9.5% YoY. 608 Sheriff positions + 13 new FTEs. No transcription line item or BWC mention found in FY25-26 budget.",
+                  "snippet": "Placer County's law enforcement budget grew nearly 10% this year — 608 Sheriff positions across Auburn, South Placer, and Tahoe operations.\nNo transcription line visible yet, but scale and growth make this a strong cold outreach.",
+              },
+              "Santa Cruz": {
+                  "county": "Santa Cruz", "score": 50,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
+                  "tier2_it_pct": 2.4, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "University-adjacent county. ~$80M Sheriff. BWC program active. Moderate IT adoption.",
+                  "snippet": "Santa Cruz Sheriff has an active BWC program and a growing evidence management workload.\nOn NASPO — no RFP required.",
+              },
+              "Merced": {
+                  "county": "Merced", "score": 51,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
+                  "tier2_it_pct": 1.8, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": True,
+                  "evidence": "$1.12B total county budget. New correctional center under construction. ARPA investments in public safety. Fast-growing county (UC Merced effect).",
+                  "snippet": "Merced County is investing heavily — new jail, ARPA public safety grants, and a growing DA caseload from UC Merced area growth.\nOn NASPO so there's no competitive bid process.",
+              },
+              "Butte": {
+                  "county": "Butte", "score": 51,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
+                  "tier2_it_pct": 2.0, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": True,
+                  "evidence": "Post-Camp Fire recovery investment. ~$80M Sheriff. BWC program active. ARPA-funded public safety tech. Chico/Oroville operations.",
+                  "snippet": "Butte County Sheriff made significant tech investments post-Camp Fire, including body cams now operational.\nARPA public safety funds are still active — they have budget to spend.",
+              },
+              "Nevada": {
+                  "county": "Nevada", "score": 42,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 50.0,
+                  "tier2_it_pct": 1.9, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": True,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "$415.5M county budget (conservative, balanced). BWC program approved 2021, now operational. ~$50M Sheriff. Budget growth flat.",
+                  "snippet": "Nevada County Sheriff approved body cams in 2021 and they're operational — that footage is going somewhere today.\nSmall department where one deal covers everything. On NASPO.",
+              },
+              "Yolo": {
+                  "county": "Yolo", "score": 48,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 60.0,
+                  "tier2_it_pct": 2.5, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "$223.5M county revenues. Davis/Woodland area. ~$60M Sheriff. University-adjacent, moderate tech adoption.",
+                  "snippet": "Yolo County's DA office handles a busy docket with UC Davis caseloads — investigator interviews and depositions are a constant.\nOn NASPO, no RFP needed.",
+              },
+              "El Dorado": {
+                  "county": "El Dorado", "score": 46,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 70.0,
+                  "tier2_it_pct": 2.0, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Growing foothill county between Sacramento and Tahoe. ~$70M Sheriff. Moderate IT spend.",
+                  "snippet": "El Dorado Sheriff covers a large geographic area including South Lake Tahoe — lots of patrol, lots of evidence.\nOn NASPO so procurement is a single PO.",
+              },
+              "Shasta": {
+                  "county": "Shasta", "score": 47,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
+                  "tier2_it_pct": 1.8, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Redding-area county. ~$80M Sheriff. Conservative budget approach. Rural northern CA.",
+                  "snippet": "Shasta County Sheriff is one of the most active in NorCal — Redding has a historically busy DA caseload.\nOn NASPO so no RFP process to navigate.",
+              },
+              "Madera": {
+                  "county": "Madera", "score": 40,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 50.0,
+                  "tier2_it_pct": 1.7, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Central Valley county, Fresno-adjacent. ~$50M Sheriff. Moderate law enforcement operations.",
+                  "snippet": "Madera County DA handles significant Central Valley caseloads — narcotics, ag crime, DUI.\nOn NASPO, clean procurement path.",
+              },
+              "Kings": {
+                  "county": "Kings", "score": 38,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 50.0,
+                  "tier2_it_pct": 1.6, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Hanford/Lemoore area. ~$50M Sheriff. Central Valley rural county.",
+                  "snippet": "Kings County Sheriff and DA handle a steady rural caseload — investigator interviews are routine.\nOn NASPO, no RFP needed.",
+              },
+              "Humboldt": {
+                  "county": "Humboldt", "score": 38,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 45.0,
+                  "tier2_it_pct": 1.7, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Eureka/NorCal coast. ~$45M Sheriff. Budget under fiscal stress. Recognized GFOA budget award recipient.",
+                  "snippet": "Humboldt County Sheriff covers a large remote territory — evidence management is a real operational challenge.\nOn NASPO so procurement is simple even with a tight budget.",
+              },
+              "Imperial": {
+                  "county": "Imperial", "score": 36,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 60.0,
+                  "tier2_it_pct": 1.5, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": True,
+                  "evidence": "Border county. ~$60M Sheriff (border ops). Federal grants active for border enforcement.",
+                  "snippet": "Imperial County Sheriff handles significant border-related law enforcement — high interview and evidence volume.\nFederal grants are flowing; on NASPO for any procurement.",
+              },
+              "Sutter": {
+                  "county": "Sutter", "score": 34,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 30.0,
+                  "tier2_it_pct": 1.6, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Yuba City area. ~$30M Sheriff. Small-medium county.",
+                  "snippet": "Sutter County DA office runs a busy court calendar for its size.\nOn NASPO — one PO to close a deal.",
+              },
+              "San Benito": {
+                  "county": "San Benito", "score": 31,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
+                  "tier2_it_pct": 1.5, "tier2_it_growing": True,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Hollister. Fastest-growing CA county by %. ~$20M Sheriff but rapidly growing. Small but expanding.",
+                  "snippet": "San Benito County is one of the fastest-growing in California — their DA office is scaling up fast.\nOn NASPO, easy procurement as they build out systems.",
+              },
+              "Calaveras": {
+                  "county": "Calaveras", "score": 28,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 18.0,
+                  "tier2_it_pct": 1.4, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Gold rush foothill county. ~$18M Sheriff. Small rural county.",
+                  "snippet": "Calaveras County is small but their Sheriff covers major highway corridors and tourist areas.\nOn NASPO.",
+              },
+              "Tuolumne": {
+                  "county": "Tuolumne", "score": 30,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
+                  "tier2_it_pct": 1.4, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "$68M total county budget. Sonora. ~$20M Sheriff. Rural Sierra foothill county.",
+                  "snippet": "Tuolumne County's DA handles the Sonora court calendar — small but consistent caseload.\nOn NASPO.",
+              },
+              "Mendocino": {
+                  "county": "Mendocino", "score": 26,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 30.0,
+                  "tier2_it_pct": 1.4, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "$17.8M budget deficit in FY25-26. Sheriff and Jail missing attrition savings targets. Rural NorCal coast. Budget under significant stress.",
+                  "snippet": "Mendocino is navigating a serious budget deficit — any pitch needs to frame ROI clearly.\nOn NASPO, which matters when procurement is under scrutiny.",
+              },
+              "Tehama": {
+                  "county": "Tehama", "score": 24,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
+                  "tier2_it_pct": 1.3, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Red Bluff. ~$20M Sheriff. Rural northern CA. Conservative budget.",
+                  "snippet": "Tehama County Sheriff covers a wide rural territory — evidence from patrol is steady.\nOn NASPO.",
+              },
+              "Lake": {
+                  "county": "Lake", "score": 25,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
+                  "tier2_it_pct": 1.3, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Lakeport. Rural NorCal. Budget historically stressed. ~$20M Sheriff.",
+                  "snippet": "Lake County DA handles drug and rural crime caseloads.\nOn NASPO.",
+              },
+              "Lassen": {
+                  "county": "Lassen", "score": 21,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 12.0,
+                  "tier2_it_pct": 1.2, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Susanville. Prison-town economy. ~$12M Sheriff. Small remote county.",
+                  "snippet": "Lassen County's law enforcement activity is boosted by its state prison operations.\nOn NASPO.",
+              },
+              "Amador": {
+                  "county": "Amador", "score": 22,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 15.0,
+                  "tier2_it_pct": 1.2, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Jackson. Small foothill county. ~$15M Sheriff.",
+                  "snippet": "Amador County is small but the Sheriff and DA handle a steady caseload.\nOn NASPO.",
+              },
+              "Glenn": {
+                  "county": "Glenn", "score": 16,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 10.0,
+                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Willows. Very small rural county. ~$10M Sheriff.",
+                  "snippet": "Glenn County is small, but any department using Rev saves time on a per-case basis.\nOn NASPO.",
+              },
+              "Del Norte": {
+                  "county": "Del Norte", "score": 17,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 10.0,
+                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Crescent City. Most remote northern CA county. ~$10M Sheriff.",
+                  "snippet": "Del Norte is remote — but that makes evidence turnaround slower, which is exactly where Rev helps.\nOn NASPO.",
+              },
+              "Siskiyou": {
+                  "county": "Siskiyou", "score": 21,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 12.0,
+                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Yreka. Large geographic territory, small population. ~$12M Sheriff.",
+                  "snippet": "Siskiyou Sheriff patrols one of the largest counties in CA by area — lots of patrol = lots of evidence.\nOn NASPO.",
+              },
+              "Colusa": {
+                  "county": "Colusa", "score": 16,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 8.0,
+                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Williams. Tiny agricultural county. ~$8M Sheriff.",
+                  "snippet": "Colusa County is small but their DA still handles criminal caseloads.\nOn NASPO.",
+              },
+              "Trinity": {
+                  "county": "Trinity", "score": 11,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 6.0,
+                  "tier2_it_pct": 1.0, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Weaverville. Very small remote county. ~$6M Sheriff.",
+                  "snippet": "Trinity County is small and remote.\nOn NASPO.",
+              },
+              "Plumas": {
+                  "county": "Plumas", "score": 13,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 7.0,
+                  "tier2_it_pct": 1.0, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Quincy. Mountain county. ~$7M Sheriff.",
+                  "snippet": "Plumas County Sheriff covers remote mountain terrain.\nOn NASPO.",
+              },
+              "Inyo": {
+                  "county": "Inyo", "score": 13,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 8.0,
+                  "tier2_it_pct": 1.0, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Bishop. Desert/mountain county. ~$8M Sheriff. Death Valley jurisdiction.",
+                  "snippet": "Inyo County covers Death Valley and eastern Sierra — vast territory, small force.\nOn NASPO.",
+              },
+              "Modoc": {
+                  "county": "Modoc", "score": 9,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 4.0,
+                  "tier2_it_pct": 0.9, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Alturas. Most remote CA county. ~$4M Sheriff. Tiny population.",
+                  "snippet": "Modoc County is very small and remote.\nOn NASPO.",
+              },
+              "Mono": {
+                  "county": "Mono", "score": 13,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 10.0,
+                  "tier2_it_pct": 1.2, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Mammoth Lakes / Bridgeport. Tourism-driven. ~$10M Sheriff.",
+                  "snippet": "Mono County Sheriff handles a busy tourist corridor with Mammoth Mountain.\nOn NASPO.",
+              },
+              "Alpine": {
+                  "county": "Alpine", "score": 4,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 1.5,
+                  "tier2_it_pct": 0.8, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Markleeville. Least populous CA county. ~1,200 residents. Minimal LE budget.",
+                  "snippet": "Alpine County is the smallest county in California by population.\nOn NASPO.",
+              },
+              "Sierra": {
+                  "county": "Sierra", "score": 6,
+                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 2.0,
+                  "tier2_it_pct": 0.9, "tier2_it_growing": False,
+                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
+                  "tier3_body_cam": False,
+                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
+                  "evidence": "Downieville. ~3,000 residents. Very small LE budget.",
+                  "snippet": "Sierra County is one of the smallest in California.\nOn NASPO.",
+              },
+          }
+
+          def load_county_scores():
+              try:
+                  resp = hs_post("/crm/v3/objects/notes/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN", "value": SCORE_MARKER}
+                      ]}],
+                      "properties": ["hs_note_body", "hs_timestamp"],
+                      "sorts": [{"propertyName": "hs_timestamp", "direction": "DESCENDING"}],
+                      "limit": 1
+                  })
+                  results = resp.get("results", [])
+                  if results:
+                      body      = results[0]["properties"]["hs_note_body"]
+                      ts        = int(results[0]["properties"]["hs_timestamp"]) / 1000
+                      age_days  = (datetime.datetime.now().timestamp() - ts) / 86400
+                      if age_days <= SCORE_MAX_DAYS:
+                          json_str = body.split(SCORE_MARKER)[1].strip()
+                          scores   = json.loads(json_str)
+                          print(f"✅ Loaded county scores ({age_days:.1f}d old): {list(scores.keys())}")
+                          return scores
+                      else:
+                          print(f"⚠️ County scores stale ({age_days:.1f}d) — will refresh via Claude API")
+              except Exception as e:
+                  print(f"Score load error: {e}")
+              # Fall back to seed scores (real PDF data + estimates)
+              print("🌱 No cached scores found — using seed scores")
+              return None
+
+          def save_county_scores(scores):
+              try:
+                  hs_post("/crm/v3/objects/notes", {
+                      "properties": {
+                          "hs_note_body": f"{SCORE_MARKER}\n{json.dumps(scores)}",
+                          "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000))
+                      }
+                  })
+                  print(f"✅ County scores saved ({len(scores)} counties)")
+              except Exception as e:
+                  print(f"Score save error: {e}")
+
+          def score_county(county):
+              """
+              Score a CA county 0-100 for Rev legal transcription outreach.
+              Scoring tiers:
+                Tier 0 — Carahsoft/NASPO/cooperative purchasing (+25)  ← removes procurement friction entirely
+                Tier 1 — Size: Sheriff + DA budget, bigger = better (+10)
+                Tier 2 — Tech readiness: IT spend growth, SaaS adoption (+18)
+                Tier 3 — Direct pain: transcription line items, body cam (+30+15 bonus)
+                Tier 4 — Buying momentum: budget increases, new hires, ARPA (+5+5+5)
+              """
+              prompt = f"""You are a B2B sales intelligence analyst. Research {county} County, California
+          for signals relevant to selling Rev's legal transcription software (~$15k/yr) to law enforcement.
+          Rev partners with Carahsoft for public sector distribution via NASPO ValuePoint and cooperative contracts.
+
+          Search for and answer each question below with a number/boolean and 1-line evidence:
+
+          TIER 0 — Procurement vehicle (most important)
+          T0a. Does {county} County purchase software via Carahsoft, NASPO ValuePoint, OMNIA Partners, or any cooperative purchasing contract? (yes=25pts / no=0)
+
+          TIER 1 — Size
+          T1a. What is the {county} County Sheriff's Office annual budget? (>$40M=10, $10-40M=7, $5-10M=4, <$5M=1)
+          T1b. What is the {county} County District Attorney annual budget? (>$15M=10pts in context, note for reference)
+
+          TIER 2 — Tech readiness
+          T2a. What % of {county} County's total budget goes to IT/technology? (>3%=8, 2-3%=5, <2%=2)
+          T2b. Is {county} County IT budget growing YoY? (yes=5, flat/declining=0)
+          T2c. Does {county} County have active SaaS or software subscription purchases across departments? (yes=5, no=0)
+
+          TIER 3 — Direct pain
+          T3a. Does {county} County (Sheriff, DA, Courts, or other law enforcement) have a budget line for Transcription Services? (yes=30, no=0)
+          T3b. If yes, roughly how much is budgeted for transcription? (<$5k=+0, $5-20k=+8, >$20k=+15 bonus)
+          T3c. Does {county} County Sheriff or Police have a body-worn camera (BWC) / body cam program? (yes=15, no=0)
+
+          TIER 4 — Buying momentum
+          T4a. Did {county} County law enforcement budget increase >5% YoY most recently? (yes=5, no=0)
+          T4b. Any new Data Specialist, Analyst, or Investigator hires in Sheriff/DA/Courts in last 12 months? (yes=5, no=0)
+          T4c. Any ARPA or federal tech grants active in {county} County for public safety? (yes=5, no=0)
+
+          Return a JSON object with this exact structure:
+          {{
+            "county": "{county}",
+            "score": <total 0-100>,
+            "tier0_carahsoft": <true/false>,
+            "tier1_sheriff_budget_m": <float millions>,
+            "tier2_it_pct": <float>,
+            "tier2_it_growing": <true/false>,
+            "tier3_transcription_line": <true/false>,
+            "tier3_transcription_amt_k": <float thousands, 0 if none>,
+            "tier3_body_cam": <true/false>,
+            "tier4_budget_increase": <true/false>,
+            "tier4_new_hire": <true/false>,
+            "tier4_arpa": <true/false>,
+            "evidence": "<2-3 sentence summary of top signals found>",
+            "snippet": "<EXACTLY 2 lines max. Line 1: the strongest signal (e.g. 'Saw {county} County DA budgeted $8k for transcription services this year — that tells us you\\'re already solving this manually.'). Line 2: the Carahsoft/procurement angle if applicable OR the body cam angle (e.g. 'You\\'re also on NASPO so there\\'s no procurement cycle to worry about.'). No third line. Keep it conversational, not corporate.>"
+          }}
+          Return ONLY the JSON object."""
+              raw = claude(prompt, max_tokens=800, use_search=True)
+              for attempt in [
+                  lambda t: json.loads(t.strip()),
+                  lambda t: json.loads(t[t.find("{"):t.rfind("}")+1]),
+              ]:
+                  try:
+                      result = attempt(raw)
+                      if isinstance(result, dict) and "score" in result:
+                          print(f"  📊 {county}: {result['score']}/100 | T0={result.get('tier0_carahsoft')} T3_tx={result.get('tier3_transcription_line')} T3_bwc={result.get('tier3_body_cam')}")
+                          return result
+                  except: pass
+              print(f"  ⚠️ Could not parse score for {county}")
+              return {"county": county, "score": 0, "evidence": "parse error", "snippet": ""}
+
+          def sort_counties_by_score(county_list, scores):
+              """Sort a county list by score descending; unscored counties go to the end."""
+              return sorted(county_list, key=lambda c: scores.get(c, {}).get("score", 0), reverse=True)
+
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
               body = {
@@ -248,6 +832,71 @@ jobs:
               resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
               return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+          # ── Load / init state ─────────────────────────────────────
+          state = load_state()
+          if not state:
+              print("No state — initializing fresh")
+              state = init_state()
+          else:
+              print(f"Loaded state: {json.dumps(state, indent=2)}")
+              for ae in AES:
+                  if "county_leads" not in state[ae]:
+                      state[ae]["county_leads"] = {}
+
+          # ── County scoring pre-pass (weekly refresh) ──────────────
+          county_scores = load_county_scores()
+          if not county_scores:
+              # ── First run or stale cache: seed from real PDF data + estimates,
+              #    then kick off a Claude API refresh pass to sharpen scores.
+              print("🌱 Seeding county scores from PDF research baseline...")
+              county_scores = {k: v.copy() for k, v in SEED_SCORES.items()}
+
+              # Identify any counties not in seeds (e.g. newly added) and score them fresh
+              all_counties = list({
+                  c for ae in AES
+                  for c in (AE_COUNTIES[ae] + AE_OVERFLOW_COUNTIES.get(ae, []))
+              })
+              missing = [c for c in all_counties if c not in county_scores]
+              if missing:
+                  print(f"  🔍 Scoring {len(missing)} new counties via Claude API: {missing}")
+                  for county in missing:
+                      try:
+                          result = score_county(county)
+                          county_scores[county] = result
+                          time.sleep(2)
+                      except Exception as e:
+                          print(f"  ⚠️ Scoring error for {county}: {e}")
+                          county_scores[county] = {"score": 0, "evidence": str(e), "snippet": ""}
+
+              save_county_scores(county_scores)
+
+              # Post score leaderboard to Slack
+              score_lines = sorted(county_scores.items(), key=lambda x: x[1].get("score", 0), reverse=True)
+              score_msg   = f"<@{SLACK_USER}>\n*📊 County Signal Scores* (seeded from FY25-26 budget PDFs)\n\n"
+              for c, s in score_lines:
+                  t0  = "🤝" if s.get("tier0_carahsoft") else "  "
+                  t3  = "📝" if s.get("tier3_transcription_line") else "  "
+                  bwc = "📷" if s.get("tier3_body_cam") else "  "
+                  score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
+                  if s.get("snippet"):
+                      snippet_line1 = s["snippet"].split("\n")[0]
+                      score_msg += f"    _{snippet_line1}_\n"
+              requests.post("https://slack.com/api/chat.postMessage",
+                  headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": score_msg})
+          else:
+              print(f"✅ Using cached county scores ({len(county_scores)} counties)")
+
+          # Re-sort each AE's county list by score (highest first), preserving already-exhausted order
+          for ae in AES:
+              not_started  = [c for c in AE_COUNTIES[ae]
+                               if c not in state[ae].get("exhausted", [])
+                               and c != state[ae].get("county")]
+              already_done = state[ae].get("exhausted", [])
+              current      = state[ae].get("county")
+              sorted_next  = sort_counties_by_score(not_started, county_scores)
+              AE_COUNTIES[ae] = already_done + ([current] if current else []) + sorted_next
+              print(f"  {ae} county order: {AE_COUNTIES[ae]}")
+
           # ── Find leads ────────────────────────────────────────────
           def find_leads(county, org_type, titles, exclude_names=None, batch=1):
               exclude_str = ""
@@ -436,6 +1085,16 @@ jobs:
                   "ob_email_4_subject":    subjects.get(4, ""),
                   "ob_email_4_body":       emails.get("email_4", ""),
               }
+              # ── County signal properties (written from cached scores) ──
+              c_sig = county_scores.get(contact.get("county", ""), {})
+              if c_sig:
+                  props["county_signal_score"]         = c_sig.get("score", 0)
+                  props["county_carahsoft__naspo"]      = "CA NASPO ValuePoint Cloud Solutions Contract — no RFP required. Any CA county can purchase directly via Carahsoft (contract #AR2472)."
+                  props["county_transcription_budget_k"] = c_sig.get("tier3_transcription_amt_k", 0)
+                  props["county_body_cam_program"]      = "true" if c_sig.get("tier3_body_cam") else "false"
+                  snippet = c_sig.get("snippet", "")
+                  if snippet:
+                      props["county_signal_snippet"] = snippet
               if owner_map.get(ae_name):       props["hubspot_owner_id"] = owner_map[ae_name]
               if contact.get("email"):         props["email"]   = contact["email"]
               if contact.get("phone"):         props["phone"]   = contact["phone"]
@@ -716,19 +1375,24 @@ jobs:
               county       = data["county"]
               added        = data["added"]
               ae_skipped   = data["skipped"]
-              next_c       = state[ae_name].get("county", "")
-              next_str     = f" → *{next_c}* tomorrow" if next_c and next_c != county else ""
               list_url     = LIST_URLS[ae_name]
               county_leads = state[ae_name].get("county_leads", {})
               exhausted    = state[ae_name].get("exhausted", [])
+              # Next 2 upcoming counties
+              upcoming     = get_upcoming_counties(ae_name, state, n=2)
+              if upcoming:
+                  upcoming_str = "  · ".join(f"*{c}*" for c in upcoming)
+                  next_str     = f"\n  ⏭ Up next: {upcoming_str}"
+              else:
+                  next_str = "\n  ⚠️ All counties exhausted — add more to AE_COUNTIES"
               # Build compact county list: exhausted ✅, active 🔄
               county_parts = []
               for c, count in county_leads.items():
                   icon = "✅" if c in exhausted else "🔄"
                   county_parts.append(f"{c} {icon} ({count})")
               county_line = "  " + "  ·  ".join(county_parts) if county_parts else "  No counties yet"
-              msg += f"*👤 {ae_name}* — 📍 {county} County{next_str} | <{list_url}|View Segment>\n"
-              msg += f"  {len(added)} leads added · {ae_skipped} dupes skipped · {len(county_leads)} counties checked\n"
+              msg += f"*👤 {ae_name}* — 📍 {county} County | <{list_url}|View Segment>\n"
+              msg += f"  {len(added)} leads added · {ae_skipped} dupes skipped · {len(county_leads)} counties checked{next_str}\n"
               msg += f"{county_line}\n\n"
           msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v31_"
           requests.post("https://slack.com/api/chat.postMessage",

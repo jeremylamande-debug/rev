@@ -39,23 +39,26 @@ jobs:
           }
           AE_ORDER = ["749290652", "87460084", "89993866"]
 
-          # ── Disposition label map ─────────────────────────────────────
-          DISPOSITIONS = {
-              "d62d6bbe-4f03-4e2d-81fa-faabcc26c819": "Meeting Set",
-              "7bbece5e-4427-411d-aa02-cc562a181b4c": "Not Interested",
-              "9d9162e7-6cf3-4944-bf63-4dff82258764": "Busy",
-              "f240bbac-87c9-4f6e-bf70-924b57d47db7": "Connected",
-              "a4c4c377-d246-4b32-a13b-75a56a4cd0ff": "Left live message",
-              "b2cf5968-551e-4856-9783-52b3da59a7d0": "Left voicemail",
-              "73a0d17f-1163-4015-bdd5-ec830791da20": "No answer",
-              "17b47fee-58de-441e-a44c-c6300d46f273": "Wrong number",
-          }
-          CONNECTED_DISPOSITIONS = {
-              "d62d6bbe-4f03-4e2d-81fa-faabcc26c819",  # Meeting Set
-              "f240bbac-87c9-4f6e-bf70-924b57d47db7",  # Connected
-              "7bbece5e-4427-411d-aa02-cc562a181b4c",  # Not Interested
-              "a4c4c377-d246-4b32-a13b-75a56a4cd0ff",  # Left live message
-          }
+          # ── Aircall tag classification ────────────────────────────────
+          # Aircall tags (entered by reps) are the source of truth for disposition.
+          # HubSpot's hs_call_disposition is unreliable — a call can show "Connected"
+          # in HubSpot while the rep tagged it "Not Connected" in Aircall.
+          MEETING_SET_GUID = "d62d6bbe-4f03-4e2d-81fa-faabcc26c819"  # fallback only
+
+          def tag_emoji(tag):
+              t = tag.lower()
+              if "meeting set" in t or "interested (" in t:  return "📅"
+              if t.startswith("connected"):                   return "🟢"
+              if "voicemail" in t:                            return "📬"
+              if "wrong number" in t:                         return "❌"
+              if "not connected" in t:                        return "🔴"
+              return "⚪"
+
+          def is_connected_tag(tag):
+              return tag.lower().startswith("connected")
+
+          def is_meeting_set_tag(tag):
+              return "meeting set" in tag.lower() or "interested (" in tag.lower()
 
           # ── Date range logic ──────────────────────────────────────────
           # Monday  → weekly summary: last Mon 00:00 UTC → last Fri 23:59 UTC
@@ -161,55 +164,55 @@ jobs:
               if oid in ae_calls:
                   ae_calls[oid].append(call["properties"])
 
-          # ── Compute metrics (shared daily + weekly) ───────────────────
+          # ── Compute metrics — Aircall tags as source of truth ────────
           def compute_metrics(calls):
               total = len(calls)
               if total == 0:
                   return None
-              disp_counts    = {}
-              connected_durs = []
-              aircall_tags   = {}
-              coaching_notes = []
+              tag_counts     = {}   # raw Aircall tag → count
+              connected_durs = []   # seconds, connected calls only
+              coaching_notes = []   # comments from connected calls
+              meeting_set    = 0
 
               for c in calls:
                   disp_guid   = c.get("hs_call_disposition") or ""
-                  disp_label  = DISPOSITIONS.get(disp_guid, "Unknown")
                   duration_ms = int(c.get("hs_call_duration") or 0)
                   body        = c.get("hs_call_body") or ""
 
-                  disp_counts[disp_label] = disp_counts.get(disp_label, 0) + 1
-
-                  if disp_guid in CONNECTED_DISPOSITIONS and duration_ms > 0:
-                      connected_durs.append(duration_ms / 1000)
-
                   aircall = parse_aircall(body)
-                  if aircall["tags"]:
-                      aircall_tags[aircall["tags"]] = aircall_tags.get(aircall["tags"], 0) + 1
-                  if aircall["comments"] and disp_guid in CONNECTED_DISPOSITIONS:
-                      coaching_notes.append(aircall["comments"])
+                  tag     = aircall["tags"].strip() if aircall["tags"] else ""
+                  tag_key = tag if tag else "(no tag)"
+                  tag_counts[tag_key] = tag_counts.get(tag_key, 0) + 1
 
-              connected   = sum(disp_counts.get(d, 0) for d in
-                                ["Meeting Set", "Connected", "Not Interested", "Left live message"])
-              meeting_set = disp_counts.get("Meeting Set", 0)
-              wrong_num   = disp_counts.get("Wrong number", 0)
-              voicemail   = disp_counts.get("Left voicemail", 0)
-              no_answer   = disp_counts.get("No answer", 0)
-              busy        = disp_counts.get("Busy", 0)
-              avg_dur_sec = int(sum(connected_durs) / len(connected_durs)) if connected_durs else 0
+                  # Meeting set: Aircall tag OR HubSpot disposition fallback
+                  if is_meeting_set_tag(tag) or disp_guid == MEETING_SET_GUID:
+                      meeting_set += 1
+
+                  # Connected = Aircall tag starts with "connected"
+                  if is_connected_tag(tag):
+                      if duration_ms > 0:
+                          connected_durs.append(duration_ms / 1000)
+                      if aircall["comments"]:
+                          coaching_notes.append(aircall["comments"])
+
+              # Connected count = sum of all "connected *" tags
+              connected    = sum(v for k, v in tag_counts.items() if is_connected_tag(k))
+              wrong_num    = sum(v for k, v in tag_counts.items() if "wrong number" in k.lower())
+              wrong_num_rt = round(wrong_num / total * 100) if total else 0
+              avg_dur_sec  = int(sum(connected_durs) / len(connected_durs)) if connected_durs else 0
+
+              # Sort tags by count descending for display
+              tag_sorted = sorted(tag_counts.items(), key=lambda x: -x[1])
 
               return {
                   "total":          total,
                   "connected":      connected,
                   "meeting_set":    meeting_set,
-                  "voicemail":      voicemail,
-                  "no_answer":      no_answer,
-                  "busy":           busy,
-                  "wrong_number":   wrong_num,
                   "connect_rate":   round(connected / total * 100) if total else 0,
                   "meeting_rate":   round(meeting_set / total * 100) if total else 0,
-                  "wrong_num_rate": round(wrong_num / total * 100) if total else 0,
+                  "wrong_num_rate": wrong_num_rt,
                   "avg_dur_sec":    avg_dur_sec,
-                  "aircall_tags":   aircall_tags,
+                  "tag_sorted":     tag_sorted,   # [(tag, count), ...] sorted by count
                   "coaching_notes": coaching_notes[:10],
               }
 
@@ -219,7 +222,7 @@ jobs:
               m    = compute_metrics(ae_calls[oid])
               metrics[oid] = m
               if m:
-                  print(f"  {name}: {m['total']} calls | {m['connected']} connected | {m['meeting_set']} mtg set")
+                  print(f"  {name}: {m['total']} calls | {m['connected']} connected ({m['connect_rate']}%) | {m['meeting_set']} mtg set")
               else:
                   print(f"  {name}: 0 calls")
 
@@ -287,25 +290,20 @@ jobs:
                   lines.append(f"*{name}* — 0 calls logged\n")
                   continue
 
-              lines.append(f"*{name}* — {m['total']} calls")
-
-              disp_parts = []
-              if m["meeting_set"]:  disp_parts.append(f"📅 {m['meeting_set']} mtg{'s' if m['meeting_set'] != 1 else ''} set")
-              if m["connected"]:    disp_parts.append(f"✅ {m['connected']} connected ({m['connect_rate']}%)")
-              if m["voicemail"]:    disp_parts.append(f"📬 {m['voicemail']} VM")
-              if m["no_answer"]:    disp_parts.append(f"📵 {m['no_answer']} no answer")
-              if m["busy"]:         disp_parts.append(f"🔄 {m['busy']} busy")
-              if m["wrong_number"]: disp_parts.append(f"❌ {m['wrong_number']} wrong #")
-              if disp_parts:
-                  lines.append("  " + "  |  ".join(disp_parts))
-
+              # Header line
+              summary_parts = [f"Connect rate: *{m['connect_rate']}%*"]
+              if m["meeting_set"]:
+                  summary_parts.append(f"📅 {m['meeting_set']} mtg{'s' if m['meeting_set'] != 1 else ''} set")
               if m["avg_dur_sec"]:
                   d = m["avg_dur_sec"]
-                  lines.append(f"  ⏱ Avg connected: {d // 60}m {d % 60}s")
+                  summary_parts.append(f"⏱ Avg connected: {d // 60}m {d % 60}s")
+              lines.append(f"*{name}* — {m['total']} calls  |  {'  |  '.join(summary_parts)}")
 
-              if m["aircall_tags"]:
-                  tag_parts = [f"{v}× _{k}_" for k, v in sorted(m["aircall_tags"].items(), key=lambda x: -x[1])]
-                  lines.append(f"  🏷 Tags: {', '.join(tag_parts)}")
+              # Aircall tag breakdown (stacked view — source of truth)
+              for tag, count in m["tag_sorted"]:
+                  pct   = round(count / m["total"] * 100)
+                  emoji = tag_emoji(tag)
+                  lines.append(f"  {emoji} _{tag}_: {count} ({pct}%)")
 
               if m["wrong_num_rate"] >= 20:
                   lines.append(f"  ⚠️ *High wrong-number rate ({m['wrong_num_rate']}%)* — refresh phone data for {name}'s counties")

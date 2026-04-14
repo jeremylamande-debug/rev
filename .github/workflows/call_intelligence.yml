@@ -108,20 +108,31 @@ jobs:
               return ""
 
           # ── Parse Aircall data from hs_call_body HTML ─────────────────
+          # HTML structure: <div id="aircall-tags"><br><strong>Tags:</strong> VALUE</div>
+          # Must strip HTML tags first — "Tags:" is inside <strong> so a naive
+          # regex stopping at "<" captures nothing.
+          def strip_html(html_str):
+              return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html_str)).strip()
+
           def parse_aircall(body):
               if not body:
                   return {"tags": "", "comments": ""}
-              tags_match = re.search(
-                  r'id=["\']aircall-tags["\'][^>]*>.*?Tags:\s*([^<\n]+)',
+              # Extract aircall-tags div, strip HTML, then find "Tags: VALUE"
+              tags_div = re.search(
+                  r'id=["\']aircall-tags["\'][^>]*>(.*?)</div>',
                   body, re.DOTALL | re.IGNORECASE
               )
-              tags = re.sub(r'\s+', ' ', tags_match.group(1)).strip() if tags_match else ""
-              comments_match = re.search(
+              tags = ""
+              if tags_div:
+                  plain = strip_html(tags_div.group(1))
+                  t = re.search(r'Tags:\s*(.+)', plain, re.IGNORECASE)
+                  tags = t.group(1).strip() if t else ""
+              # Extract aircall-comments div
+              comments_div = re.search(
                   r'id=["\']aircall-comments["\'][^>]*>(.*?)</div>',
                   body, re.DOTALL | re.IGNORECASE
               )
-              comments_raw = comments_match.group(1).strip() if comments_match else ""
-              comments = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', comments_raw)).strip()
+              comments = strip_html(comments_div.group(1)) if comments_div else ""
               return {"tags": tags, "comments": comments}
 
           # ── Fetch all outbound calls in range (paginated) ─────────────

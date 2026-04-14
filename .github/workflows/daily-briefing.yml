@@ -1,14 +1,11 @@
 name: Daily Revenue Briefing
-
 on:
   schedule:
     - cron: '0 7 * * 2-6'  # 3:00 AM ET (UTC-4 EDT), Tue–Sat
   workflow_dispatch:
-
 jobs:
   post-briefings:
     runs-on: ubuntu-latest
-
     steps:
       - name: Post Daily Pipe Update with QMH
         env:
@@ -18,50 +15,41 @@ jobs:
           pip install pytz --quiet
           python3 - <<'EOF'
           import urllib.request, urllib.parse, json, os, datetime, pytz
-
           HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
           SLACK_CHANNEL = "C0APDRMLN1Z"  # #daily-sales
           SLACK_USER    = "U08JJMM2QSW"
           SELLERS       = ["Dillon DeWitt", "Will Weis", "Isabella Simpatico", "James Gregory"]
           PORTAL_ID     = "21451281"
-
           LEGAL_INDUSTRIES = {"Government", "Legal", "Law Enforcement"}
           CORE_INDUSTRIES  = {"Marketing", "Technology", "Finance", "Consulting", "Media",
                                "Healthcare", "Content Creation", "Education", "Research", "Other"}
-
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
-
           # ── Date ranges ───────────────────────────────────────────
           et        = pytz.timezone("America/New_York")
           now_et    = datetime.datetime.now(et)
           yesterday = now_et - datetime.timedelta(days=1)
-
           # Yesterday window (for daily deals)
           start_et  = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0))
           end_et    = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59))
           start_ms  = int(start_et.timestamp() * 1000)
           end_ms    = int(end_et.timestamp() * 1000)
           date_label = yesterday.strftime("%A, %B %d, %Y")
-
           # MTD window (for QMH MTD)
           mtd_start = et.localize(datetime.datetime(now_et.year, now_et.month, 1, 0, 0, 0))
           mtd_start_ms = int(mtd_start.timestamp() * 1000)
           now_ms    = int(now_et.timestamp() * 1000)
-
           # ── HubSpot helpers ────────────────────────────────────────
           def hs_get(path):
               req = urllib.request.Request(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
-
           def hs_post(path, payload):
               data = json.dumps(payload).encode()
               req  = urllib.request.Request(
                   f"https://api.hubapi.com{path}",
                   data=data, headers=HS_HEADERS, method="POST")
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
-
           def hs_post_all(path, payload, limit=100):
               """Paginate through all results."""
               all_results = []
@@ -77,14 +65,12 @@ jobs:
                   if not offset or len(results) < limit:
                       break
               return all_results
-
           # ── Get owners ─────────────────────────────────────────────
           owners    = hs_get("/crm/v3/owners").get("results", [])
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           id_to_name = {o["id"]: f"{o['firstName']} {o['lastName']}" for o in owners}
           seller_ids = {name: owner_map.get(name) for name in SELLERS}
           print(f"Seller IDs: {seller_ids}")
-
           # ── Fetch yesterday's deals ────────────────────────────────
           deals = hs_post("/crm/v3/objects/deals/search", {
               "filterGroups": [{"filters": [
@@ -95,19 +81,16 @@ jobs:
                              "dealstage", "hubspot_owner_id", "hs_createdate"],
               "limit": 100
           }).get("results", [])
-
           # ── Helpers ────────────────────────────────────────────────
           def fmt_currency(val):
               try: return f"${float(val):,.0f}"
               except: return "$0"
-
           def fmt_date(iso):
               if not iso: return "—"
               try:
                   d = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
                   return d.strftime("%b %d, %Y")
               except: return iso
-
           # ── Map deals to sellers ───────────────────────────────────
           seller_deals = {s: [] for s in SELLERS}
           for deal in deals:
@@ -116,12 +99,10 @@ jobs:
               for name, sid in seller_ids.items():
                   if str(oid) == str(sid):
                       seller_deals[name].append({**p, "hs_object_id": deal["id"]})
-
           total_deals = sum(len(v) for v in seller_deals.values())
           total_acv   = sum(float(d.get("amount") or 0) for v in seller_deals.values() for d in v)
           acv_vals    = [sum(float(d.get("amount") or 0) for d in seller_deals[s]) for s in SELLERS]
           short_names = [s.split()[0] for s in SELLERS]
-
           # ── Fetch QMH meetings ────────────────────────────────────
           def fetch_qmh_meetings(start_ms, end_ms):
               """Fetch Held Qualified + Intro/Discovery meetings in time window."""
@@ -135,10 +116,8 @@ jobs:
                   "properties": ["hs_meeting_outcome", "hs_activity_type",
                                  "hs_meeting_end_time", "hubspot_owner_id"],
               })
-
           # ── Get industry group for a meeting via associated contact ─
           contact_industry_cache = {}
-
           def get_industry_for_meeting(meeting_id):
               if meeting_id in contact_industry_cache:
                   return contact_industry_cache[meeting_id]
@@ -158,7 +137,6 @@ jobs:
                   print(f"Industry lookup error for meeting {meeting_id}: {e}")
                   contact_industry_cache[meeting_id] = None
                   return None
-
           def classify_industry(industry):
               if not industry: return "unknown"
               for legal in LEGAL_INDUSTRIES:
@@ -166,7 +144,6 @@ jobs:
               for core in CORE_INDUSTRIES:
                   if core.lower() in industry.lower(): return "core"
               return "unknown"
-
           # ── Build QMH counts ──────────────────────────────────────
           def build_qmh_counts(meetings):
               """Returns {seller_name: {"legal": n, "core": n, "total": n}}"""
@@ -183,17 +160,14 @@ jobs:
                       counts[owner_name][bucket] += 1
                   counts[owner_name]["total"] += 1
               return counts
-
           print("Fetching daily QMH meetings...")
           daily_meetings = fetch_qmh_meetings(start_ms, end_ms)
           print(f"Daily QMH meetings found: {len(daily_meetings)}")
           daily_qmh = build_qmh_counts(daily_meetings)
-
           print("Fetching MTD QMH meetings...")
           mtd_meetings = fetch_qmh_meetings(mtd_start_ms, now_ms)
           print(f"MTD QMH meetings found: {len(mtd_meetings)}")
           mtd_qmh = build_qmh_counts(mtd_meetings)
-
           # ── ASCII bar chart helper ─────────────────────────────────
           def ascii_chart(names, values, max_bar=20):
               max_val = max(values) if max(values) > 0 else 1
@@ -202,12 +176,10 @@ jobs:
                   bar = "█" * int((val / max_val) * max_bar)
                   lines.append(f"{name:<12} {str(val):>6}  {bar}")
               return lines
-
           # ── Build Slack message ───────────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*📊 Daily Pipe Update — {date_label}*\n"
           msg += f"*{total_deals} new deal{'s' if total_deals != 1 else ''} | Total ACV: {fmt_currency(total_acv)}*\n\n"
-
           # Deal details per seller
           for seller in SELLERS:
               sd = seller_deals[seller]
@@ -226,7 +198,6 @@ jobs:
                       url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-3/{did}"
                       msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
                   msg += "\n"
-
           # ACV chart
           msg += "```\n"
           msg += f"{'Rep':<12} {'ACV':>10}  Chart\n"
@@ -236,13 +207,11 @@ jobs:
               bar     = "█" * int((val / max_acv) * 20)
               msg    += f"{name:<12} {fmt_currency(val):>10}  {bar}\n"
           msg += "```\n\n"
-
           # QMH Daily chart
           daily_legal  = [daily_qmh[s]["legal"] for s in SELLERS]
           daily_core   = [daily_qmh[s]["core"]  for s in SELLERS]
           daily_totals = [daily_qmh[s]["total"] for s in SELLERS]
           total_daily_qmh = sum(daily_totals)
-
           msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified)*\n"
           msg += f"*{total_daily_qmh} total qualified meetings*\n"
           msg += "```\n"
@@ -253,13 +222,11 @@ jobs:
               bar = "█" * int((total / max_daily) * 15)
               msg += f"{s:<12} {legal:>6}  {core:>6}  {total:>6}  {bar}\n"
           msg += "```\n\n"
-
           # QMH MTD chart
           mtd_legal  = [mtd_qmh[s]["legal"] for s in SELLERS]
           mtd_core   = [mtd_qmh[s]["core"]  for s in SELLERS]
           mtd_totals = [mtd_qmh[s]["total"] for s in SELLERS]
           total_mtd_qmh = sum(mtd_totals)
-
           msg += f"*📅 QMH — MTD (Month to Date)*\n"
           msg += f"*{total_mtd_qmh} total qualified meetings this month*\n"
           msg += "```\n"
@@ -270,7 +237,6 @@ jobs:
               bar = "█" * int((total / max_mtd) * 15)
               msg += f"{s:<12} {legal:>6}  {core:>6}  {total:>6}  {bar}\n"
           msg += "```\n"
-
           # ── Post to Slack ──────────────────────────────────────────
           payload = {"channel": SLACK_CHANNEL, "text": msg}
           req = urllib.request.Request(
@@ -283,141 +249,4 @@ jobs:
                   print("✅ Daily Pipe Update + QMH posted!")
               else:
                   print(f"⚠️ Slack error: {result.get('error')}")
-          EOF
-
-      - name: Post Daily CS Brief
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        run: |
-          python3 - <<'EOF'
-          import urllib.request, json, os, datetime
-
-          ANTHROPIC_KEY      = os.environ["ANTHROPIC_API_KEY"]
-          SLACK_TOKEN        = os.environ["SLACK_BOT_TOKEN"]
-          JEREMY             = "U08JJMM2QSW"
-          CHURN_RISK_CHANNEL = "C0A2GPGBPD0"
-
-          req = urllib.request.Request(
-              f"https://slack.com/api/conversations.history?channel={CHURN_RISK_CHANNEL}&limit=30",
-              headers={"Authorization": f"Bearer {SLACK_TOKEN}"}, method="GET")
-          with urllib.request.urlopen(req) as r:
-              churn_data = json.loads(r.read())
-
-          messages   = churn_data.get("messages", [])
-          churn_text = "\n---\n".join([m.get("text", "")[:800] for m in messages if m.get("text")])[:6000]
-
-          payload = {
-              "model": "claude-sonnet-4-20250514",
-              "max_tokens": 1000,
-              "messages": [{"role": "user", "content": f"""You are a CS intelligence agent for Rev.com.
-          Analyze these recent #churn-risk Slack alerts and produce a concise daily CS brief in Slack markdown format.
-          Structure it as:
-          1. 🔴 High Priority (risk score 7-10) — list company, score, ACV, owner, one-line insight
-          2. 🟡 Watch List (score 5-6) — brief bullets
-          3. 📋 This Week's Churn Theme — 1-2 sentences on the dominant pattern
-          Keep it under 400 words. Use bullet points. Include HubSpot links where present.
-          Do not add a greeting or sign-off.
-          #churn-risk data:
-          {churn_text}"""}]
-          }
-
-          req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
-              data=json.dumps(payload).encode(),
-              headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
-                       "anthropic-version": "2023-06-01"}, method="POST")
-          with urllib.request.urlopen(req) as r:
-              result = json.loads(r.read())
-
-          summary   = result["content"][0]["text"]
-          today_str = datetime.date.today().strftime("%a %b %-d, %Y")
-          cs_msg    = f":green_heart: *Daily CS Brief — {today_str}*\n━━━━━━━━━━━━━━━━━━━━━━━\n<@{JEREMY}>\n\n{summary}\n\n_Powered by #churn-risk · Health Monitor & Churn Risk Agents_"
-
-          req = urllib.request.Request(
-              "https://slack.com/api/chat.postMessage",
-              data=json.dumps({"channel": "C0APJ5L22BY", "text": cs_msg}).encode(),
-              headers={"Content-Type": "application/json", "Authorization": f"Bearer {SLACK_TOKEN}"},
-              method="POST")
-          with urllib.request.urlopen(req) as r:
-              print("CS brief posted:", json.loads(r.read()).get("ok"))
-          EOF
-
-      - name: Post Leadership Digest
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          HUBSPOT_API_KEY:   ${{ secrets.HUBSPOT_API_KEY }}
-          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
-        run: |
-          python3 - <<'EOF'
-          import urllib.request, json, os, datetime
-
-          ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-          HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
-          SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
-          JEREMY        = "U08JJMM2QSW"
-
-          def hs_post(payload):
-              req = urllib.request.Request(
-                  "https://api.hubapi.com/crm/v3/objects/deals/search",
-                  data=json.dumps(payload).encode(),
-                  headers={"Content-Type": "application/json",
-                           "Authorization": f"Bearer {HUBSPOT_KEY}"}, method="POST")
-              with urllib.request.urlopen(req) as r: return json.loads(r.read())
-
-          today_ts   = int(datetime.datetime.now().timestamp() * 1000)
-          open_deals = hs_post({
-              "filterGroups": [{"filters": [
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedwon"},
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedlost"}
-              ]}], "properties": ["dealname"], "limit": 1})
-          total_open = open_deals.get("total", 0)
-
-          overdue = hs_post({
-              "filterGroups": [{"filters": [
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedwon"},
-                  {"propertyName": "dealstage", "operator": "NEQ", "value": "closedlost"},
-                  {"propertyName": "closedate", "operator": "LTE", "value": str(today_ts)}
-              ]}], "properties": ["dealname"], "limit": 1})
-          total_overdue = overdue.get("total", 0)
-
-          req = urllib.request.Request(
-              "https://slack.com/api/conversations.history?channel=C0A2GPGBPD0&limit=20",
-              headers={"Authorization": f"Bearer {SLACK_TOKEN}"}, method="GET")
-          with urllib.request.urlopen(req) as r:
-              churn_msgs = json.loads(r.read()).get("messages", [])
-          churn_snippet = "\n".join([m.get("text","")[:400] for m in churn_msgs[:5]])[:2000]
-
-          payload = {
-              "model": "claude-sonnet-4-20250514",
-              "max_tokens": 800,
-              "messages": [{"role": "user", "content": f"""You are a revenue intelligence agent for Rev.com. Write a leadership digest in Slack markdown.
-          Format: Top 5 priorities numbered, each tagged [Sales] or [CS], with a red or yellow circle emoji for urgency.
-          Then a 2-line NRR Signal section. Then a Pipeline line.
-          Under 350 words total. No greeting or sign-off.
-          Data:
-          - Total open deals: {total_open}
-          - Open deals past close date: {total_overdue}
-          - Recent #churn-risk signals: {churn_snippet}"""}]
-          }
-
-          req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
-              data=json.dumps(payload).encode(),
-              headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
-                       "anthropic-version": "2023-06-01"}, method="POST")
-          with urllib.request.urlopen(req) as r:
-              result = json.loads(r.read())
-
-          digest    = result["content"][0]["text"]
-          today_str = datetime.date.today().strftime("%a %b %-d, %Y")
-          msg       = f":rocket: *Leadership Digest — {today_str}*\n━━━━━━━━━━━━━━━━━━━━━━━\n<@{JEREMY}>\n\n{digest}\n\n_Powered by HubSpot + #churn-risk · All agents_"
-
-          req = urllib.request.Request(
-              "https://slack.com/api/chat.postMessage",
-              data=json.dumps({"channel": "C0APDRPC96X", "text": msg}).encode(),
-              headers={"Content-Type": "application/json", "Authorization": f"Bearer {SLACK_TOKEN}"},
-              method="POST")
-          with urllib.request.urlopen(req) as r:
-              print("Leadership digest posted:", json.loads(r.read()).get("ok"))
           EOF

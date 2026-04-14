@@ -237,37 +237,35 @@ jobs:
               notes_block = "\n".join(f"- {n}" for n in m["coaching_notes"])
 
               if is_weekly:
-                  prompt = f"""You are a sales coach reviewing {scope} connected call notes for {name}, a Rev sales rep selling AI transcription to California law enforcement.
-
-Call notes ({len(m['coaching_notes'])} connected calls, {day_label}):
-{notes_block}
-
-Write 3 concise coaching observations for the week:
-1. Top pattern or strength observed
-2. Most common objection or friction point
-3. One specific action item for next week
-
-Format:
-✅ [strength]
-⚠️ [friction]
-🎯 [action item]
-
-Be specific. Reference actual content from the notes."""
+                  prompt = (
+                      f"You are a sales coach reviewing {scope} connected call notes for {name}, "
+                      f"a Rev sales rep selling AI transcription to California law enforcement.\n\n"
+                      f"Call notes ({len(m['coaching_notes'])} connected calls, {day_label}):\n"
+                      f"{notes_block}\n\n"
+                      f"Write 3 concise coaching observations for the week:\n"
+                      f"1. Top pattern or strength observed\n"
+                      f"2. Most common objection or friction point\n"
+                      f"3. One specific action item for next week\n\n"
+                      f"Format:\n"
+                      f"✅ [strength]\n"
+                      f"⚠️ [friction]\n"
+                      f"🎯 [action item]\n\n"
+                      f"Be specific. Reference actual content from the notes."
+                  )
               else:
-                  prompt = f"""You are a sales coach reviewing {scope} connected call notes for {name}, a Rev sales rep selling AI transcription to California law enforcement.
-
-Call notes ({len(m['coaching_notes'])} connected calls, {day_label}):
-{notes_block}
-
-Write 2 concise coaching observations:
-1. What is working well
-2. One specific area to improve
-
-Format:
-✅ [positive]
-🔧 [improve]
-
-Be specific. Reference actual content from the notes."""
+                  prompt = (
+                      f"You are a sales coach reviewing {scope} connected call notes for {name}, "
+                      f"a Rev sales rep selling AI transcription to California law enforcement.\n\n"
+                      f"Call notes ({len(m['coaching_notes'])} connected calls, {day_label}):\n"
+                      f"{notes_block}\n\n"
+                      f"Write 2 concise coaching observations:\n"
+                      f"1. What is working well\n"
+                      f"2. One specific area to improve\n\n"
+                      f"Format:\n"
+                      f"✅ [positive]\n"
+                      f"🔧 [improve]\n\n"
+                      f"Be specific. Reference actual content from the notes."
+                  )
 
               coaching_insights[oid] = claude(prompt, max_tokens=250 if is_weekly else 200)
               time.sleep(1)

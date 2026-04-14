@@ -135,6 +135,49 @@ jobs:
               comments = strip_html(comments_div.group(1)) if comments_div else ""
               return {"tags": tags, "comments": comments}
 
+          # ── Fetch HubSpot contact links for meeting-set calls ────────
+          def get_meeting_contacts(call_ids):
+              """Returns list of (name, hs_url) for contacts linked to these call IDs."""
+              if not call_ids:
+                  return []
+              # Step 1: get associated contact IDs for each call
+              assoc_resp = requests.post(
+                  "https://api.hubapi.com/crm/v3/associations/calls/contacts/batch/read",
+                  headers=HS_HEADERS,
+                  json={"inputs": [{"id": str(cid)} for cid in call_ids[:100]]}
+              ).json()
+              contact_map = {}  # call_id → contact_id
+              for r in assoc_resp.get("results", []):
+                  call_id   = str(r.get("from", {}).get("id", ""))
+                  tos       = r.get("to", [])
+                  if tos and call_id:
+                      contact_map[call_id] = str(tos[0].get("id", ""))
+              if not contact_map:
+                  return []
+              # Step 2: batch-read contact names
+              unique_cids = list(set(contact_map.values()))
+              names_resp  = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                  headers=HS_HEADERS,
+                  json={"inputs": [{"id": cid} for cid in unique_cids],
+                        "properties": ["firstname", "lastname"]}
+              ).json()
+              id_to_name = {}
+              for c in names_resp.get("results", []):
+                  props = c.get("properties", {})
+                  name  = " ".join(filter(None, [props.get("firstname",""), props.get("lastname","")])).strip()
+                  id_to_name[c["id"]] = name or f"Contact {c['id']}"
+              # Build (name, url) pairs deduplicated by contact
+              seen = set()
+              result = []
+              for contact_id in contact_map.values():
+                  if contact_id not in seen:
+                      seen.add(contact_id)
+                      name = id_to_name.get(contact_id, f"Contact {contact_id}")
+                      url  = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{contact_id}"
+                      result.append((name, url))
+              return result
+
           # ── Fetch all outbound calls in range (paginated) ─────────────
           print(f"\n📥 Fetching outbound calls from HubSpot...")
           all_calls = []
@@ -168,22 +211,26 @@ jobs:
 
           print(f"  ✅ {len(all_calls)} outbound calls found")
 
-          # ── Group calls by AE ─────────────────────────────────────────
+          PORTAL_ID = "21451281"
+
+          # ── Group calls by AE (preserve call ID alongside properties) ─
           ae_calls = {oid: [] for oid in AE_OWNERS}
           for call in all_calls:
               oid = str(call["properties"].get("hubspot_owner_id") or "")
               if oid in ae_calls:
-                  ae_calls[oid].append(call["properties"])
+                  # merge id into properties dict so compute_metrics can track it
+                  ae_calls[oid].append({"_call_id": call["id"], **call["properties"]})
 
           # ── Compute metrics — Aircall tags as source of truth ────────
           def compute_metrics(calls):
               total = len(calls)
               if total == 0:
                   return None
-              tag_counts     = {}   # raw Aircall tag → count
-              connected_durs = []   # seconds, connected calls only
-              coaching_notes = []   # comments from connected calls
-              meeting_set    = 0
+              tag_counts          = {}   # raw Aircall tag → count
+              connected_durs      = []   # seconds, connected calls only
+              coaching_notes      = []   # comments from connected calls
+              meeting_set         = 0
+              meeting_set_call_ids = []
 
               for c in calls:
                   disp_guid   = c.get("hs_call_disposition") or ""
@@ -198,6 +245,7 @@ jobs:
                   # Meeting set: Aircall tag OR HubSpot disposition fallback
                   if is_meeting_set_tag(tag) or disp_guid == MEETING_SET_GUID:
                       meeting_set += 1
+                      meeting_set_call_ids.append(c.get("_call_id", ""))
 
                   # Connected = Aircall tag starts with "connected"
                   if is_connected_tag(tag):
@@ -223,17 +271,23 @@ jobs:
                   "meeting_rate":   round(meeting_set / total * 100) if total else 0,
                   "wrong_num_rate": wrong_num_rt,
                   "avg_dur_sec":    avg_dur_sec,
-                  "tag_sorted":     tag_sorted,   # [(tag, count), ...] sorted by count
-                  "coaching_notes": coaching_notes[:10],
+                  "tag_sorted":            tag_sorted,
+                  "coaching_notes":        coaching_notes[:10],
+                  "meeting_set_call_ids":  [cid for cid in meeting_set_call_ids if cid],
               }
 
-          metrics = {}
+          metrics          = {}
+          meeting_contacts = {}   # oid → [(name, url), ...]
           for oid in AE_ORDER:
               name = AE_OWNERS[oid]
               m    = compute_metrics(ae_calls[oid])
               metrics[oid] = m
               if m:
                   print(f"  {name}: {m['total']} calls | {m['connected']} connected ({m['connect_rate']}%) | {m['meeting_set']} mtg set")
+                  if m["meeting_set_call_ids"]:
+                      contacts = get_meeting_contacts(m["meeting_set_call_ids"])
+                      meeting_contacts[oid] = contacts
+                      print(f"    📅 Meeting contacts: {[c[0] for c in contacts]}")
               else:
                   print(f"  {name}: 0 calls")
 
@@ -315,6 +369,12 @@ jobs:
                   pct   = round(count / m["total"] * 100)
                   emoji = tag_emoji(tag)
                   lines.append(f"  {emoji} _{tag}_: {count} ({pct}%)")
+
+              # Meeting set contact links
+              contacts = meeting_contacts.get(oid, [])
+              if contacts:
+                  contact_links = "  ".join(f"<{url}|{cname}>" for cname, url in contacts)
+                  lines.append(f"  📅 Meeting set: {contact_links}")
 
               if m["wrong_num_rate"] >= 20:
                   lines.append(f"  ⚠️ *High wrong-number rate ({m['wrong_num_rate']}%)* — refresh phone data for {name}'s counties")

@@ -1,4 +1,4 @@
-name: OB Email Backfill — Regenerate All Contact Sequences
+name: Daily Call Intelligence — CA Law Enforcement
 on:
   workflow_dispatch:
 jobs:

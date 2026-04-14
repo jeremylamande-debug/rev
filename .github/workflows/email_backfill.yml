@@ -1,0 +1,341 @@
+name: OB Email Backfill — Regenerate All Contact Sequences
+on:
+  workflow_dispatch:
+jobs:
+  email-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Regenerate OB email sequences for all contacts
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HUBSPOT_API_KEY:   ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, json, os, time, datetime
+
+          ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+          ANTH_HEADERS  = {
+              "Content-Type": "application/json",
+              "x-api-key": ANTHROPIC_KEY,
+              "anthropic-version": "2023-06-01"
+          }
+
+          # ── Territory map ─────────────────────────────────────────────
+          AE_COUNTIES = {
+              "Dillon DeWitt": [
+                  "Santa Clara", "Nevada", "Shasta", "Napa", "Imperial",
+                  "Amador", "Siskiyou", "Humboldt", "Mono", "Sierra",
+                  "San Mateo", "Marin", "Santa Cruz",
+              ],
+              "Will Weis": [
+                  "Contra Costa", "Placer", "Merced", "Kings", "Tehama",
+                  "San Benito", "Del Norte", "Mendocino", "Inyo", "Alpine",
+                  "Sonoma", "Yolo", "El Dorado", "Calaveras",
+              ],
+              "James Gregory": [
+                  "Alameda", "Solano", "Butte", "Madera", "Lake",
+                  "Colusa", "Trinity", "Plumas", "Modoc", "Lassen",
+                  "Tuolumne", "Glenn", "Sutter",
+              ],
+          }
+          COUNTY_TO_AE = {
+              county: ae
+              for ae, counties in AE_COUNTIES.items()
+              for county in counties
+          }
+          MEETING_LINKS = {
+              "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
+              "Will Weis":      "https://meetings.hubspot.com/will-weis",
+              "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
+          }
+
+          # ── Persona angles ────────────────────────────────────────────
+          PERSONA_ANGLES = {
+              "Sheriff": {
+                  "pain":     "managing body cam footage and interrogation recordings manually",
+                  "use_case": "body cam transcription and interrogation documentation",
+                  "proof":    "departments using Rev cut documentation time by 60%"
+              },
+              "District Attorney": {
+                  "pain":     "preparing court proceedings and managing evidence documentation",
+                  "use_case": "court proceeding transcription and evidence documentation",
+                  "proof":    "DA offices using Rev reduce case prep time significantly"
+              },
+              "Public Defender": {
+                  "pain":     "transcribing client interviews and case preparation recordings",
+                  "use_case": "client interview transcription and case prep documentation",
+                  "proof":    "public defender offices using Rev improve case turnaround"
+              },
+              "Police Department": {
+                  "pain":     "manually processing 911 calls and incident report recordings",
+                  "use_case": "911 call transcription and incident report automation",
+                  "proof":    "police departments using Rev process calls 3x faster"
+              },
+              "City Attorney": {
+                  "pain":     "transcribing depositions, hearings and legal proceedings manually",
+                  "use_case": "legal proceeding transcription and deposition documentation",
+                  "proof":    "city attorney offices using Rev reduce documentation time significantly"
+              },
+              "Court": {
+                  "pain":     "managing court proceeding recordings and transcription backlogs",
+                  "use_case": "court proceeding transcription and record management",
+                  "proof":    "court administrators using Rev process hearings 3x faster"
+              },
+              "Investigator": {
+                  "pain":     "manually transcribing witness interviews, recorded statements and investigative recordings",
+                  "use_case": "witness interview transcription and investigative documentation",
+                  "proof":    "investigative units using Rev cut interview documentation time by 60%"
+              },
+              "Corrections": {
+                  "pain":     "documenting inmate incidents, staff misconduct investigations and internal case recordings manually",
+                  "use_case": "corrections investigation transcription and incident documentation",
+                  "proof":    "corrections agencies using Rev reduce investigation documentation time significantly"
+              },
+              "Internal Affairs": {
+                  "pain":     "transcribing officer interviews, use-of-force recordings and misconduct investigation files manually",
+                  "use_case": "internal affairs interview transcription and misconduct investigation documentation",
+                  "proof":    "internal affairs units using Rev cut investigation documentation time by 50%"
+              },
+              "Human Resources": {
+                  "pain":     "manually transcribing harassment complaints, termination meetings and employee investigation recordings",
+                  "use_case": "HR investigation transcription and employee relations documentation",
+                  "proof":    "county HR departments using Rev reduce documentation risk and investigation turnaround significantly"
+              },
+          }
+
+          # ── Org type detection from title + company ───────────────────
+          def detect_org_type(title, company):
+              t = (title   or "").lower()
+              c = (company or "").lower()
+              if "district attorney" in t or "deputy da" in t or "district attorney" in c:
+                  return "District Attorney"
+              if "public defender" in t or "public defender" in c:
+                  return "Public Defender"
+              if "city attorney" in t or "city attorney" in c:
+                  return "City Attorney"
+              if "internal affairs" in t or "professional standards" in t:
+                  return "Internal Affairs"
+              if "corrections" in t or "correctional" in t:
+                  return "Corrections"
+              if any(x in t for x in ["hr ", "human resources", "employee relations", "labor relations"]) \
+                      or "human resources" in c:
+                  return "Human Resources"
+              if "investigator" in t or "detective investigator" in t:
+                  return "Investigator"
+              if "judge" in t or "court administrator" in t or "clerk of court" in t or "court" in c:
+                  return "Court"
+              if "chief of police" in t or "police" in c:
+                  return "Police Department"
+              if "sheriff" in t or "sheriff" in c:
+                  return "Sheriff"
+              return "Sheriff"  # safe default
+
+          # ── Claude helper ─────────────────────────────────────────────
+          def claude(prompt, max_tokens=400):
+              for attempt in range(3):
+                  try:
+                      r = requests.post("https://api.anthropic.com/v1/messages",
+                          headers=ANTH_HEADERS,
+                          json={
+                              "model": "claude-sonnet-4-6",
+                              "max_tokens": max_tokens,
+                              "messages": [{"role": "user", "content": prompt}]
+                          }, timeout=60)
+                      if r.status_code == 200:
+                          return r.json()["content"][0]["text"].strip()
+                      elif r.status_code == 429:
+                          time.sleep(30)
+                  except Exception as e:
+                      print(f"  Claude error attempt {attempt+1}: {e}")
+                      time.sleep(5)
+              return ""
+
+          # ── Email body cleanup ────────────────────────────────────────
+          def clean_email_body(text):
+              """Strip accidental Subject: prefix. Keep <br><br> for HTML email rendering."""
+              text = text.strip()
+              lines = text.splitlines()
+              if lines and lines[0].lower().startswith("subject:"):
+                  text = "\n".join(lines[1:]).strip()
+              return text.strip()
+
+          # ── Email generation ──────────────────────────────────────────
+          def gen_emails(contact_id, title, last_name, org, county, org_type, ae_name):
+              angles       = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
+              meeting_link = MEETING_LINKS.get(ae_name, MEETING_LINKS["Dillon DeWitt"])
+              name         = f"{title} {last_name}"
+              emails, subjects = {}, {}
+
+              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {county} County, CA.
+          Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {meeting_link}
+          Rules:
+          - Professional but warm, 100-130 words
+          - Open with something specific to their role as {title}
+          - Never use em dashes (—), use commas or periods instead
+          - Separate paragraphs with <br><br>
+          - CTA: book 15-min demo at {meeting_link}
+          - No sign-off name, no pricing
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=400))
+              time.sleep(0.5)
+
+              subjects[1] = claude(f"""Cold email subject for {title} at {org} about Rev {angles['use_case']}. Under 10 words. Professional, curiosity-driving. Return ONLY the subject line.""", max_tokens=50).strip('"').strip("'")
+              time.sleep(0.5)
+
+              emails["email_2"] = clean_email_body(claude(f"""Write follow-up Email 2 of 4 from Rev to {name} at {org}.
+          No response to first email about {angles['use_case']}.
+          Rules:
+          - 75-100 words, short and punchy
+          - Lead with: {angles['proof']}
+          - Never use em dashes (—)
+          - Separate paragraphs with <br><br>
+          - Ask if this is a priority right now
+          - CTA: {meeting_link}
+          - No sign-off name, no "just following up"
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
+              time.sleep(0.5)
+
+              emails["email_3"] = clean_email_body(claude(f"""Write value-add Email 3 of 4 from Rev to {name} at {org}.
+          No response to 2 emails about {angles['use_case']}.
+          Rules:
+          - 75-100 words
+          - Lead with an insight about AI transcription in law enforcement
+          - Never use em dashes (—)
+          - Separate paragraphs with <br><br>
+          - Feel like a helpful resource not a sales pitch
+          - CTA: "Worth a quick 15-min call?" + {meeting_link}
+          - No sign-off name
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
+              time.sleep(0.5)
+
+              subjects[3] = claude(f"""Value-add subject for {title} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven. Return ONLY the subject line.""", max_tokens=50).strip('"').strip("'")
+              time.sleep(0.5)
+
+              emails["email_4"] = clean_email_body(claude(f"""Write break-up Email 4 of 4 from Rev to {name} at {org}.
+          Final email about {angles['use_case']}.
+          Rules:
+          - 60-75 words
+          - Acknowledge they're busy, leave door open "if timing changes"
+          - Never use em dashes (—)
+          - Separate paragraphs with <br><br>
+          - Soft CTA: {meeting_link}
+          - No sign-off name, warm not passive aggressive
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=250))
+              time.sleep(0.5)
+
+              return emails, subjects
+
+          # ── Fetch all OB contacts ─────────────────────────────────────
+          print("📥 Fetching all OB contacts...")
+          all_contacts = []
+          after = None
+          while True:
+              payload = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"}
+                  ]}],
+                  "properties": ["firstname", "lastname", "jobtitle", "company", "county", "hubspot_owner_id"],
+                  "limit": 200,
+              }
+              if after:
+                  payload["after"] = after
+              resp = requests.post("https://api.hubapi.com/crm/v3/objects/contacts/search",
+                  headers=HS_HEADERS, json=payload).json()
+              results = resp.get("results", [])
+              all_contacts.extend(results)
+              print(f"  Fetched {len(all_contacts)} so far...")
+              next_after = resp.get("paging", {}).get("next", {}).get("after")
+              if not next_after:
+                  break
+              after = next_after
+
+          print(f"✅ Total contacts to process: {len(all_contacts)}")
+
+          # ── Process each contact ──────────────────────────────────────
+          # Collect all updates then batch-write to HS
+          hs_updates = []  # list of {id, properties}
+          processed = 0
+          skipped   = 0
+          errors    = 0
+
+          for i, contact in enumerate(all_contacts):
+              props    = contact["properties"]
+              cid      = contact["id"]
+              county   = (props.get("county")     or "").strip()
+              title    = (props.get("jobtitle")   or "").strip()
+              last     = (props.get("lastname")   or "").strip()
+              org      = (props.get("company")    or "").strip()
+
+              ae_name  = COUNTY_TO_AE.get(county)
+              if not ae_name:
+                  print(f"  ⏭ Skipping {cid} — county '{county}' not in any territory")
+                  skipped += 1
+                  continue
+              if not title or not last or not org:
+                  print(f"  ⏭ Skipping {cid} — missing title/name/org")
+                  skipped += 1
+                  continue
+
+              org_type = detect_org_type(title, org)
+              print(f"  [{i+1}/{len(all_contacts)}] {title} {last} | {county} | {org_type} | {ae_name}")
+
+              try:
+                  emails, subjects = gen_emails(cid, title, last, org, county, org_type, ae_name)
+                  hs_updates.append({
+                      "id": cid,
+                      "properties": {
+                          "ob_email_1_subject": subjects.get(1, ""),
+                          "ob_email_1_body":    emails.get("email_1", ""),
+                          "ob_email_2_subject": "",
+                          "ob_email_2_body":    emails.get("email_2", ""),
+                          "ob_email_3_subject": subjects.get(3, ""),
+                          "ob_email_3_body":    emails.get("email_3", ""),
+                          "ob_email_4_subject": "",
+                          "ob_email_4_body":    emails.get("email_4", ""),
+                      }
+                  })
+                  processed += 1
+              except Exception as e:
+                  print(f"  ⚠️ Error on {cid}: {e}")
+                  errors += 1
+
+              # Flush to HubSpot every 50 contacts
+              if len(hs_updates) >= 50:
+                  print(f"  💾 Writing batch of {len(hs_updates)} to HubSpot...")
+                  for b in range(0, len(hs_updates), 10):
+                      batch = hs_updates[b:b+10]
+                      r = requests.patch("https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                          headers=HS_HEADERS,
+                          json={"inputs": [{"id": u["id"], "properties": u["properties"]} for u in batch]})
+                      if r.status_code not in (200, 207):
+                          print(f"    ⚠️ Batch write error: {r.status_code} {r.text[:200]}")
+                  hs_updates = []
+
+          # Final flush
+          if hs_updates:
+              print(f"  💾 Final flush of {len(hs_updates)} contacts...")
+              for b in range(0, len(hs_updates), 10):
+                  batch = hs_updates[b:b+10]
+                  requests.patch("https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                      headers=HS_HEADERS,
+                      json={"inputs": [{"id": u["id"], "properties": u["properties"]} for u in batch]})
+
+          # ── Slack summary ─────────────────────────────────────────────
+          msg = (
+              f"✅ *OB Email Backfill Complete*\n"
+              f"Processed: {processed} | Skipped: {skipped} | Errors: {errors}\n"
+              f"All email bodies regenerated with correct meeting links, no Subject prefix, and <br><br> spacing.\n"
+              f"_Run at {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_"
+          )
+          requests.post("https://slack.com/api/chat.postMessage",
+              headers=SLACK_HEADERS,
+              json={"channel": DAILY_OB_CHANNEL, "text": msg})
+          print(f"\n🎉 Done. Processed={processed}, Skipped={skipped}, Errors={errors}")
+          EOF

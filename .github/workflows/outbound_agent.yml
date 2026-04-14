@@ -176,6 +176,57 @@ jobs:
           owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           print(f"Owners: {list(owner_map.keys())}")
           LEADSOURCE_VALUE = "Claude"
+          # ── Build county → expected owner lookup ─────────────────────
+          ALL_COUNTIES = {
+              county: ae
+              for ae, counties in {**{ae: AE_COUNTIES[ae] + AE_OVERFLOW_COUNTIES.get(ae, []) for ae in AES}}.items()
+              for county in counties
+          }
+          # ── Ownership audit (runs every execution) ────────────────────
+          def audit_ownership():
+              """Find & fix any OB contacts whose owner doesn't match their county territory."""
+              print("🔍 Auditing contact ownership...")
+              fixes = []
+              offset = 0
+              while True:
+                  resp = hs_post("/crm/v3/objects/contacts/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"}
+                      ]}],
+                      "properties": ["county", "hubspot_owner_id"],
+                      "limit": 200,
+                      "after": offset if offset else None
+                  })
+                  results = resp.get("results", [])
+                  for c in results:
+                      county    = (c["properties"].get("county") or "").strip()
+                      actual_id = str(c["properties"].get("hubspot_owner_id") or "")
+                      expected_ae = ALL_COUNTIES.get(county)
+                      if not expected_ae:
+                          continue
+                      expected_id = str(owner_map.get(expected_ae, ""))
+                      if expected_id and actual_id != expected_id:
+                          fixes.append({"id": c["id"], "county": county,
+                                        "expected_ae": expected_ae, "expected_id": expected_id})
+                  paging = resp.get("paging", {})
+                  next_after = paging.get("next", {}).get("after")
+                  if not next_after:
+                      break
+                  offset = next_after
+              if not fixes:
+                  print(f"  ✅ All OB contacts have correct ownership")
+                  return
+              print(f"  ⚠️ Found {len(fixes)} ownership mismatches — correcting...")
+              # Batch-fix in groups of 10
+              for i in range(0, len(fixes), 10):
+                  batch = fixes[i:i+10]
+                  inputs = [{"id": f["id"], "properties": {"hubspot_owner_id": f["expected_id"]}} for f in batch]
+                  requests.patch("https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                      headers=HS_HEADERS, json={"inputs": inputs})
+                  for f in batch:
+                      print(f"    ✅ Fixed {f['county']} contact {f['id']} → {f['expected_ae']}")
+              print(f"  ✅ Ownership audit complete — {len(fixes)} contacts corrected")
+          audit_ownership()
           # ── Ensure county signal properties exist in HubSpot ──────
           # Runs on every boot but is idempotent — HS ignores duplicates gracefully
           COUNTY_PROPS = [
@@ -890,19 +941,23 @@ jobs:
                           print(f"  ⚠️ Scoring error for {county}: {e}")
                           county_scores[county] = {"score": 0, "evidence": str(e), "snippet": ""}
               save_county_scores(county_scores)
-              # Post score leaderboard to Slack
-              score_lines = sorted(county_scores.items(), key=lambda x: x[1].get("score", 0), reverse=True)
-              score_msg   = f"<@{SLACK_USER}>\n*📊 County Signal Scores* (seeded from FY25-26 budget PDFs)\n\n"
-              for c, s in score_lines:
-                  t0  = "🤝" if s.get("tier0_carahsoft") else "  "
-                  t3  = "📝" if s.get("tier3_transcription_line") else "  "
-                  bwc = "📷" if s.get("tier3_body_cam") else "  "
-                  score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
-                  if s.get("snippet"):
-                      snippet_line1 = s["snippet"].split("\n")[0]
-                      score_msg += f"    _{snippet_line1}_\n"
-              requests.post("https://slack.com/api/chat.postMessage",
-                  headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": score_msg})
+              # Post score leaderboard to Slack — Mondays only (weekly update)
+              if datetime.datetime.today().weekday() == 0:  # 0 = Monday
+                  week_of   = datetime.datetime.today().strftime("%B %d, %Y")
+                  score_lines = sorted(county_scores.items(), key=lambda x: x[1].get("score", 0), reverse=True)
+                  score_msg   = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
+                  for c, s in score_lines:
+                      t0  = "🤝" if s.get("tier0_carahsoft") else "  "
+                      t3  = "📝" if s.get("tier3_transcription_line") else "  "
+                      bwc = "📷" if s.get("tier3_body_cam") else "  "
+                      score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
+                      if s.get("snippet"):
+                          snippet_line1 = s["snippet"].split("\n")[0]
+                          score_msg += f"    _{snippet_line1}_\n"
+                  requests.post("https://slack.com/api/chat.postMessage",
+                      headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": score_msg})
+              else:
+                  print("📊 County scores refreshed — Slack post skipped (Monday only)")
           else:
               print(f"✅ Using cached county scores ({len(county_scores)} counties)")
           # Re-sort each AE's county list by score (highest first), preserving already-exhausted order
@@ -968,6 +1023,15 @@ jobs:
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
           # ── Email sequence ────────────────────────────────────────
+          def clean_email_body(text):
+              """Strip accidental Subject: prefix. Keep <br><br> for HTML email rendering."""
+              text = text.strip()
+              # Strip any leading "Subject: ...\n" line Claude sneaks in
+              lines = text.splitlines()
+              if lines and lines[0].lower().startswith("subject:"):
+                  text = "\n".join(lines[1:]).strip()
+              return text.strip()
+
           def gen_email_sequence(contact, ae_name):
               meeting_link = get_meeting_link(ae_name)
               org_type     = contact.get("org_type", "Sheriff")
@@ -976,54 +1040,54 @@ jobs:
               org          = contact["organization"]
               county       = contact["county"]
               emails       = {}
-              emails["email_1"] = claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {county} County, CA.
+              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {county} County, CA.
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {meeting_link}
           Rules:
           - Professional but warm, 100-130 words
           - Open with something specific to their role as {contact['title']}
           - Never use em dashes (—), use commas or periods instead
-          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Separate paragraphs with two newlines
           - CTA: book 15-min demo at {meeting_link}
           - No sign-off name, the sender is automated
           - No pricing
-          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=400)
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=400))
               time.sleep(1)
-              emails["email_2"] = claude(f"""Write follow-up Email 2 of 4 from Rev to {name} at {org}.
+              emails["email_2"] = clean_email_body(claude(f"""Write follow-up Email 2 of 4 from Rev to {name} at {org}.
           No response to first email about {angles['use_case']}.
           Rules:
           - 75-100 words (short and punchy)
           - Lead with: {angles['proof']}
           - Never use em dashes (—), use commas or periods instead
-          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Separate paragraphs with two newlines
           - Ask if this is a priority right now
           - CTA: {meeting_link}
           - No sign-off name, the sender is automated
           - No "just following up"
-          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=350)
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
               time.sleep(1)
-              emails["email_3"] = claude(f"""Write value-add Email 3 of 4 from Rev to {name} at {org}.
+              emails["email_3"] = clean_email_body(claude(f"""Write value-add Email 3 of 4 from Rev to {name} at {org}.
           No response to 2 emails about {angles['use_case']}.
           Rules:
           - 75-100 words
           - Lead with an insight about AI transcription in law enforcement
           - Never use em dashes (—), use commas or periods instead
-          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Separate paragraphs with two newlines
           - Feel like a helpful resource not a sales pitch
           - CTA: "Worth a quick 15-min call?" + {meeting_link}
           - No sign-off name, the sender is automated
-          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=350)
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
               time.sleep(1)
-              emails["email_4"] = claude(f"""Write break-up Email 4 of 4 from Rev to {name} at {org}.
+              emails["email_4"] = clean_email_body(claude(f"""Write break-up Email 4 of 4 from Rev to {name} at {org}.
           Final email about {angles['use_case']}.
           Rules:
           - 60-75 words
           - Acknowledge they're busy, leave door open "if timing changes"
           - Never use em dashes (—), use commas or periods instead
-          - Separate every paragraph with <br><br> (HTML line breaks for email rendering)
+          - Separate paragraphs with two newlines
           - Soft CTA: {meeting_link}
           - No sign-off name, the sender is automated
           - Warm not passive aggressive
-          Return ONLY the email body, using <br><br> between paragraphs.""", max_tokens=250)
+          Return ONLY the email body. Do NOT include a subject line.""", max_tokens=250))
               return emails
           def gen_subject(contact, email_num=1):
               if email_num in (2, 4):
@@ -1431,7 +1495,7 @@ jobs:
               msg += f"*👤 {ae_name}* — 📍 {county} County{curr_badge} | <{list_url}|View Segment>\n"
               msg += f"  {len(added)} leads added · {ae_skipped} dupes skipped · {len(county_leads)} counties checked{next_str}\n"
               msg += f"{county_line}\n\n"
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v34_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v37_"
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")

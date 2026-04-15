@@ -28,12 +28,14 @@ jobs:
               "ob_email_4_body",
           ]
 
-          def strip_subject_lines(text):
-              """Remove any line starting with 'Subject:' (case-insensitive)."""
+          def clean_body(text):
+              """Remove Subject: lines and replace <br><br> with <br> for tighter spacing."""
               if not text:
                   return text
               lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
-              return "\n".join(lines).strip()
+              cleaned = "\n".join(lines).strip()
+              cleaned = cleaned.replace("<br><br>", "<br>")
+              return cleaned
 
           # ── Fetch all JL OB contacts that have ob_email_1_body ──────────
           print("📥 Fetching JL OB contacts with email bodies...")
@@ -73,7 +75,7 @@ jobs:
               update = {}
               for field in EMAIL_BODY_FIELDS:
                   val = props.get(field) or ""
-                  cleaned = strip_subject_lines(val)
+                  cleaned = clean_body(val)
                   if cleaned != val:
                       update[field] = cleaned
               if update:
@@ -103,7 +105,7 @@ jobs:
           msg = (
               f"✅ *OB Email Subject Cleanup Complete*\n"
               f"Checked: {len(all_contacts)} | Fixed: {fixed} | Errors: {errors}\n"
-              f"Stripped Subject: prefix from ob_email body fields.\n"
+              f"Stripped Subject: prefix and tightened paragraph spacing (<br><br> → <br>).\n"
               f"_Run at {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_"
           )
           requests.post("https://slack.com/api/chat.postMessage",

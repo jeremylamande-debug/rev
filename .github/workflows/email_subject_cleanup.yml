@@ -57,7 +57,13 @@ jobs:
                   r'\1',
                   cleaned
               )
-              # 5. Strip trailing <br> tags then add exactly one <br> for signature gap
+              # 5. Fix any "X-minute demo" or "X-min demo" → "30-minute call"
+              cleaned = re.sub(r'\d+[- ]min(?:ute)?[- ]demo', '30-minute call', cleaned, flags=re.IGNORECASE)
+              # Also catch bare "15-minute" or "15-min" not already followed by "call"
+              cleaned = re.sub(r'15[- ]min(?:ute)?(?!\s*call)', '30-minute', cleaned, flags=re.IGNORECASE)
+              # Catch any remaining standalone "demo" after "minute"
+              cleaned = re.sub(r'(minute\s+)demo\b', r'\1call', cleaned, flags=re.IGNORECASE)
+              # 6. Strip trailing <br> tags then add exactly one <br> for signature gap
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
               cleaned = cleaned + '<br>'
               return cleaned

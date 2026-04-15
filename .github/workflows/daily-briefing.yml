@@ -76,6 +76,7 @@ jobs:
               "filterGroups": [{"filters": [
                   {"propertyName": "hs_createdate", "operator": "GTE", "value": str(start_ms)},
                   {"propertyName": "hs_createdate", "operator": "LTE", "value": str(end_ms)},
+                  {"propertyName": "pipeline",      "operator": "EQ",  "value": "default"},
               ]}],
               "properties": ["dealname", "dealtype", "icp", "amount", "closedate",
                              "dealstage", "hubspot_owner_id", "hs_createdate"],

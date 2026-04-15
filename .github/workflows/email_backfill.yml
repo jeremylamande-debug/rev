@@ -160,12 +160,11 @@ jobs:
 
           # ── Email body cleanup ────────────────────────────────────────
           def clean_email_body(text):
-              """Strip accidental Subject: prefix. Keep <br><br> for HTML email rendering."""
+              """Strip any Subject: line wherever it appears. Keep <br><br> for HTML email rendering."""
               text = text.strip()
-              lines = text.splitlines()
-              if lines and lines[0].lower().startswith("subject:"):
-                  text = "\n".join(lines[1:]).strip()
-              return text.strip()
+              # Remove any line that starts with "Subject:" (case-insensitive)
+              lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
+              return "\n".join(lines).strip()
 
           # ── Email generation ──────────────────────────────────────────
           def gen_emails(contact_id, title, last_name, org, county, org_type, ae_name):
@@ -232,14 +231,15 @@ jobs:
 
               return emails, subjects
 
-          # ── Fetch all OB contacts ─────────────────────────────────────
-          print("📥 Fetching all OB contacts...")
+          # ── Fetch OB contacts missing ob_email_1_body ─────────────────
+          print("📥 Fetching OB contacts missing email sequences...")
           all_contacts = []
           after = None
           while True:
               payload = {
                   "filterGroups": [{"filters": [
-                      {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"}
+                      {"propertyName": "lead_source_details",  "operator": "EQ",              "value": "JL OB"},
+                      {"propertyName": "ob_email_1_body",      "operator": "NOT_HAS_PROPERTY"},
                   ]}],
                   "properties": ["firstname", "lastname", "jobtitle", "company", "county", "hubspot_owner_id"],
                   "limit": 200,
@@ -311,7 +311,7 @@ jobs:
                   print(f"  💾 Writing batch of {len(hs_updates)} to HubSpot...")
                   for b in range(0, len(hs_updates), 10):
                       batch = hs_updates[b:b+10]
-                      r = requests.patch("https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                      r = requests.post("https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
                           headers=HS_HEADERS,
                           json={"inputs": [{"id": u["id"], "properties": u["properties"]} for u in batch]})
                       if r.status_code not in (200, 207):
@@ -329,9 +329,9 @@ jobs:
 
           # ── Slack summary ─────────────────────────────────────────────
           msg = (
-              f"✅ *OB Email Backfill Complete*\n"
+              f"✅ *OB Email Backfill — Retry Complete*\n"
               f"Processed: {processed} | Skipped: {skipped} | Errors: {errors}\n"
-              f"All email bodies regenerated with correct meeting links, no Subject prefix, and <br><br> spacing.\n"
+              f"Targeted only contacts missing ob_email_1_body. Fixed: batch POST, no Subject prefix.\n"
               f"_Run at {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_"
           )
           requests.post("https://slack.com/api/chat.postMessage",

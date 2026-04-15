@@ -28,21 +28,37 @@ jobs:
               "ob_email_4_body",
           ]
 
+          MEETING_LINKS = {
+              "dillon-dewitt":  "https://meetings.hubspot.com/dillon-dewitt",
+              "will-weis":      "https://meetings.hubspot.com/will-weis",
+              "james-gregory2": "https://meetings.hubspot.com/james-gregory2",
+          }
+
           def clean_body(text):
-              """Remove Subject: lines, strip newlines (HubSpot renders them as extra gaps),
-              collapse multiple <br> tags, and add trailing <br> for signature spacing."""
+              """Fix email bodies:
+              1. Remove Subject: lines
+              2. Strip \\n so HubSpot doesn't double-render them alongside <br> tags
+              3. Normalize paragraph spacing to exactly <br><br>
+              4. Convert bare meeting URLs to clickable hyperlinks
+              5. Add trailing <br><br> for signature breathing room
+              """
               if not text:
                   return text
-              # Strip Subject: lines
+              # 1. Strip Subject: lines
               lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
               cleaned = "\n".join(lines).strip()
-              # Remove all newlines — HubSpot renders \n as a line break ON TOP of <br> tags
+              # 2. Remove newlines — HubSpot renders \n as extra line breaks on top of <br>
               cleaned = cleaned.replace("\n", "")
-              # Collapse any run of <br> tags (e.g. <br><br>, <br> <br>) into a single <br>
-              cleaned = re.sub(r'(<br\s*/?>[\s]*)+', '<br>', cleaned, flags=re.IGNORECASE)
-              # Ensure a single <br> at the end so signature has space
-              if not cleaned.endswith("<br>"):
-                  cleaned = cleaned + "<br>"
+              # 3. Collapse 3+ <br> tags to <br><br>, leave <br><br> as paragraph spacing
+              cleaned = re.sub(r'(<br\s*/?>){3,}', '<br><br>', cleaned, flags=re.IGNORECASE)
+              # 4. Convert bare meeting URLs to hyperlinks
+              cleaned = re.sub(
+                  r'(https://meetings\.hubspot\.com/[\w-]+)',
+                  r'<a href="\1">Schedule a 15-minute demo</a>',
+                  cleaned
+              )
+              # 5. Ensure trailing <br><br> for signature spacing
+              cleaned = re.sub(r'(<br\s*/?>)*$', '<br><br>', cleaned.rstrip(), flags=re.IGNORECASE)
               return cleaned
 
           # ── Fetch all JL OB contacts that have ob_email_1_body ──────────

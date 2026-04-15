@@ -29,12 +29,20 @@ jobs:
           ]
 
           def clean_body(text):
-              """Remove Subject: lines and replace <br><br> with <br> for tighter spacing."""
+              """Remove Subject: lines, strip newlines (HubSpot renders them as extra gaps),
+              collapse multiple <br> tags, and add trailing <br> for signature spacing."""
               if not text:
                   return text
+              # Strip Subject: lines
               lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
               cleaned = "\n".join(lines).strip()
-              cleaned = cleaned.replace("<br><br>", "<br>")
+              # Remove all newlines — HubSpot renders \n as a line break ON TOP of <br> tags
+              cleaned = cleaned.replace("\n", "")
+              # Collapse any run of <br> tags (e.g. <br><br>, <br> <br>) into a single <br>
+              cleaned = re.sub(r'(<br\s*/?>[\s]*)+', '<br>', cleaned, flags=re.IGNORECASE)
+              # Ensure a single <br> at the end so signature has space
+              if not cleaned.endswith("<br>"):
+                  cleaned = cleaned + "<br>"
               return cleaned
 
           # ── Fetch all JL OB contacts that have ob_email_1_body ──────────

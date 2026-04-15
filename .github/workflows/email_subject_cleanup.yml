@@ -1,0 +1,113 @@
+name: OB Email — Strip Subject Prefix from Bodies
+on:
+  workflow_dispatch:
+jobs:
+  email-subject-cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Strip Subject prefix from ob_email body fields
+        env:
+          HUBSPOT_API_KEY:  ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN:  ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, os, re, time, datetime
+
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          EMAIL_BODY_FIELDS = [
+              "ob_email_1_body",
+              "ob_email_2_body",
+              "ob_email_3_body",
+              "ob_email_4_body",
+          ]
+
+          def strip_subject_lines(text):
+              """Remove any line starting with 'Subject:' (case-insensitive)."""
+              if not text:
+                  return text
+              lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
+              return "\n".join(lines).strip()
+
+          # ── Fetch all JL OB contacts that have ob_email_1_body ──────────
+          print("📥 Fetching JL OB contacts with email bodies...")
+          all_contacts = []
+          after = None
+          while True:
+              payload = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "lead_source_details", "operator": "EQ",           "value": "JL OB"},
+                      {"propertyName": "ob_email_1_body",     "operator": "HAS_PROPERTY"},
+                  ]}],
+                  "properties": EMAIL_BODY_FIELDS,
+                  "limit": 200,
+              }
+              if after:
+                  payload["after"] = after
+              resp = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/contacts/search",
+                  headers=HS_HEADERS, json=payload
+              ).json()
+              results = resp.get("results", [])
+              all_contacts.extend(results)
+              print(f"  Fetched {len(all_contacts)} so far...")
+              next_after = resp.get("paging", {}).get("next", {}).get("after")
+              if not next_after:
+                  break
+              after = next_after
+              time.sleep(0.3)
+
+          print(f"✅ {len(all_contacts)} contacts to check")
+
+          # ── Build updates for contacts that have Subject: in any body ───
+          updates_needed = []
+          for contact in all_contacts:
+              props  = contact["properties"]
+              cid    = contact["id"]
+              update = {}
+              for field in EMAIL_BODY_FIELDS:
+                  val = props.get(field) or ""
+                  cleaned = strip_subject_lines(val)
+                  if cleaned != val:
+                      update[field] = cleaned
+              if update:
+                  updates_needed.append({"id": cid, "properties": update})
+
+          print(f"🔧 {len(updates_needed)} contacts need Subject: stripped")
+
+          # ── Batch write (POST, 10 at a time) ─────────────────────────────
+          fixed = 0
+          errors = 0
+          for b in range(0, len(updates_needed), 10):
+              batch = updates_needed[b:b+10]
+              r = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                  headers=HS_HEADERS,
+                  json={"inputs": [{"id": u["id"], "properties": u["properties"]} for u in batch]}
+              )
+              if r.status_code in (200, 207):
+                  fixed += len(batch)
+                  print(f"  ✅ Wrote batch {b//10 + 1} ({len(batch)} contacts)")
+              else:
+                  errors += len(batch)
+                  print(f"  ⚠️ Batch error: {r.status_code} {r.text[:200]}")
+              time.sleep(0.2)
+
+          # ── Slack summary ─────────────────────────────────────────────────
+          msg = (
+              f"✅ *OB Email Subject Cleanup Complete*\n"
+              f"Checked: {len(all_contacts)} | Fixed: {fixed} | Errors: {errors}\n"
+              f"Stripped Subject: prefix from ob_email body fields.\n"
+              f"_Run at {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_"
+          )
+          requests.post("https://slack.com/api/chat.postMessage",
+              headers=SLACK_HEADERS,
+              json={"channel": DAILY_OB_CHANNEL, "text": msg})
+          print(f"\n🎉 Done. Checked={len(all_contacts)}, Fixed={fixed}, Errors={errors}")
+          EOF

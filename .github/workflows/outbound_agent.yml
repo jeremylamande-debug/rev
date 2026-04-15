@@ -1024,13 +1024,22 @@ jobs:
               return r.get("total", 0) > 0
           # ── Email sequence ────────────────────────────────────────
           def clean_email_body(text):
-              """Strip accidental Subject: prefix. Keep <br><br> for HTML email rendering."""
-              text = text.strip()
-              # Strip any leading "Subject: ...\n" line Claude sneaks in
-              lines = text.splitlines()
-              if lines and lines[0].lower().startswith("subject:"):
-                  text = "\n".join(lines[1:]).strip()
-              return text.strip()
+              """Clean email body: strip Subject: lines, remove newlines (HubSpot double-renders
+              them alongside <br> tags), normalize all <br> to <br><br> for paragraph spacing,
+              and add a trailing <br> for signature breathing room."""
+              import re
+              if not text:
+                  return text
+              # Strip any line starting with Subject:
+              lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
+              cleaned = "\n".join(lines).strip()
+              # Remove newlines — HubSpot renders \n as extra line breaks on top of <br>
+              cleaned = cleaned.replace("\n", "")
+              # Normalize: any run of <br> tags becomes exactly <br><br>
+              cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
+              # Strip trailing <br> tags then add exactly one <br> for signature gap
+              cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
+              return cleaned + '<br>'
 
           def gen_email_sequence(contact, ae_name):
               meeting_link = get_meeting_link(ae_name)
@@ -1046,8 +1055,8 @@ jobs:
           - Professional but warm, 100-130 words
           - Open with something specific to their role as {contact['title']}
           - Never use em dashes (—), use commas or periods instead
-          - Separate paragraphs with two newlines
-          - CTA: book 15-min demo at {meeting_link}
+          - Separate paragraphs with <br><br> (no newlines, HTML only)
+          - CTA: schedule a 30-minute call at {meeting_link}
           - No sign-off name, the sender is automated
           - No pricing
           Return ONLY the email body. Do NOT include a subject line.""", max_tokens=400))
@@ -1058,7 +1067,7 @@ jobs:
           - 75-100 words (short and punchy)
           - Lead with: {angles['proof']}
           - Never use em dashes (—), use commas or periods instead
-          - Separate paragraphs with two newlines
+          - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Ask if this is a priority right now
           - CTA: {meeting_link}
           - No sign-off name, the sender is automated
@@ -1071,9 +1080,9 @@ jobs:
           - 75-100 words
           - Lead with an insight about AI transcription in law enforcement
           - Never use em dashes (—), use commas or periods instead
-          - Separate paragraphs with two newlines
+          - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Feel like a helpful resource not a sales pitch
-          - CTA: "Worth a quick 15-min call?" + {meeting_link}
+          - CTA: "Worth a quick 30-minute call?" + {meeting_link}
           - No sign-off name, the sender is automated
           Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
               time.sleep(1)
@@ -1083,7 +1092,7 @@ jobs:
           - 60-75 words
           - Acknowledge they're busy, leave door open "if timing changes"
           - Never use em dashes (—), use commas or periods instead
-          - Separate paragraphs with two newlines
+          - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Soft CTA: {meeting_link}
           - No sign-off name, the sender is automated
           - Warm not passive aggressive

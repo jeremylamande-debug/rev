@@ -39,8 +39,8 @@ jobs:
               1. Remove Subject: lines
               2. Strip \\n so HubSpot doesn't double-render alongside <br> tags
               3. Normalize ALL <br> variants to <br><br> for paragraph spacing
-              4. Strip trailing <br> tags — HubSpot handles signature gap natively
-              5. Convert bare meeting URLs to clickable hyperlinks
+              4. Strip any broken anchor tags from previous cleanup runs
+              5. Add single trailing <br> for signature spacing
               """
               if not text:
                   return text
@@ -51,14 +51,15 @@ jobs:
               cleaned = cleaned.replace("\n", "")
               # 3. Normalize: any run of <br> tags becomes exactly <br><br>
               cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
-              # 4. Remove trailing <br> tags — let HubSpot add its own signature padding
-              cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
-              # 5. Convert bare meeting URLs to hyperlinks
+              # 4. Remove any anchor tags wrapping meeting URLs (leave bare URL, HubSpot auto-links)
               cleaned = re.sub(
-                  r'(https://meetings\.hubspot\.com/[\w-]+)',
-                  r'<a href="\1">Schedule a 30-minute call</a>',
+                  r'<a href="(https://meetings\.hubspot\.com/[\w-]+)">[^<]*</a>',
+                  r'\1',
                   cleaned
               )
+              # 5. Strip trailing <br> tags then add exactly one <br> for signature gap
+              cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
+              cleaned = cleaned + '<br>'
               return cleaned
 
           # ── Fetch all JL OB contacts that have ob_email_1_body ──────────

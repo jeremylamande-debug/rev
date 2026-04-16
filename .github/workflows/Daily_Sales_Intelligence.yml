@@ -1,4 +1,4 @@
-name: Daily Call Intelligence — CA Law Enforcement
+name: Daily Sales Intelligence — CA Law Enforcement
 on:
   schedule:
     - cron: '5 6 * * 1-6'  # 2:05 AM ET (UTC-4 EDT), Mon–Sat
@@ -6,10 +6,10 @@ on:
     #   Tue–Sat → daily recap of prior day (Sat captures Fri)
   workflow_dispatch:
 jobs:
-  call-intelligence:
+  sales-intelligence:
     runs-on: ubuntu-latest
     steps:
-      - name: Run Call Intelligence Agent
+      - name: Run Sales Intelligence Agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           HUBSPOT_API_KEY:   ${{ secrets.HUBSPOT_API_KEY }}
@@ -30,6 +30,9 @@ jobs:
               "x-api-key": ANTHROPIC_KEY,
               "anthropic-version": "2023-06-01"
           }
+
+          PORTAL_ID    = "21451281"
+          SEQUENCE_ID  = "304238924"  # OB Agent sequence
 
           # ── AE identity map ───────────────────────────────────────────
           AE_OWNERS = {
@@ -69,14 +72,14 @@ jobs:
               end_ms     = int(week_end.timestamp()   * 1000)
               day_label  = (f"Week of {week_start.strftime('%b %d')} – "
                             f"{(week_end - datetime.timedelta(days=1)).strftime('%b %d, %Y')}")
-              mode_label = "📊 *Weekly Call Summary*"
+              mode_label = "📊 *Weekly Sales Summary*"
           else:
               start_dt  = today - datetime.timedelta(days=1)
               end_dt    = today
               start_ms  = int(start_dt.timestamp() * 1000)
               end_ms    = int(end_dt.timestamp()   * 1000)
               day_label = start_dt.strftime("%A, %b %d")
-              mode_label = "📞 *Daily Call Recap*"
+              mode_label = "📞 *Daily Sales Recap*"
 
           print(f"📅 Mode: {'Weekly' if is_weekly else 'Daily'} | Period: {day_label}")
 
@@ -162,7 +165,9 @@ jobs:
                       result.append((name, url))
               return result
 
-          # ── Fetch all outbound calls in range (paginated) ─────────────
+          # ══════════════════════════════════════════════════════════════
+          # SECTION 1 — CALL INTELLIGENCE
+          # ══════════════════════════════════════════════════════════════
           print(f"\n📥 Fetching outbound calls from HubSpot...")
           all_calls = []
           after = None
@@ -195,8 +200,6 @@ jobs:
 
           print(f"  ✅ {len(all_calls)} outbound calls found")
 
-          PORTAL_ID = "21451281"
-
           # ── Group calls by AE ─────────────────────────────────────────
           ae_calls = {oid: [] for oid in AE_OWNERS}
           for call in all_calls:
@@ -204,8 +207,8 @@ jobs:
               if oid in ae_calls:
                   ae_calls[oid].append({"_call_id": call["id"], **call["properties"]})
 
-          # ── Compute metrics ───────────────────────────────────────────
-          def compute_metrics(calls):
+          # ── Compute call metrics ──────────────────────────────────────
+          def compute_call_metrics(calls):
               total = len(calls)
               if total == 0:
                   return None
@@ -254,12 +257,12 @@ jobs:
                   "meeting_set_call_ids":  [cid for cid in meeting_set_call_ids if cid],
               }
 
-          metrics          = {}
+          call_metrics     = {}
           meeting_contacts = {}
           for oid in AE_ORDER:
               name = AE_OWNERS[oid]
-              m    = compute_metrics(ae_calls[oid])
-              metrics[oid] = m
+              m    = compute_call_metrics(ae_calls[oid])
+              call_metrics[oid] = m
               if m:
                   print(f"  {name}: {m['total']} calls | {m['connected']} connected ({m['connect_rate']}%) | {m['meeting_set']} mtg set")
                   if m["meeting_set_call_ids"]:
@@ -269,12 +272,12 @@ jobs:
               else:
                   print(f"  {name}: 0 calls")
 
-          # ── Claude coaching ───────────────────────────────────────────
-          print(f"\n🧠 Generating coaching insights...")
+          # ── Claude call coaching ──────────────────────────────────────
+          print(f"\n🧠 Generating call coaching insights...")
           coaching_insights = {}
           for oid in AE_ORDER:
               name = AE_OWNERS[oid]
-              m    = metrics.get(oid)
+              m    = call_metrics.get(oid)
               if not m or not m["coaching_notes"]:
                   coaching_insights[oid] = ""
                   continue
@@ -316,18 +319,157 @@ jobs:
               coaching_insights[oid] = claude(prompt, max_tokens=150 if not is_weekly else 200)
               time.sleep(1)
 
-          # ── Build Slack message ───────────────────────────────────────
-          total_calls    = sum((metrics[o]["total"]       if metrics[o] else 0) for o in AE_ORDER)
-          total_conn     = sum((metrics[o]["connected"]   if metrics[o] else 0) for o in AE_ORDER)
-          total_meetings = sum((metrics[o]["meeting_set"] if metrics[o] else 0) for o in AE_ORDER)
+          # ══════════════════════════════════════════════════════════════
+          # SECTION 2 — OB AGENT SEQUENCE (ID: 304238924)
+          # Only emails explicitly tagged with hs_sequence_id = 304238924
+          # ══════════════════════════════════════════════════════════════
+          print(f"\n📧 Fetching OB Agent sequence emails from HubSpot...")
+
+          seq_emails_sent   = {oid: 0 for oid in AE_OWNERS}   # outbound sent
+          seq_emails_bounced = {oid: 0 for oid in AE_OWNERS}  # bounced
+          seq_replies       = {oid: [] for oid in AE_OWNERS}   # (contact_id, email_id) pairs that got replies
+          seq_meetings      = {oid: [] for oid in AE_OWNERS}   # (name, url) for meetings booked
+
+          # ── Fetch outbound sequence emails ────────────────────────────
+          seq_after = None
+          seq_email_ids_by_owner = {oid: [] for oid in AE_OWNERS}  # email_id → owner for reply lookup
+
+          while True:
+              payload = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "hs_sequence_id",    "operator": "EQ",  "value": SEQUENCE_ID},
+                      {"propertyName": "hs_email_direction","operator": "EQ",  "value": "EMAIL"},
+                      {"propertyName": "hs_timestamp",      "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp",      "operator": "LT",  "value": str(end_ms)},
+                  ]}],
+                  "properties": [
+                      "hs_email_subject", "hs_email_direction", "hs_email_status",
+                      "hubspot_owner_id", "hs_timestamp", "hs_sequence_id",
+                      "hs_email_reply_count"
+                  ],
+                  "limit": 200,
+              }
+              if seq_after:
+                  payload["after"] = seq_after
+              resp = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/emails/search",
+                  headers=HS_HEADERS, json=payload
+              ).json()
+              results = resp.get("results", [])
+              for email in results:
+                  props = email["properties"]
+                  oid   = str(props.get("hubspot_owner_id") or "")
+                  if oid not in AE_OWNERS:
+                      continue
+                  status = (props.get("hs_email_status") or "").upper()
+                  if status == "BOUNCED":
+                      seq_emails_bounced[oid] += 1
+                  else:
+                      seq_emails_sent[oid] += 1
+                  # Track emails with replies for contact lookup
+                  reply_count = int(props.get("hs_email_reply_count") or 0)
+                  if reply_count > 0:
+                      seq_email_ids_by_owner[oid].append(email["id"])
+
+              next_after = resp.get("paging", {}).get("next", {}).get("after")
+              if not next_after:
+                  break
+              seq_after = next_after
+              time.sleep(0.3)
+
+          total_seq_sent    = sum(seq_emails_sent.values())
+          total_seq_bounced = sum(seq_emails_bounced.values())
+          print(f"  ✅ {total_seq_sent} sequence emails sent | {total_seq_bounced} bounced")
+
+          # ── Fetch contacts linked to replied emails ───────────────────
+          # For each email that got a reply, find associated contact name + URL
+          def get_contacts_for_emails(email_ids):
+              """Returns list of (name, url) for contacts linked to these email IDs."""
+              if not email_ids:
+                  return []
+              assoc_resp = requests.post(
+                  "https://api.hubapi.com/crm/v3/associations/emails/contacts/batch/read",
+                  headers=HS_HEADERS,
+                  json={"inputs": [{"id": str(eid)} for eid in email_ids[:100]]}
+              ).json()
+              contact_ids = set()
+              for r in assoc_resp.get("results", []):
+                  for to in r.get("to", []):
+                      contact_ids.add(str(to.get("id", "")))
+              contact_ids.discard("")
+              if not contact_ids:
+                  return []
+              names_resp = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                  headers=HS_HEADERS,
+                  json={"inputs": [{"id": cid} for cid in list(contact_ids)],
+                        "properties": ["firstname", "lastname"]}
+              ).json()
+              result = []
+              for c in names_resp.get("results", []):
+                  props = c.get("properties", {})
+                  name  = " ".join(filter(None, [props.get("firstname",""), props.get("lastname","")])).strip()
+                  name  = name or f"Contact {c['id']}"
+                  url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
+                  result.append((name, url))
+              return result
+
+          for oid in AE_ORDER:
+              if seq_email_ids_by_owner[oid]:
+                  seq_replies[oid] = get_contacts_for_emails(seq_email_ids_by_owner[oid])
+                  print(f"  {AE_OWNERS[oid]} replies: {[c[0] for c in seq_replies[oid]]}")
+
+          # ── Fetch meeting bookings from sequence contacts ──────────────
+          # Look for "Accepted:" calendar emails from sequence contacts within the period
+          # We check for meeting-acceptance emails associated with sequence contacts
+          # Only fires if there were any replied emails (common precursor to meetings)
+          all_replied_email_ids = [eid for ids in seq_email_ids_by_owner.values() for eid in ids]
+          if all_replied_email_ids:
+              # Get all contact IDs that replied
+              all_replied_contacts = get_contacts_for_emails(all_replied_email_ids)
+              # For each AE, check if any of their replied contacts booked a meeting
+              # (look for "Accepted:" emails owned by that AE in the period)
+              mtg_payload = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "hs_timestamp",       "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp",       "operator": "LT",  "value": str(end_ms)},
+                      {"propertyName": "hs_email_direction", "operator": "EQ",  "value": "INCOMING_EMAIL"},
+                      {"propertyName": "hs_sequence_id",     "operator": "EQ",  "value": SEQUENCE_ID},
+                  ]}],
+                  "properties": ["hs_email_subject", "hubspot_owner_id", "hs_timestamp"],
+                  "limit": 100,
+              }
+              mtg_resp = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/emails/search",
+                  headers=HS_HEADERS, json=mtg_payload
+              ).json()
+              mtg_email_ids_by_owner = {oid: [] for oid in AE_OWNERS}
+              for email in mtg_resp.get("results", []):
+                  props   = email["properties"]
+                  oid     = str(props.get("hubspot_owner_id") or "")
+                  subject = (props.get("hs_email_subject") or "").lower()
+                  if oid in AE_OWNERS and "accepted:" in subject:
+                      mtg_email_ids_by_owner[oid].append(email["id"])
+              for oid in AE_ORDER:
+                  if mtg_email_ids_by_owner[oid]:
+                      seq_meetings[oid] = get_contacts_for_emails(mtg_email_ids_by_owner[oid])
+
+          # ══════════════════════════════════════════════════════════════
+          # BUILD SLACK MESSAGE
+          # ══════════════════════════════════════════════════════════════
+          total_calls    = sum((call_metrics[o]["total"]       if call_metrics[o] else 0) for o in AE_ORDER)
+          total_conn     = sum((call_metrics[o]["connected"]   if call_metrics[o] else 0) for o in AE_ORDER)
+          total_meetings = sum((call_metrics[o]["meeting_set"] if call_metrics[o] else 0) for o in AE_ORDER)
           team_conn_rate = round(total_conn    / total_calls * 100) if total_calls else 0
           team_mtg_rate  = round(total_meetings/ total_calls * 100) if total_calls else 0
 
           lines = [f"{mode_label} — {day_label}\n"]
 
+          # ── Call section ──────────────────────────────────────────────
+          lines.append("📞 *Calls*")
           for oid in AE_ORDER:
               name = AE_OWNERS[oid]
-              m    = metrics.get(oid)
+              m    = call_metrics.get(oid)
 
               if not m:
                   lines.append(f"*{name}* — 0 calls logged\n")
@@ -364,15 +506,46 @@ jobs:
                           lines.append("")
               lines.append("")
 
+          # ── Sequence section ──────────────────────────────────────────
+          lines.append("📧 *OB Agent Sequence*")
+          for oid in AE_ORDER:
+              name    = AE_OWNERS[oid]
+              sent    = seq_emails_sent[oid]
+              bounced = seq_emails_bounced[oid]
+              replies = seq_replies.get(oid, [])
+              meetings = seq_meetings.get(oid, [])
+
+              if sent == 0 and bounced == 0:
+                  lines.append(f"*{name}* — 0 emails sent\n")
+                  continue
+
+              parts = [f"*{sent}* email{'s' if sent != 1 else ''} sent"]
+              if bounced:
+                  parts.append(f"{bounced} bounced")
+              line = f"*{name}* — {' | '.join(parts)}"
+              lines.append(line)
+
+              if replies:
+                  reply_links = "  ".join(f"<{url}|{cname}>" for cname, url in replies)
+                  lines.append(f"  💬 {'Reply' if len(replies) == 1 else 'Replies'}: {reply_links}")
+
+              if meetings:
+                  mtg_links = "  ".join(f"<{url}|{cname}>" for cname, url in meetings)
+                  lines.append(f"  📅 Meeting booked: {mtg_links}")
+
+              lines.append("")
+
+          # ── Totals ────────────────────────────────────────────────────
           if total_calls:
               lines.append(
                   f"{'📊 *Weekly Totals*' if is_weekly else '📊 *Totals*'}: "
                   f"{total_calls} calls  |  "
                   f"{total_conn} connected ({team_conn_rate}%)  |  "
-                  f"{total_meetings} meeting{'s' if total_meetings != 1 else ''} set ({team_mtg_rate}%)"
+                  f"{total_meetings} meeting{'s' if total_meetings != 1 else ''} set ({team_mtg_rate}%)  |  "
+                  f"{total_seq_sent} sequence emails sent"
               )
           else:
-              lines.append("_No outbound calls logged for this period._")
+              lines.append("_No outbound activity logged for this period._")
 
           lines.append(f"\n_Generated {now.strftime('%Y-%m-%d %H:%M UTC')}_")
 
@@ -387,5 +560,5 @@ jobs:
               print("\n✅ Posted to #daily-ob")
           else:
               print(f"\n⚠️ Slack post failed: {result.get('error')}")
-          print(f"Done. {total_calls} calls | {total_meetings} meetings set.")
+          print(f"Done. {total_calls} calls | {total_meetings} meetings set | {total_seq_sent} sequence emails.")
           EOF

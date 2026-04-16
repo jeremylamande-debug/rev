@@ -17,7 +17,7 @@ jobs:
         run: |
           pip install requests --quiet
           python3 - <<'EOF'
-          import requests, json, os, re, time, datetime
+          import requests, json, os, re, time, datetime, calendar
 
           ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
           HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
@@ -61,6 +61,7 @@ jobs:
               return "meeting set" in tag.lower() or "interested (" in tag.lower()
 
           # ── Date range logic ──────────────────────────────────────────
+          # Use calendar.timegm to safely convert UTC datetime to Unix timestamp
           now   = datetime.datetime.utcnow()
           today = now.replace(hour=0, minute=0, second=0, microsecond=0)
           is_weekly = (today.weekday() == 0)  # Monday
@@ -68,20 +69,21 @@ jobs:
           if is_weekly:
               week_start = today - datetime.timedelta(days=7)
               week_end   = today - datetime.timedelta(days=2)
-              start_ms   = int(week_start.timestamp() * 1000)
-              end_ms     = int(week_end.timestamp()   * 1000)
+              start_ms   = int(calendar.timegm(week_start.timetuple()) * 1000)
+              end_ms     = int(calendar.timegm(week_end.timetuple())   * 1000)
               day_label  = (f"Week of {week_start.strftime('%b %d')} – "
                             f"{(week_end - datetime.timedelta(days=1)).strftime('%b %d, %Y')}")
               mode_label = "📊 *Weekly Sales Summary*"
           else:
               start_dt  = today - datetime.timedelta(days=1)
               end_dt    = today
-              start_ms  = int(start_dt.timestamp() * 1000)
-              end_ms    = int(end_dt.timestamp()   * 1000)
+              start_ms  = int(calendar.timegm(start_dt.timetuple()) * 1000)
+              end_ms    = int(calendar.timegm(end_dt.timetuple())   * 1000)
               day_label = start_dt.strftime("%A, %b %d")
               mode_label = "📞 *Daily Sales Recap*"
 
           print(f"📅 Mode: {'Weekly' if is_weekly else 'Daily'} | Period: {day_label}")
+          print(f"   start_ms={start_ms} | end_ms={end_ms}")
 
           # ── Claude helper ─────────────────────────────────────────────
           def claude(prompt, max_tokens=400):
@@ -321,26 +323,25 @@ jobs:
 
           # ══════════════════════════════════════════════════════════════
           # SECTION 2 — OB AGENT SEQUENCE (ID: 304238924)
-          # Only emails explicitly tagged with hs_sequence_id = 304238924
+          # Filters by hs_sequence_id only — no direction filter needed
+          # hs_sequence_id is only set on outbound sequence sends
           # ══════════════════════════════════════════════════════════════
           print(f"\n📧 Fetching OB Agent sequence emails from HubSpot...")
+          print(f"   Sequence ID: {SEQUENCE_ID} | Range: {start_ms} – {end_ms}")
 
-          seq_emails_sent   = {oid: 0 for oid in AE_OWNERS}   # outbound sent
-          seq_emails_bounced = {oid: 0 for oid in AE_OWNERS}  # bounced
-          seq_replies       = {oid: [] for oid in AE_OWNERS}   # (contact_id, email_id) pairs that got replies
-          seq_meetings      = {oid: [] for oid in AE_OWNERS}   # (name, url) for meetings booked
+          seq_emails_sent    = {oid: 0 for oid in AE_OWNERS}
+          seq_emails_bounced = {oid: 0 for oid in AE_OWNERS}
+          seq_replies        = {oid: [] for oid in AE_OWNERS}
+          seq_meetings       = {oid: [] for oid in AE_OWNERS}
+          seq_email_ids_by_owner = {oid: [] for oid in AE_OWNERS}
 
-          # ── Fetch outbound sequence emails ────────────────────────────
           seq_after = None
-          seq_email_ids_by_owner = {oid: [] for oid in AE_OWNERS}  # email_id → owner for reply lookup
-
           while True:
               payload = {
                   "filterGroups": [{"filters": [
-                      {"propertyName": "hs_sequence_id",    "operator": "EQ",  "value": SEQUENCE_ID},
-                      {"propertyName": "hs_email_direction","operator": "EQ",  "value": "EMAIL"},
-                      {"propertyName": "hs_timestamp",      "operator": "GTE", "value": str(start_ms)},
-                      {"propertyName": "hs_timestamp",      "operator": "LT",  "value": str(end_ms)},
+                      {"propertyName": "hs_sequence_id", "operator": "EQ",  "value": SEQUENCE_ID},
+                      {"propertyName": "hs_timestamp",   "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp",   "operator": "LT",  "value": str(end_ms)},
                   ]}],
                   "properties": [
                       "hs_email_subject", "hs_email_direction", "hs_email_status",
@@ -355,18 +356,25 @@ jobs:
                   "https://api.hubapi.com/crm/v3/objects/emails/search",
                   headers=HS_HEADERS, json=payload
               ).json()
+
+              if "error" in resp:
+                  print(f"  ⚠️ Sequence query error: {resp}")
+                  break
+
               results = resp.get("results", [])
+              print(f"  Page: {len(results)} results | total: {resp.get('total', '?')}")
+
               for email in results:
-                  props = email["properties"]
-                  oid   = str(props.get("hubspot_owner_id") or "")
-                  if oid not in AE_OWNERS:
+                  props     = email["properties"]
+                  oid       = str(props.get("hubspot_owner_id") or "")
+                  direction = (props.get("hs_email_direction") or "").upper()
+                  if oid not in AE_OWNERS or direction == "INCOMING_EMAIL":
                       continue
                   status = (props.get("hs_email_status") or "").upper()
                   if status == "BOUNCED":
                       seq_emails_bounced[oid] += 1
                   else:
                       seq_emails_sent[oid] += 1
-                  # Track emails with replies for contact lookup
                   reply_count = int(props.get("hs_email_reply_count") or 0)
                   if reply_count > 0:
                       seq_email_ids_by_owner[oid].append(email["id"])
@@ -379,12 +387,12 @@ jobs:
 
           total_seq_sent    = sum(seq_emails_sent.values())
           total_seq_bounced = sum(seq_emails_bounced.values())
-          print(f"  ✅ {total_seq_sent} sequence emails sent | {total_seq_bounced} bounced")
+          print(f"  ✅ {total_seq_sent} sent | {total_seq_bounced} bounced")
+          for oid in AE_ORDER:
+              print(f"    {AE_OWNERS[oid]}: sent={seq_emails_sent[oid]} bounced={seq_emails_bounced[oid]}")
 
           # ── Fetch contacts linked to replied emails ───────────────────
-          # For each email that got a reply, find associated contact name + URL
           def get_contacts_for_emails(email_ids):
-              """Returns list of (name, url) for contacts linked to these email IDs."""
               if not email_ids:
                   return []
               assoc_resp = requests.post(
@@ -419,24 +427,16 @@ jobs:
                   seq_replies[oid] = get_contacts_for_emails(seq_email_ids_by_owner[oid])
                   print(f"  {AE_OWNERS[oid]} replies: {[c[0] for c in seq_replies[oid]]}")
 
-          # ── Fetch meeting bookings from sequence contacts ──────────────
-          # Look for "Accepted:" calendar emails from sequence contacts within the period
-          # We check for meeting-acceptance emails associated with sequence contacts
-          # Only fires if there were any replied emails (common precursor to meetings)
+          # ── Check for meetings booked via sequence ────────────────────
           all_replied_email_ids = [eid for ids in seq_email_ids_by_owner.values() for eid in ids]
           if all_replied_email_ids:
-              # Get all contact IDs that replied
-              all_replied_contacts = get_contacts_for_emails(all_replied_email_ids)
-              # For each AE, check if any of their replied contacts booked a meeting
-              # (look for "Accepted:" emails owned by that AE in the period)
               mtg_payload = {
                   "filterGroups": [{"filters": [
-                      {"propertyName": "hs_timestamp",       "operator": "GTE", "value": str(start_ms)},
-                      {"propertyName": "hs_timestamp",       "operator": "LT",  "value": str(end_ms)},
-                      {"propertyName": "hs_email_direction", "operator": "EQ",  "value": "INCOMING_EMAIL"},
-                      {"propertyName": "hs_sequence_id",     "operator": "EQ",  "value": SEQUENCE_ID},
+                      {"propertyName": "hs_timestamp",   "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp",   "operator": "LT",  "value": str(end_ms)},
+                      {"propertyName": "hs_sequence_id", "operator": "EQ",  "value": SEQUENCE_ID},
                   ]}],
-                  "properties": ["hs_email_subject", "hubspot_owner_id", "hs_timestamp"],
+                  "properties": ["hs_email_subject", "hubspot_owner_id", "hs_email_direction"],
                   "limit": 100,
               }
               mtg_resp = requests.post(
@@ -445,10 +445,11 @@ jobs:
               ).json()
               mtg_email_ids_by_owner = {oid: [] for oid in AE_OWNERS}
               for email in mtg_resp.get("results", []):
-                  props   = email["properties"]
-                  oid     = str(props.get("hubspot_owner_id") or "")
-                  subject = (props.get("hs_email_subject") or "").lower()
-                  if oid in AE_OWNERS and "accepted:" in subject:
+                  props     = email["properties"]
+                  oid       = str(props.get("hubspot_owner_id") or "")
+                  subject   = (props.get("hs_email_subject") or "").lower()
+                  direction = (props.get("hs_email_direction") or "").upper()
+                  if oid in AE_OWNERS and direction == "INCOMING_EMAIL" and "accepted:" in subject:
                       mtg_email_ids_by_owner[oid].append(email["id"])
               for oid in AE_ORDER:
                   if mtg_email_ids_by_owner[oid]:
@@ -509,10 +510,10 @@ jobs:
           # ── Sequence section ──────────────────────────────────────────
           lines.append("📧 *OB Agent Sequence*")
           for oid in AE_ORDER:
-              name    = AE_OWNERS[oid]
-              sent    = seq_emails_sent[oid]
-              bounced = seq_emails_bounced[oid]
-              replies = seq_replies.get(oid, [])
+              name     = AE_OWNERS[oid]
+              sent     = seq_emails_sent[oid]
+              bounced  = seq_emails_bounced[oid]
+              replies  = seq_replies.get(oid, [])
               meetings = seq_meetings.get(oid, [])
 
               if sent == 0 and bounced == 0:
@@ -522,8 +523,7 @@ jobs:
               parts = [f"*{sent}* email{'s' if sent != 1 else ''} sent"]
               if bounced:
                   parts.append(f"{bounced} bounced")
-              line = f"*{name}* — {' | '.join(parts)}"
-              lines.append(line)
+              lines.append(f"*{name}* — {' | '.join(parts)}")
 
               if replies:
                   reply_links = "  ".join(f"<{url}|{cname}>" for cname, url in replies)

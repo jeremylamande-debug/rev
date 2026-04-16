@@ -525,7 +525,7 @@ jobs:
 
           if total_seq_all:
               lines.append(
-                  f"📧 *Email Totals*: "
+                  f"{'📧 *Weekly Email Totals*' if is_weekly else '📧 *Email Totals*'}: "
                   f"{total_seq_sent} sent  |  "
                   f"{total_seq_bounced_all} bounced ({team_bounce_rate}%)  |  "
                   f"{total_seq_replies} {'reply' if total_seq_replies == 1 else 'replies'}  |  "

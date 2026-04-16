@@ -338,9 +338,8 @@ jobs:
           while True:
               payload = {
                   "filterGroups": [{"filters": [
-                      {"propertyName": "hubspot_owner_id", "operator": "IN",  "values": list(AE_OWNERS.keys())},
-                      {"propertyName": "hs_timestamp",     "operator": "GTE", "value": str(start_ms)},
-                      {"propertyName": "hs_timestamp",     "operator": "LT",  "value": str(end_ms)},
+                      {"propertyName": "hs_timestamp", "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp", "operator": "LT",  "value": str(end_ms)},
                   ]}],
                   "properties": [
                       "hs_email_subject", "hs_email_direction", "hs_email_status",
@@ -356,7 +355,7 @@ jobs:
                   headers=HS_HEADERS, json=payload
               ).json()
 
-              if "error" in resp:
+              if "error" in resp or "status" in resp:
                   print(f"  ⚠️ Sequence query error: {resp}")
                   break
 

@@ -61,7 +61,6 @@ jobs:
               return "meeting set" in tag.lower() or "interested (" in tag.lower()
 
           # ── Date range logic ──────────────────────────────────────────
-          # Use calendar.timegm to safely convert UTC datetime to Unix timestamp
           now   = datetime.datetime.utcnow()
           today = now.replace(hour=0, minute=0, second=0, microsecond=0)
           is_weekly = (today.weekday() == 0)  # Monday
@@ -323,8 +322,8 @@ jobs:
 
           # ══════════════════════════════════════════════════════════════
           # SECTION 2 — OB AGENT SEQUENCE (ID: 304238924)
-          # Filters by hs_sequence_id only — no direction filter needed
-          # hs_sequence_id is only set on outbound sequence sends
+          # Filter by owner + date range, then check hs_sequence_id
+          # client-side (hs_sequence_id is not indexable in HS search API)
           # ══════════════════════════════════════════════════════════════
           print(f"\n📧 Fetching OB Agent sequence emails from HubSpot...")
           print(f"   Sequence ID: {SEQUENCE_ID} | Range: {start_ms} – {end_ms}")
@@ -339,9 +338,9 @@ jobs:
           while True:
               payload = {
                   "filterGroups": [{"filters": [
-                      {"propertyName": "hs_sequence_id", "operator": "EQ",  "value": SEQUENCE_ID},
-                      {"propertyName": "hs_timestamp",   "operator": "GTE", "value": str(start_ms)},
-                      {"propertyName": "hs_timestamp",   "operator": "LT",  "value": str(end_ms)},
+                      {"propertyName": "hubspot_owner_id", "operator": "IN",  "values": list(AE_OWNERS.keys())},
+                      {"propertyName": "hs_timestamp",     "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp",     "operator": "LT",  "value": str(end_ms)},
                   ]}],
                   "properties": [
                       "hs_email_subject", "hs_email_direction", "hs_email_status",
@@ -368,7 +367,8 @@ jobs:
                   props     = email["properties"]
                   oid       = str(props.get("hubspot_owner_id") or "")
                   direction = (props.get("hs_email_direction") or "").upper()
-                  if oid not in AE_OWNERS or direction == "INCOMING_EMAIL":
+                  seq_id    = str(props.get("hs_sequence_id") or "")
+                  if oid not in AE_OWNERS or direction == "INCOMING_EMAIL" or seq_id != SEQUENCE_ID:
                       continue
                   status = (props.get("hs_email_status") or "").upper()
                   if status == "BOUNCED":

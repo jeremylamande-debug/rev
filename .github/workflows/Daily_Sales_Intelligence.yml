@@ -506,6 +506,34 @@ jobs:
                           lines.append("")
               lines.append("")
 
+          # ── Totals ────────────────────────────────────────────────────
+          total_seq_replies  = sum(len(seq_replies[o])  for o in AE_ORDER)
+          total_seq_meetings = sum(len(seq_meetings[o]) for o in AE_ORDER)
+          total_seq_bounced_all = sum(seq_emails_bounced[o] for o in AE_ORDER)
+          total_seq_all      = total_seq_sent + total_seq_bounced_all
+          team_bounce_rate   = round(total_seq_bounced_all / total_seq_all * 100) if total_seq_all else 0
+
+          if total_calls:
+              lines.append(
+                  f"{'📊 *Weekly Totals*' if is_weekly else '📊 *Totals*'}: "
+                  f"{total_calls} calls  |  "
+                  f"{total_conn} connected ({team_conn_rate}%)  |  "
+                  f"{total_meetings} meeting{'s' if total_meetings != 1 else ''} set ({team_mtg_rate}%)"
+              )
+          else:
+              lines.append("_No outbound activity logged for this period._")
+
+          if total_seq_all:
+              lines.append(
+                  f"📧 *Email Totals*: "
+                  f"{total_seq_sent} sent  |  "
+                  f"{total_seq_bounced_all} bounced ({team_bounce_rate}%)  |  "
+                  f"{total_seq_replies} {'reply' if total_seq_replies == 1 else 'replies'}  |  "
+                  f"{total_seq_meetings} meeting{'s' if total_seq_meetings != 1 else ''} scheduled"
+              )
+
+          lines.append("")
+
           # ── Sequence section ──────────────────────────────────────────
           lines.append("📧 *OB Agent Sequence*")
           for oid in AE_ORDER:
@@ -519,32 +547,26 @@ jobs:
                   lines.append(f"*{name}* — 0 emails sent\n")
                   continue
 
+              total_emails = sent + bounced
+              bounce_pct   = round(bounced / total_emails * 100) if total_emails else 0
               parts = [f"*{sent}* email{'s' if sent != 1 else ''} sent"]
               if bounced:
-                  parts.append(f"{bounced} bounced")
+                  parts.append(f"{bounced} bounced ({bounce_pct}%)")
               lines.append(f"*{name}* — {' | '.join(parts)}")
 
               if replies:
                   reply_links = "  ".join(f"<{url}|{cname}>" for cname, url in replies)
                   lines.append(f"  💬 {'Reply' if len(replies) == 1 else 'Replies'}: {reply_links}")
+              else:
+                  lines.append(f"  💬 0 replies")
 
               if meetings:
                   mtg_links = "  ".join(f"<{url}|{cname}>" for cname, url in meetings)
                   lines.append(f"  📅 Meeting booked: {mtg_links}")
+              else:
+                  lines.append(f"  📅 0 meetings scheduled")
 
               lines.append("")
-
-          # ── Totals ────────────────────────────────────────────────────
-          if total_calls:
-              lines.append(
-                  f"{'📊 *Weekly Totals*' if is_weekly else '📊 *Totals*'}: "
-                  f"{total_calls} calls  |  "
-                  f"{total_conn} connected ({team_conn_rate}%)  |  "
-                  f"{total_meetings} meeting{'s' if total_meetings != 1 else ''} set ({team_mtg_rate}%)  |  "
-                  f"{total_seq_sent} sequence emails sent"
-              )
-          else:
-              lines.append("_No outbound activity logged for this period._")
 
           lines.append(f"\n_Generated {now.strftime('%Y-%m-%d %H:%M UTC')}_")
 

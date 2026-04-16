@@ -40,9 +40,6 @@ jobs:
           AE_ORDER = ["749290652", "87460084", "89993866"]
 
           # ── Aircall tag classification ────────────────────────────────
-          # Aircall tags (entered by reps) are the source of truth for disposition.
-          # HubSpot's hs_call_disposition is unreliable — a call can show "Connected"
-          # in HubSpot while the rep tagged it "Not Connected" in Aircall.
           MEETING_SET_GUID = "d62d6bbe-4f03-4e2d-81fa-faabcc26c819"  # fallback only
 
           def tag_emoji(tag):
@@ -61,17 +58,13 @@ jobs:
               return "meeting set" in tag.lower() or "interested (" in tag.lower()
 
           # ── Date range logic ──────────────────────────────────────────
-          # Monday  → weekly summary: last Mon 00:00 UTC → last Fri 23:59 UTC
-          # Tue–Sat → daily recap: yesterday 00:00 → today 00:00
           now   = datetime.datetime.utcnow()
           today = now.replace(hour=0, minute=0, second=0, microsecond=0)
           is_weekly = (today.weekday() == 0)  # Monday
 
           if is_weekly:
-              # Last Monday = today - 7 days
               week_start = today - datetime.timedelta(days=7)
-              # Last Friday = today - 3 days; end at Saturday 00:00 to capture full Friday
-              week_end   = today - datetime.timedelta(days=2)  # Saturday 00:00 = end of Friday
+              week_end   = today - datetime.timedelta(days=2)
               start_ms   = int(week_start.timestamp() * 1000)
               end_ms     = int(week_end.timestamp()   * 1000)
               day_label  = (f"Week of {week_start.strftime('%b %d')} – "
@@ -108,16 +101,12 @@ jobs:
               return ""
 
           # ── Parse Aircall data from hs_call_body HTML ─────────────────
-          # HTML structure: <div id="aircall-tags"><br><strong>Tags:</strong> VALUE</div>
-          # Must strip HTML tags first — "Tags:" is inside <strong> so a naive
-          # regex stopping at "<" captures nothing.
           def strip_html(html_str):
               return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html_str)).strip()
 
           def parse_aircall(body):
               if not body:
                   return {"tags": "", "comments": ""}
-              # Extract aircall-tags div, strip HTML, then find "Tags: VALUE"
               tags_div = re.search(
                   r'id=["\']aircall-tags["\'][^>]*>(.*?)</div>',
                   body, re.DOTALL | re.IGNORECASE
@@ -127,7 +116,6 @@ jobs:
                   plain = strip_html(tags_div.group(1))
                   t = re.search(r'Tags:\s*(.+)', plain, re.IGNORECASE)
                   tags = t.group(1).strip() if t else ""
-              # Extract aircall-comments div
               comments_div = re.search(
                   r'id=["\']aircall-comments["\'][^>]*>(.*?)</div>',
                   body, re.DOTALL | re.IGNORECASE
@@ -137,16 +125,14 @@ jobs:
 
           # ── Fetch HubSpot contact links for meeting-set calls ────────
           def get_meeting_contacts(call_ids):
-              """Returns list of (name, hs_url) for contacts linked to these call IDs."""
               if not call_ids:
                   return []
-              # Step 1: get associated contact IDs for each call
               assoc_resp = requests.post(
                   "https://api.hubapi.com/crm/v3/associations/calls/contacts/batch/read",
                   headers=HS_HEADERS,
                   json={"inputs": [{"id": str(cid)} for cid in call_ids[:100]]}
               ).json()
-              contact_map = {}  # call_id → contact_id
+              contact_map = {}
               for r in assoc_resp.get("results", []):
                   call_id   = str(r.get("from", {}).get("id", ""))
                   tos       = r.get("to", [])
@@ -154,7 +140,6 @@ jobs:
                       contact_map[call_id] = str(tos[0].get("id", ""))
               if not contact_map:
                   return []
-              # Step 2: batch-read contact names
               unique_cids = list(set(contact_map.values()))
               names_resp  = requests.post(
                   "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
@@ -167,7 +152,6 @@ jobs:
                   props = c.get("properties", {})
                   name  = " ".join(filter(None, [props.get("firstname",""), props.get("lastname","")])).strip()
                   id_to_name[c["id"]] = name or f"Contact {c['id']}"
-              # Build (name, url) pairs deduplicated by contact
               seen = set()
               result = []
               for contact_id in contact_map.values():
@@ -213,22 +197,21 @@ jobs:
 
           PORTAL_ID = "21451281"
 
-          # ── Group calls by AE (preserve call ID alongside properties) ─
+          # ── Group calls by AE ─────────────────────────────────────────
           ae_calls = {oid: [] for oid in AE_OWNERS}
           for call in all_calls:
               oid = str(call["properties"].get("hubspot_owner_id") or "")
               if oid in ae_calls:
-                  # merge id into properties dict so compute_metrics can track it
                   ae_calls[oid].append({"_call_id": call["id"], **call["properties"]})
 
-          # ── Compute metrics — Aircall tags as source of truth ────────
+          # ── Compute metrics ───────────────────────────────────────────
           def compute_metrics(calls):
               total = len(calls)
               if total == 0:
                   return None
-              tag_counts          = {}   # raw Aircall tag → count
-              connected_durs      = []   # seconds, connected calls only
-              coaching_notes      = []   # comments from connected calls
+              tag_counts          = {}
+              connected_durs      = []
+              coaching_notes      = []
               meeting_set         = 0
               meeting_set_call_ids = []
 
@@ -242,26 +225,21 @@ jobs:
                   tag_key = tag if tag else "(no tag)"
                   tag_counts[tag_key] = tag_counts.get(tag_key, 0) + 1
 
-                  # Meeting set: Aircall tag OR HubSpot disposition fallback
                   if is_meeting_set_tag(tag) or disp_guid == MEETING_SET_GUID:
                       meeting_set += 1
                       meeting_set_call_ids.append(c.get("_call_id", ""))
 
-                  # Connected = Aircall tag starts with "connected"
                   if is_connected_tag(tag):
                       if duration_ms > 0:
                           connected_durs.append(duration_ms / 1000)
                       if aircall["comments"]:
                           coaching_notes.append(aircall["comments"])
 
-              # Connected count = sum of all "connected *" tags
               connected    = sum(v for k, v in tag_counts.items() if is_connected_tag(k))
               wrong_num    = sum(v for k, v in tag_counts.items() if "wrong number" in k.lower())
               wrong_num_rt = round(wrong_num / total * 100) if total else 0
               avg_dur_sec  = int(sum(connected_durs) / len(connected_durs)) if connected_durs else 0
-
-              # Sort tags by count descending for display
-              tag_sorted = sorted(tag_counts.items(), key=lambda x: -x[1])
+              tag_sorted   = sorted(tag_counts.items(), key=lambda x: -x[1])
 
               return {
                   "total":          total,
@@ -277,7 +255,7 @@ jobs:
               }
 
           metrics          = {}
-          meeting_contacts = {}   # oid → [(name, url), ...]
+          meeting_contacts = {}
           for oid in AE_ORDER:
               name = AE_OWNERS[oid]
               m    = compute_metrics(ae_calls[oid])
@@ -310,14 +288,14 @@ jobs:
                       f"a Rev sales rep selling AI transcription to California law enforcement.\n\n"
                       f"Call notes ({len(m['coaching_notes'])} connected calls, {day_label}):\n"
                       f"{notes_block}\n\n"
-                      f"Write 3 concise coaching observations for the week:\n"
+                      f"Write 3 coaching observations — each must be exactly ONE sentence.\n"
                       f"1. Top pattern or strength observed\n"
                       f"2. Most common objection or friction point\n"
                       f"3. One specific action item for next week\n\n"
-                      f"Format:\n"
-                      f"✅ [strength]\n"
-                      f"⚠️ [friction]\n"
-                      f"🎯 [action item]\n\n"
+                      f"Format (blank line between each, no extra text):\n"
+                      f"✅ **What's Working:** [one sentence]\n\n"
+                      f"⚠️ **Friction Point:** [one sentence]\n\n"
+                      f"🎯 **Action Item:** [one sentence]\n\n"
                       f"Be specific. Reference actual content from the notes."
                   )
               else:
@@ -326,16 +304,16 @@ jobs:
                       f"a Rev sales rep selling AI transcription to California law enforcement.\n\n"
                       f"Call notes ({len(m['coaching_notes'])} connected calls, {day_label}):\n"
                       f"{notes_block}\n\n"
-                      f"Write 2 concise coaching observations:\n"
+                      f"Write 2 coaching observations — each must be exactly ONE sentence.\n"
                       f"1. What is working well\n"
                       f"2. One specific area to improve\n\n"
-                      f"Format:\n"
-                      f"✅ [positive]\n"
-                      f"🔧 [improve]\n\n"
+                      f"Format (blank line between them, no extra text):\n"
+                      f"✅ **What's Working:** [one sentence]\n\n"
+                      f"🔧 **Area to Improve:** [one sentence]\n\n"
                       f"Be specific. Reference actual content from the notes."
                   )
 
-              coaching_insights[oid] = claude(prompt, max_tokens=250 if is_weekly else 200)
+              coaching_insights[oid] = claude(prompt, max_tokens=150 if not is_weekly else 200)
               time.sleep(1)
 
           # ── Build Slack message ───────────────────────────────────────
@@ -355,7 +333,6 @@ jobs:
                   lines.append(f"*{name}* — 0 calls logged\n")
                   continue
 
-              # Header line
               summary_parts = [f"Connect rate: *{m['connect_rate']}%*"]
               if m["meeting_set"]:
                   summary_parts.append(f"📅 {m['meeting_set']} mtg{'s' if m['meeting_set'] != 1 else ''} set")
@@ -364,13 +341,11 @@ jobs:
                   summary_parts.append(f"⏱ Avg connected: {d // 60}m {d % 60}s")
               lines.append(f"*{name}* — {m['total']} calls  |  {'  |  '.join(summary_parts)}")
 
-              # Aircall tag breakdown (stacked view — source of truth)
               for tag, count in m["tag_sorted"]:
                   pct   = round(count / m["total"] * 100)
                   emoji = tag_emoji(tag)
                   lines.append(f"  {emoji} _{tag}_: {count} ({pct}%)")
 
-              # Meeting set contact links
               contacts = meeting_contacts.get(oid, [])
               if contacts:
                   contact_links = "  ".join(f"<{url}|{cname}>" for cname, url in contacts)
@@ -381,13 +356,14 @@ jobs:
 
               insight = coaching_insights.get(oid, "")
               if insight:
-                  lines.append(f"\n  _Coaching:_")
+                  lines.append(f"\n  _Coaching:_\n")
                   for il in insight.splitlines():
                       if il.strip():
                           lines.append(f"  {il.strip()}")
+                      else:
+                          lines.append("")
               lines.append("")
 
-          # Team totals
           if total_calls:
               lines.append(
                   f"{'📊 *Weekly Totals*' if is_weekly else '📊 *Totals*'}: "

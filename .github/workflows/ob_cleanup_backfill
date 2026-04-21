@@ -1,0 +1,242 @@
+name: OB Cleanup Backfill — Fix Existing Contact Bodies (No LLM)
+on:
+  workflow_dispatch:
+jobs:
+  ob-cleanup-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Clean up legacy OB email bodies and property casing in HubSpot
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, os, re, datetime, time
+
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          # ── Acronym allowlist for casing normalization ────────────────
+          ACRONYMS = {
+              "HR", "IT", "PR", "IA", "IG", "HRIS", "CHRO", "HRO", "HRBP",
+              "CEO", "CFO", "COO", "CTO", "CIO", "CPO", "CSO", "CRO", "CMO",
+              "VP", "SVP", "EVP", "AVP", "GM", "MD", "PHD",
+              "LLC", "LLP", "INC", "CORP", "LTD", "CO", "NA",
+              "DA", "ADA", "PD", "SO", "USA", "US",
+              "DOJ", "FBI", "CIA", "NSA", "DHS", "ICE", "IRS", "ATF", "DEA",
+              "OIG", "EEOC", "HIPAA", "OSHA", "FOIA", "CJIS",
+              "SWAT", "LAPD", "NYPD", "LASD", "USCIS", "CSI", "K9",
+          }
+
+          # ── normalize_case: 'JORDAN' -> 'Jordan', 'HR Director' unchanged ──
+          def normalize_case(text):
+              if not text:
+                  return text
+              def title_chunk(word):
+                  out, cap_next, chunk_len = [], True, 0
+                  for c in word:
+                      if c.isalpha():
+                          out.append(c.upper() if cap_next else c.lower())
+                          cap_next = False
+                          chunk_len += 1
+                      elif c == "'":
+                          out.append(c)
+                          cap_next = chunk_len <= 2
+                          chunk_len = 0
+                      elif c == "-":
+                          out.append(c)
+                          cap_next = True
+                          chunk_len = 0
+                      else:
+                          out.append(c)
+                          cap_next = True
+                          chunk_len = 0
+                  return "".join(out)
+              result = []
+              for w in text.split(" "):
+                  core = re.sub(r'[^A-Za-z]', '', w)
+                  if core and core.isupper() and core not in ACRONYMS:
+                      result.append(title_chunk(w))
+                  else:
+                      result.append(w)
+              return " ".join(result)
+
+          # ── clean_subject: strip wrapping **markdown** or 'Subject:' prefix ─
+          def clean_subject(text):
+              if not text:
+                  return text
+              cleaned = text.strip()
+              cleaned = re.sub(r'^\*+\s*', '', cleaned)
+              cleaned = re.sub(r'\s*\*+$', '', cleaned)
+              cleaned = re.sub(r'^subject:\s*', '', cleaned, flags=re.IGNORECASE)
+              return cleaned.strip()
+
+          # ── clean_legacy_body: convert legacy \n bodies + greeting + hyperlink ──
+          def clean_legacy_body(text):
+              """Legacy-safe cleaner. Handles \n paragraph breaks AND already-<br>'d bodies.
+              Idempotent — safe to run multiple times.
+              """
+              if not text:
+                  return text
+              # Strip any Subject: prefix line
+              lines = [l for l in text.splitlines(keepends=True) if not l.strip().lower().startswith("subject:")]
+              cleaned = "".join(lines).strip()
+              # Two or more newlines (with optional whitespace) -> <br><br>
+              cleaned = re.sub(r'[ \t]*\n[ \t]*(?:\n[ \t]*)+', '<br><br>', cleaned)
+              # Remaining single newlines -> space (joins soft-wrapped lines)
+              cleaned = re.sub(r'[ \t]*\n[ \t]*', ' ', cleaned)
+              # Collapse runs of spaces
+              cleaned = re.sub(r'  +', ' ', cleaned)
+              # Normalize any run of <br> tags (even mixed-case) to exactly <br><br>
+              cleaned = re.sub(r'(<br\s*/?>\s*)+', '<br><br>', cleaned, flags=re.IGNORECASE)
+              # Ensure 'Hi Name,' greeting is followed by <br><br>, not jammed to next paragraph
+              cleaned = re.sub(
+                  r'^(Hi\s+[^,<]{1,40},)(?!\s*<br)\s*',
+                  r'\1<br><br>',
+                  cleaned,
+                  flags=re.IGNORECASE,
+              )
+              # Turn raw HubSpot meeting URLs into '<a>my calendar</a>' hyperlinks
+              meet_url = r'https?://meetings\.hubspot\.com/[A-Za-z0-9_\-]+'
+              # First pass: 'here: URL' / 'at URL' → 'on <a>my calendar</a>'
+              cleaned = re.sub(
+                  r'\b(?:here(?:\'s)?|at)\s*:?\s+(' + meet_url + r')',
+                  r'on <a href="\1">my calendar</a>',
+                  cleaned,
+                  flags=re.IGNORECASE,
+              )
+              # Second pass: any remaining bare URL (not already in an href) → wrap it
+              cleaned = re.sub(
+                  r'(?<!href=")(?<!href=\')(' + meet_url + r')',
+                  r'<a href="\1">my calendar</a>',
+                  cleaned,
+                  flags=re.IGNORECASE,
+              )
+              # Trim trailing <br>s, then add exactly one for signature breathing room
+              cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
+              return cleaned + '<br>'
+
+          # ── Fetch every JL OB contact that has ob_email_1_body populated ─
+          print("📥 Fetching JL OB contacts with ob_email_1_body populated...")
+          PROPS = [
+              "firstname", "lastname", "jobtitle", "company", "county",
+              "ob_email_1_subject", "ob_email_3_subject",
+              "ob_email_1_body", "ob_email_2_body", "ob_email_3_body", "ob_email_4_body",
+          ]
+          all_contacts = []
+          after = None
+          while True:
+              payload = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"},
+                      {"propertyName": "ob_email_1_body",     "operator": "HAS_PROPERTY"},
+                  ]}],
+                  "properties": PROPS,
+                  "limit": 200,
+              }
+              if after:
+                  payload["after"] = after
+              r = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/contacts/search",
+                  headers=HS_HEADERS, json=payload
+              )
+              if r.status_code != 200:
+                  print(f"⚠️ Search failed: {r.status_code} {r.text[:200]}")
+                  break
+              resp = r.json()
+              all_contacts.extend(resp.get("results", []))
+              print(f"  Fetched {len(all_contacts)} so far...")
+              nxt = resp.get("paging", {}).get("next", {}).get("after")
+              if not nxt:
+                  break
+              after = nxt
+
+          print(f"✅ Total JL OB contacts to evaluate: {len(all_contacts)}")
+
+          # ── Compute field-level diffs (only write what actually changed) ──
+          PROP_FIELDS    = ["firstname", "lastname", "jobtitle", "company", "county"]
+          SUBJECT_FIELDS = ["ob_email_1_subject", "ob_email_3_subject"]
+          BODY_FIELDS    = ["ob_email_1_body", "ob_email_2_body", "ob_email_3_body", "ob_email_4_body"]
+
+          hs_updates = []
+          unchanged = 0
+          field_change_counts = {}  # per-field change tally
+
+          for c in all_contacts:
+              cid = c["id"]
+              props = c.get("properties", {}) or {}
+              diff = {}
+              for f in PROP_FIELDS:
+                  before = (props.get(f) or "")
+                  after  = normalize_case(before)
+                  if after != before:
+                      diff[f] = after
+              for f in SUBJECT_FIELDS:
+                  before = (props.get(f) or "")
+                  after  = clean_subject(before)
+                  if after != before:
+                      diff[f] = after
+              for f in BODY_FIELDS:
+                  before = (props.get(f) or "")
+                  if not before:
+                      continue
+                  after = clean_legacy_body(before)
+                  if after != before:
+                      diff[f] = after
+              if diff:
+                  hs_updates.append({"id": cid, "properties": diff})
+                  for f in diff:
+                      field_change_counts[f] = field_change_counts.get(f, 0) + 1
+              else:
+                  unchanged += 1
+
+          print(f"\n📊 Diff summary:")
+          print(f"   Contacts needing update: {len(hs_updates)}")
+          print(f"   Already clean:           {unchanged}")
+          print(f"   Field-level changes:")
+          for f, n in sorted(field_change_counts.items(), key=lambda x: -x[1]):
+              print(f"     • {f:22} {n} contacts")
+
+          # ── Batch-write updates to HubSpot (100 per request) ─────────────
+          print(f"\n💾 Writing {len(hs_updates)} updates to HubSpot in batches of 100...")
+          written = 0
+          write_errors = 0
+          for b in range(0, len(hs_updates), 100):
+              batch = hs_updates[b:b+100]
+              r = requests.post(
+                  "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                  headers=HS_HEADERS,
+                  json={"inputs": [{"id": u["id"], "properties": u["properties"]} for u in batch]},
+              )
+              if r.status_code in (200, 207):
+                  written += len(batch)
+                  print(f"   ✓ batch {b//100 + 1}: wrote {len(batch)} contacts")
+              else:
+                  write_errors += len(batch)
+                  print(f"   ⚠️ batch {b//100 + 1} failed: {r.status_code} {r.text[:250]}")
+              time.sleep(0.2)  # gentle pacing
+
+          # ── Slack summary ────────────────────────────────────────────────
+          msg = (
+              f"🧹 *OB Cleanup Backfill — Complete*\n"
+              f"• Evaluated: {len(all_contacts)} contacts (lead_source_details = JL OB)\n"
+              f"• Updated:   {written}   •   Already clean: {unchanged}   •   Errors: {write_errors}\n"
+              f"• Field changes: "
+              + ", ".join(f"{f.replace('ob_email_','e').replace('_body','b').replace('_subject','s')}={n}"
+                          for f, n in sorted(field_change_counts.items(), key=lambda x: -x[1]))
+              + f"\n_Run at {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_"
+          )
+          try:
+              requests.post("https://slack.com/api/chat.postMessage",
+                  headers=SLACK_HEADERS,
+                  json={"channel": DAILY_OB_CHANNEL, "text": msg})
+          except Exception as e:
+              print(f"⚠️ Slack post failed: {e}")
+
+          print(f"\n🎉 Done. Updated={written}, Unchanged={unchanged}, Errors={write_errors}")
+          EOF

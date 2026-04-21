@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       range:
-        description: 'Range: "yesterday" (default), "today", "lastweek" (prior Mon–Fri), "last7days" (rolling), or YYYY-MM-DD'
+        description: 'Range: "lastweek" (prior Mon–Fri, default), "yesterday", "today", "last7days" (rolling), or YYYY-MM-DD'
         required: false
-        default: 'yesterday'
+        default: 'lastweek'
       post_to_slack:
         description: 'Post result to #daily-ob? (true/false)'
         required: false

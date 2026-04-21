@@ -1,0 +1,241 @@
+name: Untagged Calls List — Per Seller
+on:
+  workflow_dispatch:
+    inputs:
+      range:
+        description: 'Range: "yesterday" (default), "today", "lastweek" (prior Mon–Fri), "last7days" (rolling), or YYYY-MM-DD'
+        required: false
+        default: 'yesterday'
+      post_to_slack:
+        description: 'Post result to #daily-ob? (true/false)'
+        required: false
+        default: 'true'
+jobs:
+  untagged-calls-list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Build per-seller list of untagged calls
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          RANGE:          ${{ github.event.inputs.range }}
+          POST_TO_SLACK:  ${{ github.event.inputs.post_to_slack }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, os, re, datetime, time
+
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
+          PORTAL_ID        = "21451281"
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          RANGE_INPUT   = (os.environ.get("RANGE") or "yesterday").strip().lower()
+          POST_TO_SLACK = (os.environ.get("POST_TO_SLACK") or "true").strip().lower() == "true"
+
+          # ── AE identity map ───────────────────────────────────────────
+          AE_OWNERS = {
+              "749290652": "Dillon DeWitt",
+              "87460084":  "Will Weis",
+              "89993866":  "James Gregory",
+          }
+          AE_ORDER = ["749290652", "87460084", "89993866"]
+
+          # ── Resolve date range ───────────────────────────────────────
+          now   = datetime.datetime.utcnow()
+          today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+          if RANGE_INPUT == "today":
+              start_dt = today
+              end_dt   = today + datetime.timedelta(days=1)
+              label    = start_dt.strftime("%A, %b %d")
+          elif RANGE_INPUT == "last7days":
+              start_dt = today - datetime.timedelta(days=7)
+              end_dt   = today
+              label    = f"last 7 days ({start_dt.strftime('%b %d')} – {(end_dt - datetime.timedelta(days=1)).strftime('%b %d')})"
+          elif RANGE_INPUT == "lastweek":
+              # Prior Monday 00:00 through prior Saturday 00:00 (captures Mon–Fri calls)
+              # today.weekday(): Mon=0, Tue=1, ..., Sun=6. Days back to the most recent Monday:
+              days_since_monday = today.weekday()
+              # Last week's Monday is today.weekday + 7 days back
+              last_monday = today - datetime.timedelta(days=days_since_monday + 7)
+              start_dt = last_monday
+              end_dt   = last_monday + datetime.timedelta(days=5)  # Saturday 00:00 = end of Friday
+              label    = f"week of {start_dt.strftime('%b %d')} – {(end_dt - datetime.timedelta(days=1)).strftime('%b %d')} (Mon–Fri)"
+          elif re.match(r"^\d{4}-\d{2}-\d{2}$", RANGE_INPUT):
+              start_dt = datetime.datetime.strptime(RANGE_INPUT, "%Y-%m-%d")
+              end_dt   = start_dt + datetime.timedelta(days=1)
+              label    = start_dt.strftime("%A, %b %d")
+          else:  # yesterday (default)
+              start_dt = today - datetime.timedelta(days=1)
+              end_dt   = today
+              label    = start_dt.strftime("%A, %b %d")
+          start_ms = int(start_dt.timestamp() * 1000)
+          end_ms   = int(end_dt.timestamp()   * 1000)
+          print(f"📅 Range: {label} (UTC {start_dt} → {end_dt})")
+
+          # ── Parse Aircall tag from hs_call_body HTML ──────────────────
+          def strip_html(s):
+              return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', s or '')).strip()
+
+          def get_aircall_tag(body):
+              if not body:
+                  return ""
+              m = re.search(r'id=["\']aircall-tags["\'][^>]*>(.*?)</div>',
+                            body, re.DOTALL | re.IGNORECASE)
+              if not m:
+                  return ""
+              plain = strip_html(m.group(1))
+              t = re.search(r'Tags:\s*(.+)', plain, re.IGNORECASE)
+              return t.group(1).strip() if t else ""
+
+          # ── Fetch outbound calls in range ─────────────────────────────
+          print("📥 Fetching outbound calls from HubSpot...")
+          all_calls = []
+          after = None
+          while True:
+              payload = {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "hs_call_direction", "operator": "EQ",  "value": "OUTBOUND"},
+                      {"propertyName": "hs_timestamp",      "operator": "GTE", "value": str(start_ms)},
+                      {"propertyName": "hs_timestamp",      "operator": "LT",  "value": str(end_ms)},
+                  ]}],
+                  "properties": ["hs_call_body", "hs_call_duration", "hubspot_owner_id", "hs_timestamp"],
+                  "limit": 200,
+              }
+              if after:
+                  payload["after"] = after
+              r = requests.post("https://api.hubapi.com/crm/v3/objects/calls/search",
+                                headers=HS_HEADERS, json=payload)
+              if r.status_code != 200:
+                  print(f"⚠️ Search failed: {r.status_code} {r.text[:200]}")
+                  break
+              j = r.json()
+              all_calls.extend(j.get("results", []))
+              nxt = j.get("paging", {}).get("next", {}).get("after")
+              if not nxt:
+                  break
+              after = nxt
+              time.sleep(0.2)
+          print(f"  ✅ {len(all_calls)} outbound calls found in range")
+
+          # ── Filter to (no tag) calls per AE ───────────────────────────
+          per_ae = {oid: [] for oid in AE_OWNERS}
+          for c in all_calls:
+              p   = c.get("properties", {}) or {}
+              oid = str(p.get("hubspot_owner_id") or "")
+              if oid not in per_ae:
+                  continue
+              tag = get_aircall_tag(p.get("hs_call_body", ""))
+              if tag:
+                  continue  # has a tag, skip
+              per_ae[oid].append({
+                  "call_id":    c["id"],
+                  "timestamp":  p.get("hs_timestamp", ""),
+                  "duration_s": int(p.get("hs_call_duration") or 0) // 1000,
+              })
+
+          total_untagged = sum(len(v) for v in per_ae.values())
+          print(f"\n🏷  Untagged calls: {total_untagged}")
+          for oid in AE_ORDER:
+              print(f"  {AE_OWNERS[oid]:20} {len(per_ae[oid])}")
+
+          # ── Look up associated contact names for every untagged call ──
+          all_untagged_ids = [u["call_id"] for lst in per_ae.values() for u in lst]
+          call_to_contact = {}
+          if all_untagged_ids:
+              # Batch read call→contact associations (100 per request)
+              for i in range(0, len(all_untagged_ids), 100):
+                  chunk = all_untagged_ids[i:i+100]
+                  r = requests.post(
+                      "https://api.hubapi.com/crm/v3/associations/calls/contacts/batch/read",
+                      headers=HS_HEADERS,
+                      json={"inputs": [{"id": str(cid)} for cid in chunk]},
+                  )
+                  if r.status_code == 200:
+                      for row in r.json().get("results", []):
+                          cid = str(row.get("from", {}).get("id", ""))
+                          tos = row.get("to", [])
+                          if cid and tos:
+                              call_to_contact[cid] = str(tos[0].get("id", ""))
+
+          # Batch read contact names for every unique contact id
+          contact_names = {}
+          unique_contact_ids = list(set(call_to_contact.values()))
+          if unique_contact_ids:
+              for i in range(0, len(unique_contact_ids), 100):
+                  chunk = unique_contact_ids[i:i+100]
+                  r = requests.post(
+                      "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                      headers=HS_HEADERS,
+                      json={"inputs": [{"id": cid} for cid in chunk],
+                            "properties": ["firstname", "lastname", "company", "jobtitle"]},
+                  )
+                  if r.status_code == 200:
+                      for c in r.json().get("results", []):
+                          p = c.get("properties", {}) or {}
+                          full = " ".join(filter(None, [p.get("firstname",""), p.get("lastname","")])).strip()
+                          contact_names[c["id"]] = {
+                              "name":    full or f"Contact {c['id']}",
+                              "company": p.get("company", "") or "",
+                              "title":   p.get("jobtitle", "") or "",
+                          }
+
+          # ── Format per-AE lists ───────────────────────────────────────
+          def fmt_call(item):
+              ts_ms = int(item["timestamp"]) if item["timestamp"] else 0
+              when  = datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%b %d, %I:%M%p UTC") if ts_ms else "unknown"
+              dur   = f"{item['duration_s']}s" if item["duration_s"] else "0s"
+              cid   = call_to_contact.get(item["call_id"])
+              info  = contact_names.get(cid or "", {})
+              name  = info.get("name") or "(no contact)"
+              org   = info.get("company") or ""
+              contact_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{cid}" if cid else ""
+              parts = [f"• *{name}*"]
+              if org:
+                  parts.append(f"({org})")
+              parts.append(f"— {when} · {dur}")
+              if contact_url:
+                  parts.append(f"<{contact_url}|view>")
+              return " ".join(parts)
+
+          print("\n" + "=" * 60)
+          print(f"📋 UNTAGGED CALLS — {label}")
+          print("=" * 60)
+          slack_blocks = []
+          slack_blocks.append(f"*🏷  Untagged Calls — {label}*")
+          slack_blocks.append(f"Reps: please go back and tag these so the daily recap is accurate.\n")
+          for oid in AE_ORDER:
+              ae = AE_OWNERS[oid]
+              lst = per_ae[oid]
+              header = f"\n*{ae}* — {len(lst)} untagged"
+              print(header)
+              slack_blocks.append(header)
+              if not lst:
+                  print("  (none — nice work)")
+                  slack_blocks.append("  _(none — nice work)_")
+                  continue
+              for item in sorted(lst, key=lambda x: int(x["timestamp"] or 0)):
+                  line = fmt_call(item)
+                  print("  " + line)
+                  slack_blocks.append(line)
+
+          print("\n" + "=" * 60)
+
+          # ── Post to Slack ─────────────────────────────────────────────
+          if POST_TO_SLACK:
+              msg = "\n".join(slack_blocks)
+              r = requests.post("https://slack.com/api/chat.postMessage",
+                                headers=SLACK_HEADERS,
+                                json={"channel": DAILY_OB_CHANNEL, "text": msg, "unfurl_links": False})
+              if r.status_code == 200 and r.json().get("ok"):
+                  print(f"✅ Posted to Slack")
+              else:
+                  print(f"⚠️ Slack post failed: {r.status_code} {r.text[:200]}")
+          else:
+              print("⏭  Skipping Slack post (post_to_slack=false)")
+
+          print(f"\n🎉 Done. Total untagged: {total_untagged}")
+          EOF

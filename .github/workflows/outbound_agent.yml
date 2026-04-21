@@ -1022,11 +1022,76 @@ jobs:
                       {"propertyName": "lastname",  "operator": "EQ", "value": last_name}
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
+          # ── Text normalization ────────────────────────────────────
+          ACRONYMS = {
+              # Business / HR / executive titles
+              "HR", "IT", "PR", "IA", "IG", "HRIS", "CHRO", "HRO", "HRBP",
+              "CEO", "CFO", "COO", "CTO", "CIO", "CPO", "CSO", "CRO", "CMO",
+              "VP", "SVP", "EVP", "AVP", "GM", "MD", "PHD",
+              "LLC", "LLP", "INC", "CORP", "LTD", "CO", "NA",
+              # Law enforcement / government
+              "DA", "ADA", "PD", "SO", "USA", "US",
+              "DOJ", "FBI", "CIA", "NSA", "DHS", "ICE", "IRS", "ATF", "DEA",
+              "OIG", "EEOC", "HIPAA", "OSHA", "FOIA", "CJIS",
+              "SWAT", "LAPD", "NYPD", "LASD", "USCIS", "CSI", "K9",
+          }
+
+          def normalize_case(text):
+              """If a word is fully uppercase and NOT a known acronym, title-case it.
+              Preserves HR, CEO, DA, FBI, SWAT, LAPD, LLC, etc. Fixes 'JORDAN' → 'Jordan',
+              'KERN' → 'Kern', 'SHERIFF' → 'Sheriff'. Handles apostrophes and hyphens:
+              O'BRIEN → O'Brien, SMITH-JONES → Smith-Jones, SHERIFF'S → Sheriff's."""
+              if not text:
+                  return text
+              def title_chunk(word):
+                  out, cap_next, chunk_len = [], True, 0
+                  for c in word:
+                      if c.isalpha():
+                          out.append(c.upper() if cap_next else c.lower())
+                          cap_next = False
+                          chunk_len += 1
+                      elif c == "'":
+                          # Only capitalize after apostrophe if the preceding chunk is 1-2 letters
+                          # (name prefix like O'Brien, D'Angelo). For possessives like Sheriff's, don't.
+                          out.append(c)
+                          cap_next = chunk_len <= 2
+                          chunk_len = 0
+                      elif c == "-":
+                          out.append(c)
+                          cap_next = True
+                          chunk_len = 0
+                      else:
+                          out.append(c)
+                          cap_next = True
+                          chunk_len = 0
+                  return "".join(out)
+              result = []
+              for w in text.split(" "):
+                  # Strip punctuation for the acronym check; preserve it in the output.
+                  import re as _re
+                  core = _re.sub(r'[^A-Za-z]', '', w)
+                  if core and core.isupper() and core not in ACRONYMS:
+                      result.append(title_chunk(w))
+                  else:
+                      result.append(w)
+              return " ".join(result)
+
+          def normalize_lead(lead):
+              """Title-case all-caps values on lead fields so emails don't read
+              'Hi JORDAN, as SHERIFF of KERN County'."""
+              if not isinstance(lead, dict):
+                  return lead
+              for field in ("first_name", "last_name", "city", "county", "title", "organization"):
+                  if lead.get(field):
+                      lead[field] = normalize_case(lead[field])
+              return lead
+
           # ── Email sequence ────────────────────────────────────────
           def clean_email_body(text):
               """Clean email body: strip Subject: lines, remove newlines (HubSpot double-renders
               them alongside <br> tags), normalize all <br> to <br><br> for paragraph spacing,
-              and add a trailing <br> for signature breathing room."""
+              turn any raw meetings.hubspot.com URL into a '<a>my calendar</a>' hyperlink so it
+              sounds human, and add a trailing <br> for signature breathing room."""
               import re
               if not text:
                   return text
@@ -1037,6 +1102,23 @@ jobs:
               cleaned = cleaned.replace("\n", "")
               # Normalize: any run of <br> tags becomes exactly <br><br>
               cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
+              # Ensure the greeting ("Hi Name,") is followed by <br><br>, not jammed
+              # into the next paragraph. Catches "Hi Gomez,As Interim..." → "Hi Gomez,<br><br>As Interim..."
+              cleaned = re.sub(r'^(Hi\s+[^,<]{1,40},)(?!\s*<br)\s*', r'\1<br><br>', cleaned, flags=re.IGNORECASE)
+              # Turn raw HubSpot meeting URLs into a human-sounding hyperlink ("my calendar").
+              # Step 1: "here: URL" / "at URL" / "here's URL" → "on <a href='URL'>my calendar</a>"
+              meet_url = r'https?://meetings\.hubspot\.com/[A-Za-z0-9_\-]+'
+              cleaned = re.sub(
+                  r'\b(?:here(?:\'s)?|at)\s*:?\s+(' + meet_url + r')',
+                  r'on <a href="\1">my calendar</a>',
+                  cleaned, flags=re.IGNORECASE
+              )
+              # Step 2: any remaining bare URL not already inside an href → wrap it
+              cleaned = re.sub(
+                  r'(?<!href=")(?<!href=\')(' + meet_url + r')',
+                  r'<a href="\1">my calendar</a>',
+                  cleaned, flags=re.IGNORECASE
+              )
               # Strip trailing <br> tags then add exactly one <br> for signature gap
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
               return cleaned + '<br>'
@@ -1056,7 +1138,7 @@ jobs:
           - Open with something specific to their role as {contact['title']}
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
-          - CTA: schedule a 30-minute call at {meeting_link}
+          - CTA: invite them to grab a time on <a href="{meeting_link}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           - No pricing
           Return ONLY the email body. Do NOT include a subject line.""", max_tokens=400))
@@ -1069,7 +1151,7 @@ jobs:
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Ask if this is a priority right now
-          - CTA: {meeting_link}
+          - CTA: link to <a href="{meeting_link}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           - No "just following up"
           Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
@@ -1082,7 +1164,7 @@ jobs:
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Feel like a helpful resource not a sales pitch
-          - CTA: "Worth a quick 30-minute call?" + {meeting_link}
+          - CTA: "Worth a quick 30-minute call?" with a link to <a href="{meeting_link}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           Return ONLY the email body. Do NOT include a subject line.""", max_tokens=350))
               time.sleep(1)
@@ -1093,7 +1175,7 @@ jobs:
           - Acknowledge they're busy, leave door open "if timing changes"
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
-          - Soft CTA: {meeting_link}
+          - Soft CTA: mention <a href="{meeting_link}">my calendar</a> is open if timing changes — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           - Warm not passive aggressive
           Return ONLY the email body. Do NOT include a subject line.""", max_tokens=250))
@@ -1363,6 +1445,9 @@ jobs:
                               for lead in leads:
                                   if len(added) >= ae_leads_cap:
                                       break
+                                  # Title-case all-caps names/titles/counties before anything
+                                  # downstream uses them (prompts, dedupe, HS properties).
+                                  lead = normalize_lead(lead)
                                   fn = lead.get("first_name", "")
                                   ln = lead.get("last_name", "")
                                   if not fn or not ln:

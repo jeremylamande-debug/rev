@@ -76,6 +76,21 @@ jobs:
           end_ms   = int(end_dt.timestamp()   * 1000)
           print(f"📅 Range: {label} (UTC {start_dt} → {end_dt})")
 
+          # ── Parse HubSpot's hs_timestamp (ISO 8601 string) to ms epoch ─
+          def parse_hs_ts(ts):
+              if not ts:
+                  return 0
+              s = str(ts)
+              if s.isdigit():
+                  return int(s)
+              for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+                  try:
+                      dt = datetime.datetime.strptime(s, fmt)
+                      return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+                  except ValueError:
+                      continue
+              return 0
+
           # ── Parse Aircall tag from hs_call_body HTML ──────────────────
           def strip_html(s):
               return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', s or '')).strip()
@@ -185,7 +200,7 @@ jobs:
 
           # ── Format per-AE lists ───────────────────────────────────────
           def fmt_call(item):
-              ts_ms = int(item["timestamp"]) if item["timestamp"] else 0
+              ts_ms = parse_hs_ts(item["timestamp"])
               when  = datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%b %d, %I:%M%p UTC") if ts_ms else "unknown"
               dur   = f"{item['duration_s']}s" if item["duration_s"] else "0s"
               cid   = call_to_contact.get(item["call_id"])
@@ -217,7 +232,7 @@ jobs:
                   print("  (none — nice work)")
                   slack_blocks.append("  _(none — nice work)_")
                   continue
-              for item in sorted(lst, key=lambda x: int(x["timestamp"] or 0)):
+              for item in sorted(lst, key=lambda x: parse_hs_ts(x["timestamp"])):
                   line = fmt_call(item)
                   print("  " + line)
                   slack_blocks.append(line)

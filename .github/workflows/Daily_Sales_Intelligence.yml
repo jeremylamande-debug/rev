@@ -174,7 +174,10 @@ jobs:
                   return set()
               # Step 2: batch-fetch contacts with lead source property
               unique_cids = list({cid for cid in obj_to_contact.values() if cid})
+              print(f"     → {len(obj_to_contact)} {object_type} have a contact, "
+                    f"{len(unique_cids)} unique contacts to look up")
               contact_source = {}
+              diag_samples   = []  # keep first few raw values for debugging
               for j in range(0, len(unique_cids), 100):
                   cid_batch = unique_cids[j:j+100]
                   try:
@@ -188,10 +191,26 @@ jobs:
                   except Exception as e:
                       print(f"  ⚠️ Contact fetch error: {e}")
                       continue
+                  # Loud error if HubSpot returns an error payload
+                  if "status" in contacts_resp and contacts_resp.get("status") == "error":
+                      print(f"  ⚠️ HubSpot error fetching contacts with property "
+                            f"{LEAD_SOURCE_PROPERTY!r}: {contacts_resp.get('message')}")
+                      return set()
                   for c in contacts_resp.get("results", []):
-                      src = (c.get("properties", {}).get(LEAD_SOURCE_PROPERTY) or "").strip().lower()
+                      raw = c.get("properties", {}).get(LEAD_SOURCE_PROPERTY)
+                      src = (raw or "").strip().lower()
                       contact_source[c["id"]] = src
+                      if len(diag_samples) < 5:
+                          diag_samples.append((c["id"], raw))
                   time.sleep(0.2)
+              # Diagnostics: what did we actually see?
+              value_counts = {}
+              for v in contact_source.values():
+                  value_counts[v] = value_counts.get(v, 0) + 1
+              top_values = sorted(value_counts.items(), key=lambda kv: -kv[1])[:5]
+              print(f"     → Values seen for {LEAD_SOURCE_PROPERTY!r} "
+                    f"(top 5): {top_values}")
+              print(f"     → Sample contact lookups: {diag_samples}")
               # Step 3: build allowed set
               for obj_id, contact_id in obj_to_contact.items():
                   if contact_source.get(contact_id, "") == target:

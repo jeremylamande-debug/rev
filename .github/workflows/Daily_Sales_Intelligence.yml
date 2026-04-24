@@ -40,9 +40,21 @@ jobs:
           # Emails are intentionally NOT filtered here — they are already
           # scoped by the OB Agent sequence (SEQUENCE_ID below).
           #
-          # ⚠️ CONFIRM THE PROPERTY NAME BEFORE RUNNING IN PRODUCTION:
-          LEAD_SOURCE_PROPERTY = "lead_source"  # HubSpot contact property internal name
-          LEAD_SOURCE_VALUE    = "Claude"       # exact value to match (case-insensitive)
+          # The script probes a list of candidate property internal names
+          # (Salesforce-synced Lead Source fields can live under different
+          # names in different HubSpot portals). For each contact it
+          # returns all of these, logs which ones have values, and matches
+          # on any candidate that equals LEAD_SOURCE_VALUE.
+          LEAD_SOURCE_CANDIDATES = [
+              "lead_source",
+              "leadsource",
+              "hs_lead_source",
+              "salesforce_lead_source",
+              "sf_lead_source",
+              "original_lead_source",
+              "lead_source_zapier",
+          ]
+          LEAD_SOURCE_VALUE = "Claude"  # exact value to match (case-insensitive)
           # Set LEAD_SOURCE_VALUE = None to disable the call filter entirely.
 
           # ── AE identity map ───────────────────────────────────────────
@@ -87,7 +99,7 @@ jobs:
               mode_label = "📞 *Daily Sales Recap* (Calls: Lead Source = Claude)"
           print(f"📅 Mode: {'Weekly' if is_weekly else 'Daily'} | Period: {day_label}")
           print(f"   start_ms={start_ms} | end_ms={end_ms}")
-          print(f"   Lead Source filter: {LEAD_SOURCE_PROPERTY} == {LEAD_SOURCE_VALUE!r}")
+          print(f"   Lead Source filter: any of {LEAD_SOURCE_CANDIDATES} == {LEAD_SOURCE_VALUE!r}")
 
           # ── Safe int coercion (HubSpot occasionally returns '1.0') ────
           def safe_int(v, default=0):
@@ -141,7 +153,7 @@ jobs:
 
           # ── Lead Source filter helper ─────────────────────────────────
           # Given a list of object IDs (calls or emails), return the subset
-          # whose associated contact has LEAD_SOURCE_PROPERTY == LEAD_SOURCE_VALUE.
+          # whose associated contact has any LEAD_SOURCE_CANDIDATES == LEAD_SOURCE_VALUE.
           # Objects with no associated contact are excluded.
           def filter_by_lead_source(object_type, object_ids):
               if not object_ids or LEAD_SOURCE_VALUE is None:
@@ -172,12 +184,13 @@ jobs:
                   time.sleep(0.2)
               if not obj_to_contact:
                   return set()
-              # Step 2: batch-fetch contacts with lead source property
+              # Step 2: batch-fetch contacts with ALL candidate properties
               unique_cids = list({cid for cid in obj_to_contact.values() if cid})
               print(f"     → {len(obj_to_contact)} {object_type} have a contact, "
                     f"{len(unique_cids)} unique contacts to look up")
-              contact_source = {}
-              diag_samples   = []  # keep first few raw values for debugging
+              # contact_sources: {contact_id: {candidate_name: lowered_value}}
+              contact_sources = {}
+              per_candidate_ok = {name: False for name in LEAD_SOURCE_CANDIDATES}
               for j in range(0, len(unique_cids), 100):
                   cid_batch = unique_cids[j:j+100]
                   try:
@@ -185,36 +198,74 @@ jobs:
                           "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
                           headers=HS_HEADERS,
                           json={"inputs": [{"id": cid} for cid in cid_batch],
-                                "properties": [LEAD_SOURCE_PROPERTY]},
+                                "properties": LEAD_SOURCE_CANDIDATES,
+                                "propertiesWithHistory": []},
                           timeout=30
                       ).json()
                   except Exception as e:
                       print(f"  ⚠️ Contact fetch error: {e}")
                       continue
-                  # Loud error if HubSpot returns an error payload
+                  # HubSpot returns 207 Multi-Status when some properties don't
+                  # exist — valid candidates come back, unknowns throw per-row
+                  # warnings but the call still succeeds.
                   if "status" in contacts_resp and contacts_resp.get("status") == "error":
-                      print(f"  ⚠️ HubSpot error fetching contacts with property "
-                            f"{LEAD_SOURCE_PROPERTY!r}: {contacts_resp.get('message')}")
-                      return set()
+                      msg = contacts_resp.get("message", "")
+                      print(f"  ⚠️ HubSpot error: {msg}")
+                      # Retry with the single candidate we're most confident exists
+                      # — the first one. That preserves some output instead of bailing.
+                      try:
+                          contacts_resp = requests.post(
+                              "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                              headers=HS_HEADERS,
+                              json={"inputs": [{"id": cid} for cid in cid_batch],
+                                    "properties": [LEAD_SOURCE_CANDIDATES[0]]},
+                              timeout=30
+                          ).json()
+                      except Exception as e:
+                          print(f"  ⚠️ Fallback fetch also failed: {e}")
+                          continue
                   for c in contacts_resp.get("results", []):
-                      raw = c.get("properties", {}).get(LEAD_SOURCE_PROPERTY)
-                      src = (raw or "").strip().lower()
-                      contact_source[c["id"]] = src
-                      if len(diag_samples) < 5:
-                          diag_samples.append((c["id"], raw))
+                      props = c.get("properties", {})
+                      per_contact = {}
+                      for name in LEAD_SOURCE_CANDIDATES:
+                          raw = props.get(name)
+                          if raw is not None:
+                              per_candidate_ok[name] = True
+                          per_contact[name] = (raw or "").strip().lower()
+                      contact_sources[c["id"]] = per_contact
                   time.sleep(0.2)
-              # Diagnostics: what did we actually see?
-              value_counts = {}
-              for v in contact_source.values():
-                  value_counts[v] = value_counts.get(v, 0) + 1
-              top_values = sorted(value_counts.items(), key=lambda kv: -kv[1])[:5]
-              print(f"     → Values seen for {LEAD_SOURCE_PROPERTY!r} "
-                    f"(top 5): {top_values}")
-              print(f"     → Sample contact lookups: {diag_samples}")
-              # Step 3: build allowed set
+
+              # Diagnostics: for each candidate, summarize value distribution
+              print(f"     → Candidate property value summaries:")
+              for name in LEAD_SOURCE_CANDIDATES:
+                  vc = {}
+                  for per in contact_sources.values():
+                      v = per.get(name, "")
+                      vc[v] = vc.get(v, 0) + 1
+                  non_blank = {k: v for k, v in vc.items() if k}
+                  top = sorted(non_blank.items(), key=lambda kv: -kv[1])[:5]
+                  marker = "✓" if per_candidate_ok[name] else " "
+                  print(f"        {marker} {name:<26} non-blank: {top or '—'}")
+
+              # Step 3: build allowed set — a contact qualifies if ANY candidate
+              # matches the target value.
+              matched_via = {}  # contact_id -> candidate name that matched (for diag)
               for obj_id, contact_id in obj_to_contact.items():
-                  if contact_source.get(contact_id, "") == target:
-                      allowed.add(obj_id)
+                  per = contact_sources.get(contact_id, {})
+                  for name in LEAD_SOURCE_CANDIDATES:
+                      if per.get(name, "") == target:
+                          allowed.add(obj_id)
+                          matched_via[contact_id] = name
+                          break
+              if matched_via:
+                  match_candidates = {}
+                  for cand in matched_via.values():
+                      match_candidates[cand] = match_candidates.get(cand, 0) + 1
+                  print(f"     → Matches found via candidate(s): {match_candidates}")
+              else:
+                  print(f"     → No candidate property on any contact equals "
+                        f"{LEAD_SOURCE_VALUE!r} — the field lives under a "
+                        f"name not yet in LEAD_SOURCE_CANDIDATES.")
               return allowed
 
           # ── Fetch HubSpot contact links for meeting-set calls ────────
@@ -295,7 +346,7 @@ jobs:
               allowed_call_ids = filter_by_lead_source("calls", call_ids)
               before = len(all_calls)
               all_calls = [c for c in all_calls if c["id"] in allowed_call_ids]
-              print(f"  🎯 Lead Source filter ({LEAD_SOURCE_PROPERTY}={LEAD_SOURCE_VALUE}): "
+              print(f"  🎯 Lead Source filter (value={LEAD_SOURCE_VALUE}): "
                     f"{before} → {len(all_calls)} calls")
 
           # ── Group calls by AE ─────────────────────────────────────────

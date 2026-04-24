@@ -18,7 +18,6 @@ jobs:
           pip install requests --quiet
           python3 - <<'EOF'
           import requests, json, os, re, time, datetime, calendar
-
           ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
           HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
@@ -30,9 +29,21 @@ jobs:
               "x-api-key": ANTHROPIC_KEY,
               "anthropic-version": "2023-06-01"
           }
-
           PORTAL_ID    = "21451281"
           SEQUENCE_ID  = "304238924"  # OB Agent sequence
+
+          # ── Outbound (Claude-sourced) filter — CALLS ONLY ─────────────
+          # Only calls whose associated HubSpot contact has
+          # Lead Source = Claude are counted. Calls with no associated
+          # contact are EXCLUDED (strict).
+          #
+          # Emails are intentionally NOT filtered here — they are already
+          # scoped by the OB Agent sequence (SEQUENCE_ID below).
+          #
+          # ⚠️ CONFIRM THE PROPERTY NAME BEFORE RUNNING IN PRODUCTION:
+          LEAD_SOURCE_PROPERTY = "lead_source"  # HubSpot contact property internal name
+          LEAD_SOURCE_VALUE    = "Claude"       # exact value to match (case-insensitive)
+          # Set LEAD_SOURCE_VALUE = None to disable the call filter entirely.
 
           # ── AE identity map ───────────────────────────────────────────
           AE_OWNERS = {
@@ -41,10 +52,8 @@ jobs:
               "89993866":  "James Gregory",
           }
           AE_ORDER = ["749290652", "87460084", "89993866"]
-
           # ── Aircall tag classification ────────────────────────────────
           MEETING_SET_GUID = "d62d6bbe-4f03-4e2d-81fa-faabcc26c819"  # fallback only
-
           def tag_emoji(tag):
               t = tag.lower()
               if "meeting set" in t or "interested (" in t:  return "📅"
@@ -53,18 +62,14 @@ jobs:
               if "wrong number" in t:                         return "❌"
               if "not connected" in t:                        return "🔴"
               return "⚪"
-
           def is_connected_tag(tag):
               return tag.lower().startswith("connected")
-
           def is_meeting_set_tag(tag):
               return "meeting set" in tag.lower() or "interested (" in tag.lower()
-
           # ── Date range logic ──────────────────────────────────────────
           now   = datetime.datetime.utcnow()
           today = now.replace(hour=0, minute=0, second=0, microsecond=0)
           is_weekly = (today.weekday() == 0)  # Monday
-
           if is_weekly:
               week_start = today - datetime.timedelta(days=7)
               week_end   = today - datetime.timedelta(days=2)
@@ -72,17 +77,26 @@ jobs:
               end_ms     = int(calendar.timegm(week_end.timetuple())   * 1000)
               day_label  = (f"Week of {week_start.strftime('%b %d')} – "
                             f"{(week_end - datetime.timedelta(days=1)).strftime('%b %d, %Y')}")
-              mode_label = "📊 *Weekly Sales Summary*"
+              mode_label = "📊 *Weekly Sales Summary* (Calls: Lead Source = Claude)"
           else:
               start_dt  = today - datetime.timedelta(days=1)
               end_dt    = today
               start_ms  = int(calendar.timegm(start_dt.timetuple()) * 1000)
               end_ms    = int(calendar.timegm(end_dt.timetuple())   * 1000)
               day_label = start_dt.strftime("%A, %b %d")
-              mode_label = "📞 *Daily Sales Recap*"
-
+              mode_label = "📞 *Daily Sales Recap* (Calls: Lead Source = Claude)"
           print(f"📅 Mode: {'Weekly' if is_weekly else 'Daily'} | Period: {day_label}")
           print(f"   start_ms={start_ms} | end_ms={end_ms}")
+          print(f"   Lead Source filter: {LEAD_SOURCE_PROPERTY} == {LEAD_SOURCE_VALUE!r}")
+
+          # ── Safe int coercion (HubSpot occasionally returns '1.0') ────
+          def safe_int(v, default=0):
+              if v is None or v == "":
+                  return default
+              try:
+                  return int(float(v))
+              except (ValueError, TypeError):
+                  return default
 
           # ── Claude helper ─────────────────────────────────────────────
           def claude(prompt, max_tokens=400):
@@ -103,11 +117,9 @@ jobs:
                       print(f"  Claude error attempt {attempt+1}: {e}")
                       time.sleep(5)
               return ""
-
           # ── Parse Aircall data from hs_call_body HTML ─────────────────
           def strip_html(html_str):
               return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html_str)).strip()
-
           def parse_aircall(body):
               if not body:
                   return {"tags": "", "comments": ""}
@@ -126,6 +138,65 @@ jobs:
               )
               comments = strip_html(comments_div.group(1)) if comments_div else ""
               return {"tags": tags, "comments": comments}
+
+          # ── Lead Source filter helper ─────────────────────────────────
+          # Given a list of object IDs (calls or emails), return the subset
+          # whose associated contact has LEAD_SOURCE_PROPERTY == LEAD_SOURCE_VALUE.
+          # Objects with no associated contact are excluded.
+          def filter_by_lead_source(object_type, object_ids):
+              if not object_ids or LEAD_SOURCE_VALUE is None:
+                  # Filter disabled — return all
+                  return set(str(o) for o in object_ids) if LEAD_SOURCE_VALUE is None else set()
+              allowed = set()
+              target  = LEAD_SOURCE_VALUE.strip().lower()
+              # Step 1: batch associations (calls/emails → contacts)
+              obj_to_contact = {}
+              for i in range(0, len(object_ids), 100):
+                  batch = object_ids[i:i+100]
+                  try:
+                      assoc_resp = requests.post(
+                          f"https://api.hubapi.com/crm/v3/associations/{object_type}/contacts/batch/read",
+                          headers=HS_HEADERS,
+                          json={"inputs": [{"id": str(oid)} for oid in batch]},
+                          timeout=30
+                      ).json()
+                  except Exception as e:
+                      print(f"  ⚠️ Association fetch error ({object_type}): {e}")
+                      continue
+                  for r in assoc_resp.get("results", []):
+                      obj_id = str(r.get("from", {}).get("id", ""))
+                      tos    = r.get("to", [])
+                      if tos and obj_id:
+                          # take first associated contact
+                          obj_to_contact[obj_id] = str(tos[0].get("id", ""))
+                  time.sleep(0.2)
+              if not obj_to_contact:
+                  return set()
+              # Step 2: batch-fetch contacts with lead source property
+              unique_cids = list({cid for cid in obj_to_contact.values() if cid})
+              contact_source = {}
+              for j in range(0, len(unique_cids), 100):
+                  cid_batch = unique_cids[j:j+100]
+                  try:
+                      contacts_resp = requests.post(
+                          "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                          headers=HS_HEADERS,
+                          json={"inputs": [{"id": cid} for cid in cid_batch],
+                                "properties": [LEAD_SOURCE_PROPERTY]},
+                          timeout=30
+                      ).json()
+                  except Exception as e:
+                      print(f"  ⚠️ Contact fetch error: {e}")
+                      continue
+                  for c in contacts_resp.get("results", []):
+                      src = (c.get("properties", {}).get(LEAD_SOURCE_PROPERTY) or "").strip().lower()
+                      contact_source[c["id"]] = src
+                  time.sleep(0.2)
+              # Step 3: build allowed set
+              for obj_id, contact_id in obj_to_contact.items():
+                  if contact_source.get(contact_id, "") == target:
+                      allowed.add(obj_id)
+              return allowed
 
           # ── Fetch HubSpot contact links for meeting-set calls ────────
           def get_meeting_contacts(call_ids):
@@ -165,7 +236,6 @@ jobs:
                       url  = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{contact_id}"
                       result.append((name, url))
               return result
-
           # ══════════════════════════════════════════════════════════════
           # SECTION 1 — CALL INTELLIGENCE
           # ══════════════════════════════════════════════════════════════
@@ -198,8 +268,16 @@ jobs:
                   break
               after = next_after
               time.sleep(0.3)
+          print(f"  ✅ {len(all_calls)} outbound calls found (pre-filter)")
 
-          print(f"  ✅ {len(all_calls)} outbound calls found")
+          # ── Apply Lead Source filter to calls ─────────────────────────
+          if LEAD_SOURCE_VALUE is not None:
+              call_ids = [c["id"] for c in all_calls]
+              allowed_call_ids = filter_by_lead_source("calls", call_ids)
+              before = len(all_calls)
+              all_calls = [c for c in all_calls if c["id"] in allowed_call_ids]
+              print(f"  🎯 Lead Source filter ({LEAD_SOURCE_PROPERTY}={LEAD_SOURCE_VALUE}): "
+                    f"{before} → {len(all_calls)} calls")
 
           # ── Group calls by AE ─────────────────────────────────────────
           ae_calls = {oid: [] for oid in AE_OWNERS}
@@ -207,7 +285,6 @@ jobs:
               oid = str(call["properties"].get("hubspot_owner_id") or "")
               if oid in ae_calls:
                   ae_calls[oid].append({"_call_id": call["id"], **call["properties"]})
-
           # ── Compute call metrics ──────────────────────────────────────
           def compute_call_metrics(calls):
               total = len(calls)
@@ -218,33 +295,27 @@ jobs:
               coaching_notes      = []
               meeting_set         = 0
               meeting_set_call_ids = []
-
               for c in calls:
                   disp_guid   = c.get("hs_call_disposition") or ""
-                  duration_ms = int(c.get("hs_call_duration") or 0)
+                  duration_ms = safe_int(c.get("hs_call_duration"))
                   body        = c.get("hs_call_body") or ""
-
                   aircall = parse_aircall(body)
                   tag     = aircall["tags"].strip() if aircall["tags"] else ""
                   tag_key = tag if tag else "(no tag)"
                   tag_counts[tag_key] = tag_counts.get(tag_key, 0) + 1
-
                   if is_meeting_set_tag(tag) or disp_guid == MEETING_SET_GUID:
                       meeting_set += 1
                       meeting_set_call_ids.append(c.get("_call_id", ""))
-
                   if is_connected_tag(tag):
                       if duration_ms > 0:
                           connected_durs.append(duration_ms / 1000)
                       if aircall["comments"]:
                           coaching_notes.append(aircall["comments"])
-
               connected    = sum(v for k, v in tag_counts.items() if is_connected_tag(k))
               wrong_num    = sum(v for k, v in tag_counts.items() if "wrong number" in k.lower())
               wrong_num_rt = round(wrong_num / total * 100) if total else 0
               avg_dur_sec  = int(sum(connected_durs) / len(connected_durs)) if connected_durs else 0
               tag_sorted   = sorted(tag_counts.items(), key=lambda x: -x[1])
-
               return {
                   "total":          total,
                   "connected":      connected,
@@ -257,7 +328,6 @@ jobs:
                   "coaching_notes":        coaching_notes[:10],
                   "meeting_set_call_ids":  [cid for cid in meeting_set_call_ids if cid],
               }
-
           call_metrics     = {}
           meeting_contacts = {}
           for oid in AE_ORDER:
@@ -272,7 +342,6 @@ jobs:
                       print(f"    📅 Meeting contacts: {[c[0] for c in contacts]}")
               else:
                   print(f"  {name}: 0 calls")
-
           # ── Claude call coaching ──────────────────────────────────────
           print(f"\n🧠 Generating call coaching insights...")
           coaching_insights = {}
@@ -282,10 +351,8 @@ jobs:
               if not m or not m["coaching_notes"]:
                   coaching_insights[oid] = ""
                   continue
-
               scope = "this week's" if is_weekly else "yesterday's"
               notes_block = "\n".join(f"- {n}" for n in m["coaching_notes"])
-
               if is_weekly:
                   prompt = (
                       f"You are a sales coach reviewing {scope} connected call notes for {name}, "
@@ -316,10 +383,8 @@ jobs:
                       f"🔧 **Area to Improve:** [one sentence]\n\n"
                       f"Be specific. Reference actual content from the notes."
                   )
-
               coaching_insights[oid] = claude(prompt, max_tokens=150 if not is_weekly else 200)
               time.sleep(1)
-
           # ══════════════════════════════════════════════════════════════
           # SECTION 2 — OB AGENT SEQUENCE (ID: 304238924)
           # Filter by owner + date range, then check hs_sequence_id
@@ -327,13 +392,14 @@ jobs:
           # ══════════════════════════════════════════════════════════════
           print(f"\n📧 Fetching OB Agent sequence emails from HubSpot...")
           print(f"   Sequence ID: {SEQUENCE_ID} | Range: {start_ms} – {end_ms}")
-
           seq_emails_sent    = {oid: 0 for oid in AE_OWNERS}
           seq_emails_bounced = {oid: 0 for oid in AE_OWNERS}
           seq_replies        = {oid: [] for oid in AE_OWNERS}
           seq_meetings       = {oid: [] for oid in AE_OWNERS}
           seq_email_ids_by_owner = {oid: [] for oid in AE_OWNERS}
-
+          # Buffer every sequence email row before aggregating (legacy from earlier
+          # two-pass design — kept for clarity even though no post-filter runs now).
+          all_seq_emails_raw = []  # list of (email_id, owner_id, status, reply_count)
           seq_after = None
           while True:
               payload = {
@@ -354,14 +420,11 @@ jobs:
                   "https://api.hubapi.com/crm/v3/objects/emails/search",
                   headers=HS_HEADERS, json=payload
               ).json()
-
               if "error" in resp or "status" in resp:
                   print(f"  ⚠️ Sequence query error: {resp}")
                   break
-
               results = resp.get("results", [])
               print(f"  Page: {len(results)} results | total: {resp.get('total', '?')}")
-
               for email in results:
                   props     = email["properties"]
                   oid       = str(props.get("hubspot_owner_id") or "")
@@ -369,27 +432,31 @@ jobs:
                   seq_id    = str(props.get("hs_sequence_id") or "")
                   if oid not in AE_OWNERS or direction == "INCOMING_EMAIL" or seq_id != SEQUENCE_ID:
                       continue
-                  status = (props.get("hs_email_status") or "").upper()
-                  if status == "BOUNCED":
-                      seq_emails_bounced[oid] += 1
-                  else:
-                      seq_emails_sent[oid] += 1
-                  reply_count = int(props.get("hs_email_reply_count") or 0)
-                  if reply_count > 0:
-                      seq_email_ids_by_owner[oid].append(email["id"])
-
+                  status      = (props.get("hs_email_status") or "").upper()
+                  reply_count = safe_int(props.get("hs_email_reply_count"))
+                  all_seq_emails_raw.append((email["id"], oid, status, reply_count))
               next_after = resp.get("paging", {}).get("next", {}).get("after")
               if not next_after:
                   break
               seq_after = next_after
               time.sleep(0.3)
 
+          # ── Aggregate sequence email stats ────────────────────────────
+          # NOTE: emails are NOT Lead-Source-filtered — the OB Agent sequence
+          # scope above (hs_sequence_id == SEQUENCE_ID) is the source of truth.
+          for email_id, oid, status, reply_count in all_seq_emails_raw:
+              if status == "BOUNCED":
+                  seq_emails_bounced[oid] += 1
+              else:
+                  seq_emails_sent[oid] += 1
+              if reply_count > 0:
+                  seq_email_ids_by_owner[oid].append(email_id)
+
           total_seq_sent    = sum(seq_emails_sent.values())
           total_seq_bounced = sum(seq_emails_bounced.values())
           print(f"  ✅ {total_seq_sent} sent | {total_seq_bounced} bounced")
           for oid in AE_ORDER:
               print(f"    {AE_OWNERS[oid]}: sent={seq_emails_sent[oid]} bounced={seq_emails_bounced[oid]}")
-
           # ── Fetch contacts linked to replied emails ───────────────────
           def get_contacts_for_emails(email_ids):
               if not email_ids:
@@ -420,12 +487,10 @@ jobs:
                   url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
                   result.append((name, url))
               return result
-
           for oid in AE_ORDER:
               if seq_email_ids_by_owner[oid]:
                   seq_replies[oid] = get_contacts_for_emails(seq_email_ids_by_owner[oid])
                   print(f"  {AE_OWNERS[oid]} replies: {[c[0] for c in seq_replies[oid]]}")
-
           # ── Check for meetings booked via sequence ────────────────────
           all_replied_email_ids = [eid for ids in seq_email_ids_by_owner.values() for eid in ids]
           if all_replied_email_ids:
@@ -450,10 +515,10 @@ jobs:
                   direction = (props.get("hs_email_direction") or "").upper()
                   if oid in AE_OWNERS and direction == "INCOMING_EMAIL" and "accepted:" in subject:
                       mtg_email_ids_by_owner[oid].append(email["id"])
+
               for oid in AE_ORDER:
                   if mtg_email_ids_by_owner[oid]:
                       seq_meetings[oid] = get_contacts_for_emails(mtg_email_ids_by_owner[oid])
-
           # ══════════════════════════════════════════════════════════════
           # BUILD SLACK MESSAGE
           # ══════════════════════════════════════════════════════════════
@@ -462,19 +527,15 @@ jobs:
           total_meetings = sum((call_metrics[o]["meeting_set"] if call_metrics[o] else 0) for o in AE_ORDER)
           team_conn_rate = round(total_conn    / total_calls * 100) if total_calls else 0
           team_mtg_rate  = round(total_meetings/ total_calls * 100) if total_calls else 0
-
           lines = [f"{mode_label} — {day_label}\n"]
-
           # ── Call section ──────────────────────────────────────────────
           lines.append("📞 *Calls*")
           for oid in AE_ORDER:
               name = AE_OWNERS[oid]
               m    = call_metrics.get(oid)
-
               if not m:
                   lines.append(f"*{name}* — 0 calls logged\n")
                   continue
-
               summary_parts = [f"Connect rate: *{m['connect_rate']}%*"]
               if m["meeting_set"]:
                   summary_parts.append(f"📅 {m['meeting_set']} mtg{'s' if m['meeting_set'] != 1 else ''} set")
@@ -482,20 +543,16 @@ jobs:
                   d = m["avg_dur_sec"]
                   summary_parts.append(f"⏱ Avg connected: {d // 60}m {d % 60}s")
               lines.append(f"*{name}* — {m['total']} calls  |  {'  |  '.join(summary_parts)}")
-
               for tag, count in m["tag_sorted"]:
                   pct   = round(count / m["total"] * 100)
                   emoji = tag_emoji(tag)
                   lines.append(f"  {emoji} _{tag}_: {count} ({pct}%)")
-
               contacts = meeting_contacts.get(oid, [])
               if contacts:
                   contact_links = "  ".join(f"<{url}|{cname}>" for cname, url in contacts)
                   lines.append(f"  📅 Meeting set: {contact_links}")
-
               if m["wrong_num_rate"] >= 20:
                   lines.append(f"  ⚠️ *High wrong-number rate ({m['wrong_num_rate']}%)* — refresh phone data for {name}'s counties")
-
               insight = coaching_insights.get(oid, "")
               if insight:
                   lines.append(f"\n  _Coaching:_\n")
@@ -505,14 +562,12 @@ jobs:
                       else:
                           lines.append("")
               lines.append("")
-
           # ── Totals ────────────────────────────────────────────────────
           total_seq_replies  = sum(len(seq_replies[o])  for o in AE_ORDER)
           total_seq_meetings = sum(len(seq_meetings[o]) for o in AE_ORDER)
           total_seq_bounced_all = sum(seq_emails_bounced[o] for o in AE_ORDER)
           total_seq_all      = total_seq_sent + total_seq_bounced_all
           team_bounce_rate   = round(total_seq_bounced_all / total_seq_all * 100) if total_seq_all else 0
-
           if total_calls:
               lines.append(
                   f"{'📊 *Weekly Totals*' if is_weekly else '📊 *Totals*'}: "
@@ -522,7 +577,6 @@ jobs:
               )
           else:
               lines.append("_No outbound activity logged for this period._")
-
           if total_seq_all:
               lines.append(
                   f"{'📧 *Weekly Email Totals*' if is_weekly else '📧 *Email Totals*'}: "
@@ -531,9 +585,7 @@ jobs:
                   f"{total_seq_replies} {'reply' if total_seq_replies == 1 else 'replies'}  |  "
                   f"{total_seq_meetings} meeting{'s' if total_seq_meetings != 1 else ''} scheduled"
               )
-
           lines.append("")
-
           # ── Sequence section ──────────────────────────────────────────
           lines.append("📧 *OB Agent Sequence*")
           for oid in AE_ORDER:
@@ -542,36 +594,28 @@ jobs:
               bounced  = seq_emails_bounced[oid]
               replies  = seq_replies.get(oid, [])
               meetings = seq_meetings.get(oid, [])
-
               if sent == 0 and bounced == 0:
                   lines.append(f"*{name}* — 0 emails sent\n")
                   continue
-
               total_emails = sent + bounced
               bounce_pct   = round(bounced / total_emails * 100) if total_emails else 0
               parts = [f"*{sent}* email{'s' if sent != 1 else ''} sent"]
               if bounced:
                   parts.append(f"{bounced} bounced ({bounce_pct}%)")
               lines.append(f"*{name}* — {' | '.join(parts)}")
-
               if replies:
                   reply_links = "  ".join(f"<{url}|{cname}>" for cname, url in replies)
                   lines.append(f"  💬 {'Reply' if len(replies) == 1 else 'Replies'}: {reply_links}")
               else:
                   lines.append(f"  💬 0 replies")
-
               if meetings:
                   mtg_links = "  ".join(f"<{url}|{cname}>" for cname, url in meetings)
                   lines.append(f"  📅 Meeting booked: {mtg_links}")
               else:
                   lines.append(f"  📅 0 meetings scheduled")
-
               lines.append("")
-
-          lines.append(f"\n_Generated {now.strftime('%Y-%m-%d %H:%M UTC')}_")
-
+          lines.append(f"\n_Generated {now.strftime('%Y-%m-%d %H:%M UTC')} · Calls filtered to Lead Source = {LEAD_SOURCE_VALUE} · Emails scoped to OB Agent sequence_")
           slack_text = "\n".join(lines)
-
           # ── Post to Slack ─────────────────────────────────────────────
           r = requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS,

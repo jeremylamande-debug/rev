@@ -121,11 +121,15 @@ jobs:
           short_names = [s.split()[0] for s in SELLERS]
 
           # ── Fetch QMH meetings ────────────────────────────────────
-          # Internal outcome value matches the UI label "Held Qualified".
+          # NOTE: HubSpot's internal value for this custom outcome is uppercase
+          # ("HELD QUALIFIED") even though the UI displays "Held Qualified".
+          # Enum filters on the Search API are case-sensitive on internal value —
+          # do not change this string without verifying via a direct GET on a
+          # known QMH meeting record.
           def fetch_qmh_meetings(start_ms, end_ms):
               return hs_post_all("/crm/v3/objects/meetings/search", {
                   "filterGroups": [{"filters": [
-                      {"propertyName": "hs_meeting_outcome",  "operator": "EQ",  "value": "Held Qualified"},
+                      {"propertyName": "hs_meeting_outcome",  "operator": "EQ",  "value": "HELD QUALIFIED"},
                       {"propertyName": "hs_activity_type",    "operator": "EQ",  "value": "Intro/Discovery"},
                       {"propertyName": "hs_meeting_end_time", "operator": "GTE", "value": str(start_ms)},
                       {"propertyName": "hs_meeting_end_time", "operator": "LTE", "value": str(end_ms)},

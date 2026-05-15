@@ -31,8 +31,10 @@ jobs:
           }
           SELLERS = list(AE_BUCKETS.keys())
 
-          # Legal Industry Group values — these mirror the HubSpot dashboard filter.
-          LEGAL_INDUSTRIES = {"government", "legal", "law enforcement"}
+          # Legal Industry Group tokens — substring match (case-insensitive).
+          # Mirrors HubSpot dashboard behavior where e.g. "Legal Services"
+          # is counted as Legal.
+          LEGAL_INDUSTRY_TOKENS = ["government", "legal", "law enforcement"]
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -78,23 +80,15 @@ jobs:
               return all_results
 
           # ── Discover the Industry Group property API name ─────────
-          # HubSpot's UI label "Industry Group" can map to different
-          # internal property names across portals (industry_group,
-          # hs_industry_group, a Salesforce-synced name, etc.). We
-          # scan the contact property definitions for any property
-          # whose label matches.
           def discover_industry_property():
               try:
                   resp = hs_get("/crm/v3/properties/contacts")
-                  props = resp.get("results", [])
-                  # Exact label match wins
-                  for p in props:
+                  for p in resp.get("results", []):
                       if (p.get("label") or "").strip().lower() == "industry group":
                           return p["name"]
-                  # Looser fallback: label contains both "industry" and "group"
-                  for p in props:
-                      label = (p.get("label") or "").lower()
-                      if "industry" in label and "group" in label:
+                  for p in resp.get("results", []):
+                      lbl = (p.get("label") or "").lower()
+                      if "industry" in lbl and "group" in lbl:
                           return p["name"]
               except Exception as e:
                   print(f"⚠️ Industry property discovery failed: {e}")
@@ -102,13 +96,8 @@ jobs:
 
           INDUSTRY_PROP = discover_industry_property()
           print(f"Discovered Industry Group property: {INDUSTRY_PROP!r}")
-
-          # Build a candidate list — discovered first, then common fallbacks,
-          # then the Salesforce-synced name we know is in use (industry_group__c).
-          # We fetch all of them per contact and use whichever has a value.
           _candidates = [INDUSTRY_PROP, "industry_group__c", "industry_group", "hs_industry_group", "industry"]
-          INDUSTRY_PROP_CANDIDATES = [c for c in _candidates if c]
-          INDUSTRY_PROP_CANDIDATES = list(dict.fromkeys(INDUSTRY_PROP_CANDIDATES))  # dedupe
+          INDUSTRY_PROP_CANDIDATES = list(dict.fromkeys([c for c in _candidates if c]))
           print(f"Will read industry candidates: {INDUSTRY_PROP_CANDIDATES}")
 
           # ── Get owners ─────────────────────────────────────────────
@@ -172,17 +161,19 @@ jobs:
               })
 
           # ── Caches ────────────────────────────────────────────────
-          meeting_to_contact_id    = {}  # meeting_id -> contact_id
-          meeting_to_contact_owner = {}  # meeting_id -> owner_id
-          contact_info             = {}  # contact_id -> {name, industry_field, industry_value}
+          # NOTE: We now keep ALL associated contacts per meeting, not just
+          # contacts[0]. HubSpot's associations API doesn't guarantee any
+          # specific contact order, so picking only the first was missing
+          # the actual decision-maker contact on many meetings.
+          meeting_to_contact_ids = {}  # meeting_id -> [contact_id, ...]
+          contact_info           = {}  # contact_id -> {name, owner_id, industry_field, industry_value}
 
           def hydrate_meeting_attributions(meeting_ids):
-              uncached = [str(mid) for mid in meeting_ids if str(mid) not in meeting_to_contact_id]
+              uncached = [str(mid) for mid in meeting_ids if str(mid) not in meeting_to_contact_ids]
               if not uncached:
                   return
 
-              # Step 1: meeting → contacts associations (batched)
-              meeting_to_first_contact = {}
+              # Step 1: meeting → ALL contacts (batched)
               for i in range(0, len(uncached), 100):
                   batch = uncached[i:i+100]
                   try:
@@ -196,20 +187,22 @@ jobs:
                   for r in resp.get("results", []):
                       mid = str(r.get("from", {}).get("id", ""))
                       tos = r.get("to", [])
-                      if mid and tos:
-                          meeting_to_first_contact[mid] = str(tos[0].get("id", ""))
+                      cids = [str(t.get("id", "")) for t in tos if t.get("id")]
+                      if mid:
+                          meeting_to_contact_ids[mid] = cids
                   time.sleep(0.2)
 
+              # Initialize empty for meetings with no contacts
               for mid in uncached:
-                  meeting_to_contact_id[mid]    = ""
-                  meeting_to_contact_owner[mid] = ""
+                  if mid not in meeting_to_contact_ids:
+                      meeting_to_contact_ids[mid] = []
 
-              # Step 2: batch-fetch contact owner + name + industry candidates
-              unique_cids = list({c for c in meeting_to_first_contact.values() if c})
-              cid_to_owner = {}
+              # Step 2: batch-fetch info for any new contact IDs
+              all_cids_needed = {cid for cids in meeting_to_contact_ids.values() for cid in cids}
+              uncached_cids   = [cid for cid in all_cids_needed if cid not in contact_info]
               fetch_props = ["hubspot_owner_id", "firstname", "lastname"] + INDUSTRY_PROP_CANDIDATES
-              for j in range(0, len(unique_cids), 100):
-                  cid_batch = unique_cids[j:j+100]
+              for j in range(0, len(uncached_cids), 100):
+                  cid_batch = uncached_cids[j:j+100]
                   try:
                       resp = hs_post(
                           "/crm/v3/objects/contacts/batch/read",
@@ -222,11 +215,9 @@ jobs:
                   for c in resp.get("results", []):
                       props = c.get("properties", {})
                       cid   = c["id"]
-                      cid_to_owner[cid] = (props.get("hubspot_owner_id") or "")
                       fn = (props.get("firstname") or "").strip()
                       ln = (props.get("lastname") or "").strip()
                       name = f"{fn} {ln}".strip() or f"Contact {cid}"
-                      # Pick first non-empty industry candidate
                       industry_field = ""
                       industry_value = ""
                       for cand in INDUSTRY_PROP_CANDIDATES:
@@ -237,65 +228,63 @@ jobs:
                               break
                       contact_info[cid] = {
                           "name":           name,
+                          "owner_id":       props.get("hubspot_owner_id") or "",
                           "industry_field": industry_field,
                           "industry_value": industry_value,
                       }
                   time.sleep(0.2)
 
-              for mid, cid in meeting_to_first_contact.items():
-                  meeting_to_contact_id[mid]    = cid
-                  meeting_to_contact_owner[mid] = cid_to_owner.get(cid, "")
-
-          # ── Build per-AE QMH counts with Legal industry filter ────
-          # Legal-bucket AEs: only count contacts whose industry_value
-          # ∈ LEGAL_INDUSTRIES (mirrors HubSpot dashboard).
-          # Core-bucket AEs: count all (no industry filter applied).
-          # Dedup by contact_id within each owner.
+          # ── Industry matching (substring, case-insensitive) ──────
           def is_legal_industry(info):
-              return (info.get("industry_value") or "").strip().lower() in LEGAL_INDUSTRIES
+              val = (info.get("industry_value") or "").strip().lower()
+              if not val: return False
+              return any(token in val for token in LEGAL_INDUSTRY_TOKENS)
 
+          # ── Build per-AE QMH counts (scan ALL contacts per meeting) ─
           def build_qmh_counts(meetings):
               hydrate_meeting_attributions([m["id"] for m in meetings])
               contacts_seen     = {s: set() for s in SELLERS}
               included_contacts = {s: []   for s in SELLERS}
-              excluded_contacts = {s: []   for s in SELLERS}  # diagnostic only
-              raw_attributed    = 0
+              excluded_seen     = {s: set() for s in SELLERS}
+              excluded_contacts = {s: []   for s in SELLERS}
+
               for m in meetings:
                   mid = str(m["id"])
-                  cid = meeting_to_contact_id.get(mid, "")
-                  oid = meeting_to_contact_owner.get(mid, "")
-                  owner_name = id_to_name.get(oid, "")
-                  if owner_name not in SELLERS or not cid:
-                      continue
-                  raw_attributed += 1
-                  if cid in contacts_seen[owner_name]:
-                      continue  # already counted this contact
+                  for cid in meeting_to_contact_ids.get(mid, []):
+                      info = contact_info.get(cid)
+                      if not info:
+                          continue
+                      owner_name = id_to_name.get(info["owner_id"], "")
+                      if owner_name not in SELLERS:
+                          continue
+                      bucket   = AE_BUCKETS.get(owner_name)
+                      enriched = {"id": cid, **info}
 
-                  info = contact_info.get(cid, {"name": f"Contact {cid}",
-                                                "industry_field": "", "industry_value": ""})
-                  bucket = AE_BUCKETS.get(owner_name, "")
-                  enriched = {"id": cid, **info}
+                      # Legal-bucket AEs: filter by Legal industry tokens
+                      if bucket == "Legal" and not is_legal_industry(info):
+                          if cid not in excluded_seen[owner_name] and cid not in contacts_seen[owner_name]:
+                              excluded_seen[owner_name].add(cid)
+                              excluded_contacts[owner_name].append(enriched)
+                          continue
 
-                  if bucket == "Legal" and not is_legal_industry(info):
-                      excluded_contacts[owner_name].append(enriched)
-                      continue
+                      if cid in contacts_seen[owner_name]:
+                          continue
+                      contacts_seen[owner_name].add(cid)
+                      included_contacts[owner_name].append(enriched)
 
-                  contacts_seen[owner_name].add(cid)
-                  included_contacts[owner_name].append(enriched)
               counts = {s: len(contacts_seen[s]) for s in SELLERS}
-              return counts, included_contacts, excluded_contacts, raw_attributed
+              return counts, included_contacts, excluded_contacts
 
           print("Fetching daily QMH meetings...")
           daily_meetings = fetch_qmh_meetings(start_ms, end_ms)
-          print(f"Daily QMH meetings found (pre-attribution): {len(daily_meetings)}")
-          daily_qmh, daily_included, daily_excluded, daily_raw = build_qmh_counts(daily_meetings)
+          print(f"Daily QMH meetings found: {len(daily_meetings)}")
+          daily_qmh, daily_included, daily_excluded = build_qmh_counts(daily_meetings)
 
           print("Fetching MTD QMH meetings...")
           mtd_meetings = fetch_qmh_meetings(mtd_start_ms, now_ms)
-          print(f"MTD QMH meetings found (pre-attribution): {len(mtd_meetings)}")
-          mtd_qmh, mtd_included, mtd_excluded, mtd_raw = build_qmh_counts(mtd_meetings)
+          print(f"MTD QMH meetings found: {len(mtd_meetings)}")
+          mtd_qmh, mtd_included, mtd_excluded = build_qmh_counts(mtd_meetings)
 
-          # Bucket totals
           def bucket_total(counts, bucket):
               return sum(c for s, c in counts.items() if AE_BUCKETS.get(s) == bucket)
 
@@ -305,9 +294,7 @@ jobs:
           mtd_core_total    = bucket_total(mtd_qmh,   "Core")
           mtd_excluded_total = sum(len(v) for v in mtd_excluded.values())
           print(f"MTD — Legal {mtd_legal_total}, Core {mtd_core_total} | "
-                f"raw attributed {mtd_raw} | "
-                f"excluded (non-Legal industry on Legal AE): {mtd_excluded_total} | "
-                f"unattributed (no SELLER contact owner): {len(mtd_meetings) - mtd_raw}")
+                f"excluded (non-Legal industry on Legal AE): {mtd_excluded_total}")
 
           # ── Build Slack message ───────────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"
@@ -360,10 +347,7 @@ jobs:
               url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
               val   = c.get("industry_value") or ""
               field = c.get("industry_field") or ""
-              if val:
-                  tag = f"{field}: `{val}`"
-              else:
-                  tag = "_no industry property set_"
+              tag   = f"{field}: `{val}`" if val else "_no industry property set_"
               return f"  {marker} <{url}|{c['name']}> — {tag}"
 
           def render_contact_list(included, excluded):
@@ -387,14 +371,12 @@ jobs:
                   lines.append("")
               return "\n".join(lines)
 
-          # QMH — Yesterday
           msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified · Industry-filtered · unique contacts by owner)*\n"
           msg += f"*Legal: {daily_legal_total}  ·  Core: {daily_core_total}  ·  Total: {daily_legal_total + daily_core_total}*\n"
           msg += render_qmh_table(daily_qmh) + "\n"
           d = render_contact_list(daily_included, daily_excluded)
           if d.strip(): msg += d + "\n"
 
-          # QMH — MTD
           msg += f"*📅 QMH — MTD (Month to Date · Industry-filtered · unique contacts by owner)*\n"
           msg += f"*Legal: {mtd_legal_total}  ·  Core: {mtd_core_total}  ·  Total: {mtd_legal_total + mtd_core_total}*\n"
           msg += render_qmh_table(mtd_qmh) + "\n"

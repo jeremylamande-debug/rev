@@ -20,7 +20,6 @@ jobs:
           SLACK_CHANNEL = "C0APDRMLN1Z"  # #daily-sales
           SLACK_USER    = "U08JJMM2QSW"
           PORTAL_ID     = "21451281"
-
           # ── Rep roster & bucket membership ────────────────────────
           # An AE can belong to multiple buckets (Will sells to both
           # Legal and Core verticals). Each QMH counts toward whichever
@@ -33,22 +32,18 @@ jobs:
               "Isabella Simpatico": ["Core"],
           }
           SELLERS = list(AE_BUCKETS.keys())
-
           # Display order for each bucket's bar chart.
           BUCKET_AE_ORDER = {
               "Legal": ["Dillon DeWitt", "James Gregory", "Mike Merritts", "Will Weis"],
               "Core":  ["Isabella Simpatico", "Will Weis"],
           }
-
           # Industry tokens — substring match, case-insensitive.
           # Legal takes precedence when both sets contain a hit.
           LEGAL_INDUSTRY_TOKENS = ["government", "legal", "law enforcement"]
           CORE_INDUSTRY_TOKENS  = ["marketing", "technology", "finance", "consulting", "media",
                                   "healthcare", "content creation", "education", "research", "other"]
-
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
-
           # ── Date ranges ───────────────────────────────────────────
           et        = pytz.timezone("America/New_York")
           now_et    = datetime.datetime.now(et)
@@ -61,19 +56,16 @@ jobs:
           mtd_start = et.localize(datetime.datetime(now_et.year, now_et.month, 1, 0, 0, 0))
           mtd_start_ms = int(mtd_start.timestamp() * 1000)
           now_ms    = int(now_et.timestamp() * 1000)
-
           # ── HubSpot helpers ────────────────────────────────────────
           def hs_get(path):
               req = urllib.request.Request(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
-
           def hs_post(path, payload):
               data = json.dumps(payload).encode()
               req  = urllib.request.Request(
                   f"https://api.hubapi.com{path}",
                   data=data, headers=HS_HEADERS, method="POST")
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
-
           def hs_post_all(path, payload, limit=100):
               all_results = []
               offset = 0
@@ -88,7 +80,6 @@ jobs:
                   if not offset or len(results) < limit:
                       break
               return all_results
-
           # ── Discover the Industry Group property API name ─────────
           def discover_industry_property():
               try:
@@ -103,20 +94,17 @@ jobs:
               except Exception as e:
                   print(f"⚠️ Industry property discovery failed: {e}")
               return None
-
           INDUSTRY_PROP = discover_industry_property()
           print(f"Discovered Industry Group property: {INDUSTRY_PROP!r}")
           _candidates = [INDUSTRY_PROP, "industry_group__c", "industry_group", "hs_industry_group", "industry"]
           INDUSTRY_PROP_CANDIDATES = list(dict.fromkeys([c for c in _candidates if c]))
           print(f"Will read industry candidates: {INDUSTRY_PROP_CANDIDATES}")
-
           # ── Get owners ─────────────────────────────────────────────
           owners     = hs_get("/crm/v3/owners").get("results", [])
           owner_map  = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           id_to_name = {o["id"]: f"{o['firstName']} {o['lastName']}" for o in owners}
           seller_ids = {name: owner_map.get(name) for name in SELLERS}
           print(f"Seller IDs: {seller_ids}")
-
           # ── Fetch yesterday's deals ────────────────────────────────
           deals = hs_post("/crm/v3/objects/deals/search", {
               "filterGroups": [{"filters": [
@@ -128,19 +116,16 @@ jobs:
                              "dealstage", "hubspot_owner_id", "hs_createdate"],
               "limit": 100
           }).get("results", [])
-
           # ── Helpers ────────────────────────────────────────────────
           def fmt_currency(val):
               try: return f"${float(val):,.0f}"
               except: return "$0"
-
           def fmt_date(iso):
               if not iso: return "—"
               try:
                   d = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
                   return d.strftime("%b %d, %Y")
               except: return iso
-
           # ── Map deals to sellers (by deal owner) ───────────────────
           seller_deals = {s: [] for s in SELLERS}
           for deal in deals:
@@ -153,7 +138,6 @@ jobs:
           total_acv   = sum(float(d.get("amount") or 0) for v in seller_deals.values() for d in v)
           acv_vals    = [sum(float(d.get("amount") or 0) for d in seller_deals[s]) for s in SELLERS]
           short_names = [s.split()[0] for s in SELLERS]
-
           # ── Fetch QMH meetings ────────────────────────────────────
           def fetch_qmh_meetings(start_ms, end_ms):
               return hs_post_all("/crm/v3/objects/meetings/search", {
@@ -166,11 +150,11 @@ jobs:
                   "properties": ["hs_meeting_outcome", "hs_activity_type",
                                  "hs_meeting_end_time", "hubspot_owner_id"],
               })
-
           # ── Caches ────────────────────────────────────────────────
           meeting_to_contact_ids = {}  # meeting_id -> [contact_id, ...]
           contact_info           = {}  # contact_id -> {name, owner_id, industry_field, industry_value}
-
+          contact_to_company_ids = {}  # contact_id -> [company_id, ...]
+          company_info           = {}  # company_id -> {name}
           def hydrate_meeting_attributions(meeting_ids):
               uncached = [str(mid) for mid in meeting_ids if str(mid) not in meeting_to_contact_ids]
               if not uncached:
@@ -194,7 +178,6 @@ jobs:
               for mid in uncached:
                   if mid not in meeting_to_contact_ids:
                       meeting_to_contact_ids[mid] = []
-
               all_cids_needed = {cid for cids in meeting_to_contact_ids.values() for cid in cids}
               uncached_cids   = [cid for cid in all_cids_needed if cid not in contact_info]
               fetch_props = ["hubspot_owner_id", "firstname", "lastname"] + INDUSTRY_PROP_CANDIDATES
@@ -230,7 +213,51 @@ jobs:
                           "industry_value": industry_value,
                       }
                   time.sleep(0.2)
-
+          def hydrate_contact_companies(contact_ids):
+              """Fetch contact→company associations and company names for the
+              given contact IDs. Used for the Yesterday section only."""
+              uncached = [str(cid) for cid in contact_ids if str(cid) not in contact_to_company_ids]
+              if not uncached:
+                  return
+              for i in range(0, len(uncached), 100):
+                  batch = uncached[i:i+100]
+                  try:
+                      resp = hs_post(
+                          "/crm/v3/associations/contacts/companies/batch/read",
+                          {"inputs": [{"id": cid} for cid in batch]}
+                      )
+                  except Exception as e:
+                      print(f"  ⚠️ contact→company assoc error: {e}")
+                      continue
+                  for r in resp.get("results", []):
+                      cid = str(r.get("from", {}).get("id", ""))
+                      coids = [str(t.get("id", "")) for t in r.get("to", []) if t.get("id")]
+                      if cid:
+                          contact_to_company_ids[cid] = coids
+                  time.sleep(0.2)
+              for cid in uncached:
+                  if cid not in contact_to_company_ids:
+                      contact_to_company_ids[cid] = []
+              all_coids_needed = {coid for coids in contact_to_company_ids.values() for coid in coids}
+              uncached_coids   = [coid for coid in all_coids_needed if coid not in company_info]
+              for j in range(0, len(uncached_coids), 100):
+                  coid_batch = uncached_coids[j:j+100]
+                  try:
+                      resp = hs_post(
+                          "/crm/v3/objects/companies/batch/read",
+                          {"inputs": [{"id": coid} for coid in coid_batch],
+                           "properties": ["name"]}
+                      )
+                  except Exception as e:
+                      print(f"  ⚠️ company batch read error: {e}")
+                      continue
+                  for co in resp.get("results", []):
+                      props = co.get("properties", {})
+                      coid  = co["id"]
+                      company_info[coid] = {
+                          "name": (props.get("name") or "").strip() or f"Company {coid}",
+                      }
+                  time.sleep(0.2)
           # ── Industry → bucket classification ──────────────────────
           # Legal takes precedence if a value matches both sets.
           def classify_bucket(info):
@@ -242,21 +269,17 @@ jobs:
               if any(t in val for t in CORE_INDUSTRY_TOKENS):
                   return "Core"
               return None
-
           # ── Build per-(AE, bucket) QMH counts ─────────────────────
           def build_qmh_counts(meetings):
               hydrate_meeting_attributions([m["id"] for m in meetings])
-
               # All (seller, bucket) pairs that are valid
               valid_keys = [(s, b) for s, buckets in AE_BUCKETS.items() for b in buckets]
               contacts_seen     = {k: set() for k in valid_keys}
               included_contacts = {k: []   for k in valid_keys}
-
               # Excluded list is per-seller (contacts that don't match any of
               # their AE's buckets)
               excluded_contacts = {s: [] for s in SELLERS}
               excluded_seen     = {s: set() for s in SELLERS}
-
               for m in meetings:
                   mid = str(m["id"])
                   for cid in meeting_to_contact_ids.get(mid, []):
@@ -266,11 +289,9 @@ jobs:
                       owner_name = id_to_name.get(info["owner_id"], "")
                       if owner_name not in SELLERS:
                           continue
-
                       ae_buckets       = AE_BUCKETS.get(owner_name, [])
                       contact_bucket   = classify_bucket(info)
                       enriched         = {"id": cid, **info}
-
                       if contact_bucket not in ae_buckets:
                           # Contact's industry doesn't fall into any of this
                           # AE's assigned buckets — exclude.
@@ -281,39 +302,39 @@ jobs:
                               excluded_seen[owner_name].add(cid)
                               excluded_contacts[owner_name].append(enriched)
                           continue
-
                       key = (owner_name, contact_bucket)
                       if cid in contacts_seen[key]:
                           continue
                       contacts_seen[key].add(cid)
                       included_contacts[key].append(enriched)
-
               return contacts_seen, included_contacts, excluded_contacts
-
           print("Fetching daily QMH meetings...")
           daily_meetings = fetch_qmh_meetings(start_ms, end_ms)
           print(f"Daily QMH meetings found: {len(daily_meetings)}")
           daily_seen, daily_included, daily_excluded = build_qmh_counts(daily_meetings)
-
+          # Hydrate company associations for yesterday's QMH contacts only.
+          daily_contact_ids = set()
+          for cids in daily_included.values():
+              daily_contact_ids.update(c["id"] for c in cids)
+          for cids in daily_excluded.values():
+              daily_contact_ids.update(c["id"] for c in cids)
+          print(f"Hydrating companies for {len(daily_contact_ids)} daily QMH contact(s)...")
+          hydrate_contact_companies(daily_contact_ids)
           print("Fetching MTD QMH meetings...")
           mtd_meetings = fetch_qmh_meetings(mtd_start_ms, now_ms)
           print(f"MTD QMH meetings found: {len(mtd_meetings)}")
           mtd_seen, mtd_included, mtd_excluded = build_qmh_counts(mtd_meetings)
-
           def bucket_total(seen, bucket):
               return sum(len(v) for (s, b), v in seen.items() if b == bucket)
-
           daily_legal_total = bucket_total(daily_seen, "Legal")
           daily_core_total  = bucket_total(daily_seen, "Core")
           mtd_legal_total   = bucket_total(mtd_seen,   "Legal")
           mtd_core_total    = bucket_total(mtd_seen,   "Core")
           print(f"MTD — Legal {mtd_legal_total}, Core {mtd_core_total}")
-
           # ── Build Slack message ───────────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*📊 Daily Pipe Update — {date_label}*\n"
           msg += f"*{total_deals} new deal{'s' if total_deals != 1 else ''} | Total ACV: {fmt_currency(total_acv)}*\n\n"
-
           for seller in SELLERS:
               sd = seller_deals[seller]
               if not sd:
@@ -331,7 +352,6 @@ jobs:
                       url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-3/{did}"
                       msg  += f"<{url}|{name}>\n{amt} | ICP: {icp} | {dtype} | Close: {close}\n"
                   msg += "\n"
-
           msg += "```\n"
           msg += f"{'Rep':<12} {'ACV':>10}  Chart\n"
           msg += "─" * 45 + "\n"
@@ -340,7 +360,6 @@ jobs:
               bar = "█" * int((val / max_acv) * 20)
               msg += f"{name:<12} {fmt_currency(val):>10}  {bar}\n"
           msg += "```\n\n"
-
           # ── QMH helpers ────────────────────────────────────────────
           def render_bucket_table(seen, bucket):
               ae_order  = BUCKET_AE_ORDER.get(bucket, [])
@@ -355,17 +374,31 @@ jobs:
                   lines.append(f"{short:<12} {count:>4}  {bar}")
               lines.append("```")
               return "\n".join(lines)
-
-          def contact_line(c, marker, bucket_tag=""):
+          def render_company_links(cid):
+              """Return ' · <co_url|Company Name>[, <co_url|Other>]' for the
+              given contact_id, or empty string if no companies / not hydrated."""
+              coids = contact_to_company_ids.get(cid, [])
+              parts = []
+              for coid in coids:
+                  ci = company_info.get(coid)
+                  if not ci:
+                      continue
+                  co_url = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-2/{coid}"
+                  parts.append(f"<{co_url}|{ci['name']}>")
+              if not parts:
+                  return ""
+              return " · 🏢 " + ", ".join(parts)
+          def contact_line(c, marker, bucket_tag="", show_company=False):
               url   = f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}"
               val   = c.get("industry_value") or ""
               field = c.get("industry_field") or ""
               ind   = f"{field}: `{val}`" if val else "_no industry property set_"
               prefix = f"[{bucket_tag}] " if bucket_tag else ""
-              return f"  {marker} {prefix}<{url}|{c['name']}> — {ind}"
-
-          def render_contact_list(included, excluded):
-              """Group by AE. For multi-bucket AEs (Will), tag each line with bucket."""
+              suffix = render_company_links(c["id"]) if show_company else ""
+              return f"  {marker} {prefix}<{url}|{c['name']}> — {ind}{suffix}"
+          def render_contact_list(included, excluded, show_company=False):
+              """Group by AE. For multi-bucket AEs (Will), tag each line with bucket.
+              When show_company=True, append associated company links to each contact."""
               lines = []
               for s in SELLERS:
                   ae_buckets    = AE_BUCKETS.get(s, [])
@@ -384,31 +417,30 @@ jobs:
                   lines.append(header)
                   for b in ae_buckets:
                       for c in per_bucket[b]:
-                          lines.append(contact_line(c, "✅", b if show_bucket_tag else ""))
+                          lines.append(contact_line(c, "✅", b if show_bucket_tag else "", show_company))
                   for c in exc:
-                      lines.append(contact_line(c, "❌"))
+                      lines.append(contact_line(c, "❌", "", show_company))
                   lines.append("")
               return "\n".join(lines)
-
-          def render_qmh_section(title, seen, included, excluded, legal_total, core_total):
+          def render_qmh_section(title, seen, included, excluded, legal_total, core_total, show_company=False):
               out  = f"*{title}*\n"
               out += f"*Legal: {legal_total}  ·  Core: {core_total}  ·  Total: {legal_total + core_total}*\n"
               out += "_Legal_\n" + render_bucket_table(seen, "Legal") + "\n"
               out += "_Core_\n"  + render_bucket_table(seen, "Core")  + "\n"
-              d = render_contact_list(included, excluded)
+              d = render_contact_list(included, excluded, show_company=show_company)
               if d.strip():
                   out += d + "\n"
               return out
-
           msg += render_qmh_section(
               "🤝 QMH — Yesterday (Intro/Discovery · Held Qualified · Industry-filtered · unique contacts by owner)",
               daily_seen, daily_included, daily_excluded,
-              daily_legal_total, daily_core_total)
+              daily_legal_total, daily_core_total,
+              show_company=True)
           msg += render_qmh_section(
               "📅 QMH — MTD (Month to Date · Industry-filtered · unique contacts by owner)",
               mtd_seen, mtd_included, mtd_excluded,
-              mtd_legal_total, mtd_core_total)
-
+              mtd_legal_total, mtd_core_total,
+              show_company=False)
           # ── Post to Slack ──────────────────────────────────────────
           payload = {"channel": SLACK_CHANNEL, "text": msg}
           req = urllib.request.Request(

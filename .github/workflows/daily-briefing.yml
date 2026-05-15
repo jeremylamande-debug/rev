@@ -24,7 +24,8 @@ jobs:
           # ── Rep roster & buckets ──────────────────────────────────
           # AE_BUCKETS is the only source of truth for who is Legal vs Core.
           # QMH attribution is by CONTACT owner (mirrors the HubSpot dashboard),
-          # not meeting owner.
+          # not meeting owner. Each contact counts at most once per window
+          # (multiple QMH meetings with the same contact dedupe to 1).
           AE_BUCKETS = {
               "Dillon DeWitt":      "Legal",
               "Will Weis":          "Legal",
@@ -41,13 +42,11 @@ jobs:
           et        = pytz.timezone("America/New_York")
           now_et    = datetime.datetime.now(et)
           yesterday = now_et - datetime.timedelta(days=1)
-          # Yesterday window (for daily deals + daily QMH)
           start_et  = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0))
           end_et    = et.localize(datetime.datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59))
           start_ms  = int(start_et.timestamp() * 1000)
           end_ms    = int(end_et.timestamp() * 1000)
           date_label = yesterday.strftime("%A, %B %d, %Y")
-          # MTD window (for QMH MTD)
           mtd_start = et.localize(datetime.datetime(now_et.year, now_et.month, 1, 0, 0, 0))
           mtd_start_ms = int(mtd_start.timestamp() * 1000)
           now_ms    = int(now_et.timestamp() * 1000)
@@ -65,7 +64,6 @@ jobs:
               with urllib.request.urlopen(req) as r: return json.loads(r.read())
 
           def hs_post_all(path, payload, limit=100):
-              """Paginate through all results."""
               all_results = []
               offset = 0
               while True:
@@ -128,8 +126,8 @@ jobs:
           short_names = [s.split()[0] for s in SELLERS]
 
           # ── Fetch QMH meetings ────────────────────────────────────
-          # HubSpot's internal value for the "Held Qualified" outcome is uppercase
-          # ("HELD QUALIFIED") even though the UI displays title case.
+          # HubSpot's internal value for the "Held Qualified" outcome is
+          # uppercase ("HELD QUALIFIED") even though the UI displays title case.
           def fetch_qmh_meetings(start_ms, end_ms):
               return hs_post_all("/crm/v3/objects/meetings/search", {
                   "filterGroups": [{"filters": [
@@ -142,17 +140,14 @@ jobs:
                                  "hs_meeting_end_time", "hubspot_owner_id"],
               })
 
-          # ── Map each meeting → its contact owner ──────────────────
-          # Mirrors the HubSpot Legal QMH dashboard's "Contact owner"
-          # dimension. For each meeting:
-          #   1) Get associated contacts (batch)
-          #   2) Take the first associated contact
-          #   3) Look up that contact's hubspot_owner_id (batch)
-          # Caches results across calls so daily + MTD don't re-fetch.
-          meeting_contact_owner_cache = {}  # meeting_id -> owner_id (or "")
+          # ── Map each meeting → (contact_id, contact_owner_id) ─────
+          # Two parallel caches, both populated by hydrate_meeting_attributions.
+          # We keep contact_id so we can dedupe per-contact in build_qmh_counts.
+          meeting_to_contact_id    = {}  # meeting_id -> contact_id (or "")
+          meeting_to_contact_owner = {}  # meeting_id -> owner_id   (or "")
 
-          def hydrate_meeting_contact_owners(meeting_ids):
-              uncached = [str(mid) for mid in meeting_ids if str(mid) not in meeting_contact_owner_cache]
+          def hydrate_meeting_attributions(meeting_ids):
+              uncached = [str(mid) for mid in meeting_ids if str(mid) not in meeting_to_contact_id]
               if not uncached:
                   return
 
@@ -175,11 +170,12 @@ jobs:
                           meeting_to_first_contact[mid] = str(tos[0].get("id", ""))
                   time.sleep(0.2)
 
-              # Initialize empty for every meeting we asked about (handles no-contact case)
+              # Initialize empty for every meeting we asked about
               for mid in uncached:
-                  meeting_contact_owner_cache[mid] = ""
+                  meeting_to_contact_id[mid]    = ""
+                  meeting_to_contact_owner[mid] = ""
 
-              # Step 2: batch-fetch contact owners
+              # Step 2: batch-fetch contact owners for unique contact IDs
               unique_cids = list({c for c in meeting_to_first_contact.values() if c})
               cid_to_owner = {}
               for j in range(0, len(unique_cids), 100):
@@ -194,34 +190,41 @@ jobs:
                       print(f"  ⚠️ contact batch read error: {e}")
                       continue
                   for c in resp.get("results", []):
-                      owner = (c.get("properties", {}).get("hubspot_owner_id") or "")
-                      cid_to_owner[c["id"]] = owner
+                      cid_to_owner[c["id"]] = (c.get("properties", {}).get("hubspot_owner_id") or "")
                   time.sleep(0.2)
 
-              # Step 3: roll up meeting → contact owner
+              # Step 3: roll up meeting → contact_id and meeting → owner
               for mid, cid in meeting_to_first_contact.items():
-                  meeting_contact_owner_cache[mid] = cid_to_owner.get(cid, "")
+                  meeting_to_contact_id[mid]    = cid
+                  meeting_to_contact_owner[mid] = cid_to_owner.get(cid, "")
 
-          # ── Build per-AE QMH counts (by contact owner) ────────────
+          # ── Build per-AE QMH counts (unique contacts, by contact owner) ──
+          # Each contact owned by an AE counts at most once per window,
+          # regardless of how many QMH meetings they had.
           def build_qmh_counts(meetings):
-              hydrate_meeting_contact_owners([m["id"] for m in meetings])
-              counts = {s: 0 for s in SELLERS}
+              hydrate_meeting_attributions([m["id"] for m in meetings])
+              contacts_per_owner   = {s: set() for s in SELLERS}
+              raw_meetings_in_seller_buckets = 0
               for m in meetings:
-                  contact_owner_id = meeting_contact_owner_cache.get(str(m["id"]), "")
-                  owner_name       = id_to_name.get(contact_owner_id, "")
-                  if owner_name in SELLERS:
-                      counts[owner_name] += 1
-              return counts
+                  mid = str(m["id"])
+                  cid = meeting_to_contact_id.get(mid, "")
+                  oid = meeting_to_contact_owner.get(mid, "")
+                  owner_name = id_to_name.get(oid, "")
+                  if owner_name in SELLERS and cid:
+                      contacts_per_owner[owner_name].add(cid)
+                      raw_meetings_in_seller_buckets += 1
+              counts = {s: len(contacts_per_owner[s]) for s in SELLERS}
+              return counts, raw_meetings_in_seller_buckets
 
           print("Fetching daily QMH meetings...")
           daily_meetings = fetch_qmh_meetings(start_ms, end_ms)
           print(f"Daily QMH meetings found (pre-attribution): {len(daily_meetings)}")
-          daily_qmh = build_qmh_counts(daily_meetings)
+          daily_qmh, daily_raw_attributed = build_qmh_counts(daily_meetings)
 
           print("Fetching MTD QMH meetings...")
           mtd_meetings = fetch_qmh_meetings(mtd_start_ms, now_ms)
           print(f"MTD QMH meetings found (pre-attribution): {len(mtd_meetings)}")
-          mtd_qmh = build_qmh_counts(mtd_meetings)
+          mtd_qmh, mtd_raw_attributed = build_qmh_counts(mtd_meetings)
 
           # Bucket totals
           def bucket_total(counts, bucket):
@@ -231,12 +234,15 @@ jobs:
           daily_core_total  = bucket_total(daily_qmh, "Core")
           mtd_legal_total   = bucket_total(mtd_qmh,   "Legal")
           mtd_core_total    = bucket_total(mtd_qmh,   "Core")
-          print(f"Daily — Legal: {daily_legal_total} | Core: {daily_core_total} | "
-                f"unattributed (no SELLER contact owner): "
-                f"{len(daily_meetings) - sum(daily_qmh.values())}")
-          print(f"MTD   — Legal: {mtd_legal_total} | Core: {mtd_core_total} | "
-                f"unattributed (no SELLER contact owner): "
-                f"{len(mtd_meetings) - sum(mtd_qmh.values())}")
+
+          print(f"Daily — unique contacts: Legal {daily_legal_total}, Core {daily_core_total} "
+                f"| raw meetings attributed: {daily_raw_attributed} "
+                f"| dedup collapsed: {daily_raw_attributed - (daily_legal_total + daily_core_total)} "
+                f"| unattributed (no SELLER contact owner): {len(daily_meetings) - daily_raw_attributed}")
+          print(f"MTD   — unique contacts: Legal {mtd_legal_total}, Core {mtd_core_total} "
+                f"| raw meetings attributed: {mtd_raw_attributed} "
+                f"| dedup collapsed: {mtd_raw_attributed - (mtd_legal_total + mtd_core_total)} "
+                f"| unattributed (no SELLER contact owner): {len(mtd_meetings) - mtd_raw_attributed}")
 
           # ── Build Slack message ───────────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"
@@ -288,12 +294,12 @@ jobs:
               return "\n".join(lines)
 
           # QMH — Yesterday
-          msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified · by contact owner)*\n"
+          msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified · unique contacts by owner)*\n"
           msg += f"*Legal: {daily_legal_total}  ·  Core: {daily_core_total}  ·  Total: {daily_legal_total + daily_core_total}*\n"
           msg += render_qmh_table(daily_qmh) + "\n\n"
 
           # QMH — MTD
-          msg += f"*📅 QMH — MTD (Month to Date · by contact owner)*\n"
+          msg += f"*📅 QMH — MTD (Month to Date · unique contacts by owner)*\n"
           msg += f"*Legal: {mtd_legal_total}  ·  Core: {mtd_core_total}  ·  Total: {mtd_legal_total + mtd_core_total}*\n"
           msg += render_qmh_table(mtd_qmh) + "\n"
 

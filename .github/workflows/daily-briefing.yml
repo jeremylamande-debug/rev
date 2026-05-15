@@ -14,21 +14,25 @@ jobs:
         run: |
           pip install pytz --quiet
           python3 - <<'EOF'
-          import urllib.request, urllib.parse, json, os, datetime, pytz
+          import urllib.request, urllib.parse, json, os, datetime, pytz, time
           HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
           SLACK_CHANNEL = "C0APDRMLN1Z"  # #daily-sales
           SLACK_USER    = "U08JJMM2QSW"
-          SELLERS       = ["Dillon DeWitt", "Will Weis", "Isabella Simpatico", "James Gregory"]
           PORTAL_ID     = "21451281"
 
-          # ── Industry Group classification ─────────────────────────
-          # Exact match only — no substring matching, no fallback to `industry`.
-          # Match is case-insensitive to be defensive against minor casing drift
-          # in the HubSpot property values, but values must match exactly otherwise.
-          LEGAL_INDUSTRIES = {"government", "legal", "law enforcement"}
-          CORE_INDUSTRIES  = {"marketing", "technology", "finance", "consulting", "media",
-                              "healthcare", "content creation", "education", "research", "other"}
+          # ── Rep roster & buckets ──────────────────────────────────
+          # AE_BUCKETS is the only source of truth for who is Legal vs Core.
+          # QMH attribution is by CONTACT owner (mirrors the HubSpot dashboard),
+          # not meeting owner.
+          AE_BUCKETS = {
+              "Dillon DeWitt":      "Legal",
+              "Will Weis":          "Legal",
+              "James Gregory":      "Legal",
+              "Mike Merritts":      "Legal",
+              "Isabella Simpatico": "Core",
+          }
+          SELLERS = list(AE_BUCKETS.keys())
 
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
@@ -77,11 +81,14 @@ jobs:
               return all_results
 
           # ── Get owners ─────────────────────────────────────────────
-          owners    = hs_get("/crm/v3/owners").get("results", [])
-          owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
+          owners     = hs_get("/crm/v3/owners").get("results", [])
+          owner_map  = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
           id_to_name = {o["id"]: f"{o['firstName']} {o['lastName']}" for o in owners}
           seller_ids = {name: owner_map.get(name) for name in SELLERS}
           print(f"Seller IDs: {seller_ids}")
+          missing = [s for s, sid in seller_ids.items() if not sid]
+          if missing:
+              print(f"⚠️ Could not resolve HubSpot owner IDs for: {missing}")
 
           # ── Fetch yesterday's deals ────────────────────────────────
           deals = hs_post("/crm/v3/objects/deals/search", {
@@ -107,7 +114,7 @@ jobs:
                   return d.strftime("%b %d, %Y")
               except: return iso
 
-          # ── Map deals to sellers ───────────────────────────────────
+          # ── Map deals to sellers (by deal owner) ───────────────────
           seller_deals = {s: [] for s in SELLERS}
           for deal in deals:
               p   = deal.get("properties", {})
@@ -121,11 +128,8 @@ jobs:
           short_names = [s.split()[0] for s in SELLERS]
 
           # ── Fetch QMH meetings ────────────────────────────────────
-          # NOTE: HubSpot's internal value for this custom outcome is uppercase
-          # ("HELD QUALIFIED") even though the UI displays "Held Qualified".
-          # Enum filters on the Search API are case-sensitive on internal value —
-          # do not change this string without verifying via a direct GET on a
-          # known QMH meeting record.
+          # HubSpot's internal value for the "Held Qualified" outcome is uppercase
+          # ("HELD QUALIFIED") even though the UI displays title case.
           def fetch_qmh_meetings(start_ms, end_ms):
               return hs_post_all("/crm/v3/objects/meetings/search", {
                   "filterGroups": [{"filters": [
@@ -138,114 +142,101 @@ jobs:
                                  "hs_meeting_end_time", "hubspot_owner_id"],
               })
 
-          # ── Batch-fetch industry_group for ALL associated contacts ─
-          # Two-step pattern, mirroring HubSpot's report-side filter:
-          #   1. Get associations meeting → contacts (batched, all contacts per meeting)
-          #   2. Batch-read industry_group for unique contact IDs
-          # A meeting is Legal/Core if ANY associated contact has a matching
-          # industry_group. NO fallback to the `industry` property.
-          meeting_industries_cache = {}  # meeting_id -> set of industry_group values (lower)
+          # ── Map each meeting → its contact owner ──────────────────
+          # Mirrors the HubSpot Legal QMH dashboard's "Contact owner"
+          # dimension. For each meeting:
+          #   1) Get associated contacts (batch)
+          #   2) Take the first associated contact
+          #   3) Look up that contact's hubspot_owner_id (batch)
+          # Caches results across calls so daily + MTD don't re-fetch.
+          meeting_contact_owner_cache = {}  # meeting_id -> owner_id (or "")
 
-          def hydrate_meeting_industries(meeting_ids):
-              """Populate meeting_industries_cache for the given meeting IDs."""
-              uncached = [mid for mid in meeting_ids if mid not in meeting_industries_cache]
+          def hydrate_meeting_contact_owners(meeting_ids):
+              uncached = [str(mid) for mid in meeting_ids if str(mid) not in meeting_contact_owner_cache]
               if not uncached:
                   return
 
-              # Step 1: meeting → contacts (batch)
-              meeting_to_contacts = {}
+              # Step 1: meeting → contacts associations (batched)
+              meeting_to_first_contact = {}
               for i in range(0, len(uncached), 100):
                   batch = uncached[i:i+100]
                   try:
                       resp = hs_post(
                           "/crm/v3/associations/meetings/contacts/batch/read",
-                          {"inputs": [{"id": str(mid)} for mid in batch]}
+                          {"inputs": [{"id": mid} for mid in batch]}
                       )
                   except Exception as e:
                       print(f"  ⚠️ meeting→contact assoc error: {e}")
                       continue
                   for r in resp.get("results", []):
                       mid = str(r.get("from", {}).get("id", ""))
-                      cids = [str(t.get("id", "")) for t in r.get("to", [])]
-                      cids = [c for c in cids if c]
-                      if mid:
-                          meeting_to_contacts[mid] = cids
+                      tos = r.get("to", [])
+                      if mid and tos:
+                          meeting_to_first_contact[mid] = str(tos[0].get("id", ""))
+                  time.sleep(0.2)
 
-              # Initialize empty sets for every meeting we asked about
+              # Initialize empty for every meeting we asked about (handles no-contact case)
               for mid in uncached:
-                  meeting_industries_cache[str(mid)] = set()
+                  meeting_contact_owner_cache[mid] = ""
 
-              # Step 2: batch-read industry_group for unique contacts
-              unique_cids = list({c for cids in meeting_to_contacts.values() for c in cids})
-              cid_to_ig = {}
+              # Step 2: batch-fetch contact owners
+              unique_cids = list({c for c in meeting_to_first_contact.values() if c})
+              cid_to_owner = {}
               for j in range(0, len(unique_cids), 100):
                   cid_batch = unique_cids[j:j+100]
                   try:
                       resp = hs_post(
                           "/crm/v3/objects/contacts/batch/read",
                           {"inputs": [{"id": cid} for cid in cid_batch],
-                           "properties": ["industry_group"]}
+                           "properties": ["hubspot_owner_id"]}
                       )
                   except Exception as e:
                       print(f"  ⚠️ contact batch read error: {e}")
                       continue
                   for c in resp.get("results", []):
-                      ig = (c.get("properties", {}).get("industry_group") or "").strip().lower()
-                      cid_to_ig[c["id"]] = ig
+                      owner = (c.get("properties", {}).get("hubspot_owner_id") or "")
+                      cid_to_owner[c["id"]] = owner
+                  time.sleep(0.2)
 
-              # Roll contact industries up to each meeting
-              for mid, cids in meeting_to_contacts.items():
-                  igs = {cid_to_ig.get(c, "") for c in cids}
-                  igs.discard("")
-                  meeting_industries_cache[str(mid)] = igs
+              # Step 3: roll up meeting → contact owner
+              for mid, cid in meeting_to_first_contact.items():
+                  meeting_contact_owner_cache[mid] = cid_to_owner.get(cid, "")
 
-          def classify_meeting(meeting_id):
-              """Returns 'legal', 'core', or 'unknown'. Legal takes precedence."""
-              igs = meeting_industries_cache.get(str(meeting_id), set())
-              if igs & LEGAL_INDUSTRIES:
-                  return "legal"
-              if igs & CORE_INDUSTRIES:
-                  return "core"
-              return "unknown"
-
-          # ── Build QMH counts ──────────────────────────────────────
+          # ── Build per-AE QMH counts (by contact owner) ────────────
           def build_qmh_counts(meetings):
-              """Returns {seller_name: {"legal": n, "core": n, "total": n}}.
-              Total = legal + core + unknown (every meeting owned by a seller)."""
-              hydrate_meeting_industries([m["id"] for m in meetings])
-              counts = {s: {"legal": 0, "core": 0, "total": 0} for s in SELLERS}
+              hydrate_meeting_contact_owners([m["id"] for m in meetings])
+              counts = {s: 0 for s in SELLERS}
               for m in meetings:
-                  props = m.get("properties", {})
-                  oid   = props.get("hubspot_owner_id")
-                  owner_name = id_to_name.get(oid, "")
-                  if owner_name not in SELLERS:
-                      continue
-                  bucket = classify_meeting(m["id"])
-                  counts[owner_name]["total"] += 1
-                  if bucket in ("legal", "core"):
-                      counts[owner_name][bucket] += 1
+                  contact_owner_id = meeting_contact_owner_cache.get(str(m["id"]), "")
+                  owner_name       = id_to_name.get(contact_owner_id, "")
+                  if owner_name in SELLERS:
+                      counts[owner_name] += 1
               return counts
-
-          # Team-wide Legal count (NO owner filter) — mirrors the HubSpot
-          # Legal QMH report so the Slack number is directly reconcilable.
-          def team_legal_count(meetings):
-              hydrate_meeting_industries([m["id"] for m in meetings])
-              return sum(1 for m in meetings if classify_meeting(m["id"]) == "legal")
 
           print("Fetching daily QMH meetings...")
           daily_meetings = fetch_qmh_meetings(start_ms, end_ms)
-          print(f"Daily QMH meetings found: {len(daily_meetings)}")
+          print(f"Daily QMH meetings found (pre-attribution): {len(daily_meetings)}")
           daily_qmh = build_qmh_counts(daily_meetings)
 
           print("Fetching MTD QMH meetings...")
           mtd_meetings = fetch_qmh_meetings(mtd_start_ms, now_ms)
-          print(f"MTD QMH meetings found: {len(mtd_meetings)}")
+          print(f"MTD QMH meetings found (pre-attribution): {len(mtd_meetings)}")
           mtd_qmh = build_qmh_counts(mtd_meetings)
 
-          # Team-wide Legal totals for reconciliation against HubSpot dashboard
-          team_legal_daily = team_legal_count(daily_meetings)
-          team_legal_mtd   = team_legal_count(mtd_meetings)
-          print(f"Team-wide Legal QMH — Daily: {team_legal_daily} | MTD: {team_legal_mtd}")
+          # Bucket totals
+          def bucket_total(counts, bucket):
+              return sum(c for s, c in counts.items() if AE_BUCKETS.get(s) == bucket)
+
+          daily_legal_total = bucket_total(daily_qmh, "Legal")
+          daily_core_total  = bucket_total(daily_qmh, "Core")
+          mtd_legal_total   = bucket_total(mtd_qmh,   "Legal")
+          mtd_core_total    = bucket_total(mtd_qmh,   "Core")
+          print(f"Daily — Legal: {daily_legal_total} | Core: {daily_core_total} | "
+                f"unattributed (no SELLER contact owner): "
+                f"{len(daily_meetings) - sum(daily_qmh.values())}")
+          print(f"MTD   — Legal: {mtd_legal_total} | Core: {mtd_core_total} | "
+                f"unattributed (no SELLER contact owner): "
+                f"{len(mtd_meetings) - sum(mtd_qmh.values())}")
 
           # ── Build Slack message ───────────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"
@@ -275,43 +266,36 @@ jobs:
           msg += "```\n"
           msg += f"{'Rep':<12} {'ACV':>10}  Chart\n"
           msg += "─" * 45 + "\n"
+          max_acv = max(acv_vals) if max(acv_vals) > 0 else 1
           for name, val in zip(short_names, acv_vals):
-              max_acv = max(acv_vals) if max(acv_vals) > 0 else 1
-              bar     = "█" * int((val / max_acv) * 20)
-              msg    += f"{name:<12} {fmt_currency(val):>10}  {bar}\n"
+              bar = "█" * int((val / max_acv) * 20)
+              msg += f"{name:<12} {fmt_currency(val):>10}  {bar}\n"
           msg += "```\n\n"
 
-          # QMH Daily chart
-          daily_legal  = [daily_qmh[s]["legal"] for s in SELLERS]
-          daily_core   = [daily_qmh[s]["core"]  for s in SELLERS]
-          daily_totals = [daily_qmh[s]["total"] for s in SELLERS]
-          total_daily_qmh = sum(daily_totals)
-          msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified)*\n"
-          msg += f"*{total_daily_qmh} total qualified meetings (AE-owned) · {team_legal_daily} team-wide Legal*\n"
-          msg += "```\n"
-          msg += f"{'Rep':<12} {'Legal':>6}  {'Core':>6}  {'Total':>6}  Chart\n"
-          msg += "─" * 55 + "\n"
-          max_daily = max(daily_totals) if max(daily_totals) > 0 else 1
-          for s, legal, core, total in zip(short_names, daily_legal, daily_core, daily_totals):
-              bar = "█" * int((total / max_daily) * 15)
-              msg += f"{s:<12} {legal:>6}  {core:>6}  {total:>6}  {bar}\n"
-          msg += "```\n\n"
+          # ── QMH helper: render a contact-owner table ──────────────
+          def render_qmh_table(counts):
+              max_count = max(counts.values()) if max(counts.values()) > 0 else 1
+              lines = ["```"]
+              lines.append(f"{'Rep':<12} {'Bucket':<8} {'QMH':>4}  Chart")
+              lines.append("─" * 50)
+              for s in SELLERS:
+                  short  = s.split()[0]
+                  bucket = AE_BUCKETS.get(s, "—")
+                  count  = counts[s]
+                  bar    = "█" * int((count / max_count) * 15)
+                  lines.append(f"{short:<12} {bucket:<8} {count:>4}  {bar}")
+              lines.append("```")
+              return "\n".join(lines)
 
-          # QMH MTD chart
-          mtd_legal  = [mtd_qmh[s]["legal"] for s in SELLERS]
-          mtd_core   = [mtd_qmh[s]["core"]  for s in SELLERS]
-          mtd_totals = [mtd_qmh[s]["total"] for s in SELLERS]
-          total_mtd_qmh = sum(mtd_totals)
-          msg += f"*📅 QMH — MTD (Month to Date)*\n"
-          msg += f"*{total_mtd_qmh} qualified meetings (AE-owned) · {team_legal_mtd} team-wide Legal*\n"
-          msg += "```\n"
-          msg += f"{'Rep':<12} {'Legal':>6}  {'Core':>6}  {'Total':>6}  Chart\n"
-          msg += "─" * 55 + "\n"
-          max_mtd = max(mtd_totals) if max(mtd_totals) > 0 else 1
-          for s, legal, core, total in zip(short_names, mtd_legal, mtd_core, mtd_totals):
-              bar = "█" * int((total / max_mtd) * 15)
-              msg += f"{s:<12} {legal:>6}  {core:>6}  {total:>6}  {bar}\n"
-          msg += "```\n"
+          # QMH — Yesterday
+          msg += f"*🤝 QMH — Yesterday (Intro/Discovery · Held Qualified · by contact owner)*\n"
+          msg += f"*Legal: {daily_legal_total}  ·  Core: {daily_core_total}  ·  Total: {daily_legal_total + daily_core_total}*\n"
+          msg += render_qmh_table(daily_qmh) + "\n\n"
+
+          # QMH — MTD
+          msg += f"*📅 QMH — MTD (Month to Date · by contact owner)*\n"
+          msg += f"*Legal: {mtd_legal_total}  ·  Core: {mtd_core_total}  ·  Total: {mtd_legal_total + mtd_core_total}*\n"
+          msg += render_qmh_table(mtd_qmh) + "\n"
 
           # ── Post to Slack ──────────────────────────────────────────
           payload = {"channel": SLACK_CHANNEL, "text": msg}

@@ -262,11 +262,19 @@ jobs:
           # Legal takes precedence if a value matches both sets.
           def classify_bucket(info):
               val = (info.get("industry_value") or "").strip().lower()
-              if not val:
-                  return None
               if any(t in val for t in LEGAL_INDUSTRY_TOKENS):
                   return "Legal"
               if any(t in val for t in CORE_INDUSTRY_TOKENS):
+                  return "Core"
+              # Empty industry → treat as "Other" (Core), mirroring the
+              # HubSpot custom report behavior where contacts without an
+              # explicit Industry Group surface under "Other". This lets
+              # the Slack QMH count reconcile 1:1 with the HS chart.
+              # A contact that has a value but doesn't match any token
+              # still falls through to None (excluded).
+              if not val:
+                  info["industry_value"] = "Other"
+                  info["industry_field"] = "(defaulted)"
                   return "Core"
               return None
           # ── Build per-(AE, bucket) QMH counts ─────────────────────

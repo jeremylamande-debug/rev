@@ -74,7 +74,20 @@ jobs:
               "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
           ]
 
-          # ── Org types & titles (10 sequences) ────────────────────
+          # ── Active personas — toggle to expand back to full set ───
+          # Currently active (3): Public Defender, District Attorney, Police/Sheriff Investigators
+          # Full set available below in ORG_TYPES (11 total). To revert to all,
+          # set ACTIVE_PERSONAS = [o["type"] for o in ORG_TYPES] OR list them explicitly:
+          # ["Sheriff", "District Attorney", "Public Defender", "Police Department",
+          #  "City Attorney", "Court", "Investigator", "Corrections",
+          #  "Internal Affairs", "Human Resources", "Police/Sheriff Investigators"]
+          ACTIVE_PERSONAS = [
+              "Public Defender",
+              "District Attorney",
+              "Police/Sheriff Investigators",
+          ]
+
+          # ── Org types & titles (all defined; filtered by ACTIVE_PERSONAS below) ──
           ORG_TYPES = [
               {"type": "Sheriff",           "titles": ["Sheriff", "Undersheriff", "Chief Deputy Sheriff", "Commander", "Captain", "Lieutenant", "Sergeant"]},
               {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Deputy District Attorney", "Chief Investigator", "Senior Investigator"]},
@@ -86,6 +99,18 @@ jobs:
               {"type": "Corrections",       "titles": ["Corrections Investigator", "Correctional Investigative Officer", "Inspector General Corrections", "Internal Affairs Corrections", "Chief of Investigations"]},
               {"type": "Internal Affairs",  "titles": ["Internal Affairs Director", "Internal Affairs Lieutenant", "Internal Affairs Sergeant", "Professional Standards Director", "Professional Standards Captain", "Professional Standards Lieutenant"]},
               {"type": "Human Resources",   "titles": ["HR Director", "Chief Human Resources Officer", "HR Manager", "Employee Relations Manager", "Labor Relations Director", "HR Investigations Manager"]},
+              {"type": "Police/Sheriff Investigators",
+               "titles": [
+                   # Command
+                   "Sheriff", "Undersheriff", "Chief Deputy Sheriff",
+                   "Chief of Police", "Deputy Chief", "Assistant Chief",
+                   "Commander", "Captain", "Lieutenant",
+                   # Investigators
+                   "Chief Investigator", "Senior Investigator",
+                   "Criminal Investigator", "Detective Investigator",
+                   "Special Investigator", "Detective",
+                   "Sergeant Investigations", "Investigations Sergeant",
+               ]},
           ]
 
           AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
@@ -111,7 +136,7 @@ jobs:
               "James Gregory":  "#059669",
           }
 
-          # ── Persona angles (10 sequences) ────────────────────────
+          # ── Persona angles (all defined; only active ones used) ───
           PERSONA_ANGLES = {
               "Sheriff": {
                   "pain":     "managing body cam footage and interrogation recordings manually",
@@ -163,20 +188,33 @@ jobs:
                   "use_case": "HR investigation transcription and employee relations documentation",
                   "proof":    "county HR departments using Rev reduce documentation risk and investigation turnaround significantly"
               },
+              "Police/Sheriff Investigators": {
+                  "pain":     "investigators and command staff drowning in body cam, interview, and interrogation footage that has to be reviewed and documented manually",
+                  "use_case": "interview/interrogation transcription, body cam documentation, and case-file evidence prep",
+                  "proof":    "investigations units using Rev cut review and documentation time by 60%, freeing detectives to close more cases"
+              },
           }
 
           DEPT_MAP = {
-              "Sheriff":           "Sheriff Dept",
-              "District Attorney": "DA Office",
-              "Public Defender":   "Public Defender",
-              "Police Department": "Police Dept",
-              "City Attorney":     "City Attorney",
-              "Court":             "Court",
-              "Investigator":      "Investigations",
-              "Corrections":       "Corrections",
-              "Internal Affairs":  "Internal Affairs",
-              "Human Resources":   "Human Resources",
+              "Sheriff":                       "Sheriff Dept",
+              "District Attorney":             "DA Office",
+              "Public Defender":               "Public Defender",
+              "Police Department":             "Police Dept",
+              "City Attorney":                 "City Attorney",
+              "Court":                         "Court",
+              "Investigator":                  "Investigations",
+              "Corrections":                   "Corrections",
+              "Internal Affairs":              "Internal Affairs",
+              "Human Resources":               "Human Resources",
+              "Police/Sheriff Investigators":  "Police/Sheriff Investigators",
           }
+
+          # ── Apply ACTIVE_PERSONAS filter ─────────────────────────
+          # Filters ORG_TYPES so the main loop only iterates over active personas.
+          # PERSONA_ANGLES and DEPT_MAP keep all definitions (inactive entries dormant
+          # but accessible) so reverting is a one-line edit to ACTIVE_PERSONAS above.
+          ORG_TYPES = [o for o in ORG_TYPES if o["type"] in ACTIVE_PERSONAS]
+          print(f"🎯 Active personas ({len(ORG_TYPES)}): {[o['type'] for o in ORG_TYPES]}")
 
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
@@ -1161,8 +1199,8 @@ jobs:
 
           def gen_email_sequence(contact, ae_name):
               meeting_link = get_meeting_link(ae_name)
-              org_type     = contact.get("org_type", "Sheriff")
-              angles       = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
+              org_type     = contact.get("org_type", "Public Defender")
+              angles       = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
               first_name   = contact["first_name"]
               name         = f"{contact['title']} {contact['last_name']}"
               org          = contact["organization"]
@@ -1242,8 +1280,8 @@ jobs:
           def gen_subject(contact, email_num=1):
               if email_num in (2, 4):
                   return ""
-              org_type = contact.get("org_type", "Sheriff")
-              angles   = PERSONA_ANGLES.get(org_type, PERSONA_ANGLES["Sheriff"])
+              org_type = contact.get("org_type", "Public Defender")
+              angles   = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
               prompts  = {
                   1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
                   3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
@@ -1629,7 +1667,8 @@ jobs:
 
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — {today_str}*\n"
-          msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n\n"
+          msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n"
+          msg += f"_Active personas: {', '.join(ACTIVE_PERSONAS)}_\n\n"
 
           for ae_name, data in results.items():
               county       = data["county"]
@@ -1675,7 +1714,7 @@ jobs:
                   msg += f"{exhausted_line}\n"
               msg += "\n"
 
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v37_"
+          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v38 · {len(ACTIVE_PERSONAS)}-persona mode_"
 
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})

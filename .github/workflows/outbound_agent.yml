@@ -1091,6 +1091,7 @@ jobs:
                                           "enrolled": enrolled,
                                           "email":    lead.get("email", ""),
                                           "state":    state_code,
+                                          "org_type": lead.get("org_type", org["type"]),
                                       })
                                       county_new       += 1
                                       org_new_this_run += 1
@@ -1124,8 +1125,19 @@ jobs:
                               print(f"  ⚠️ No more counties for {state_code}")
                       continue
                   if not found_any_leads:
-                      print(f"  ℹ️ No leads found in {county} — keeping for next run")
-                      break
+                      # No leads surfaced at all for this county across all org types.
+                      # Mark exhausted and advance so we still hit the daily cap (was: break, which left MA short).
+                      print(f"  ⚠️ No leads found in {county} across any persona — marking exhausted and advancing")
+                      if county not in state[state_code]["exhausted"]:
+                          state[state_code]["exhausted"].append(county)
+                      next_c = next_county_for_state(state_code, state)
+                      state[state_code]["county"] = next_c or None
+                      if next_c:
+                          print(f"  ➡️ Moving to: {next_c}")
+                          continue
+                      else:
+                          print(f"  ⚠️ No more counties for {state_code} — stopping at {len(added)}/{state_cap}")
+                          break
                   if len(added) < state_cap:
                       print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{state_cap})")
               results[state_code] = {
@@ -1189,7 +1201,24 @@ jobs:
               exhausted_parts = [f"{c} ({county_leads.get(c, 0)})" for c in exhausted if c in county_leads]
               exhausted_line  = f"  ✅ *Done:* {'  ·  '.join(exhausted_parts)}" if exhausted_parts else ""
               active_count = county_leads.get(county, 0)
+              # Per-persona tally for this state
+              persona_emojis = {
+                  "Public Defender":              "⚖️",
+                  "District Attorney":            "🧑‍⚖️",
+                  "Police/Sheriff Investigators": "🚓",
+              }
+              persona_counts = {}
+              for c in added_st:
+                  pt = c.get("org_type", "")
+                  if pt:
+                      persona_counts[pt] = persona_counts.get(pt, 0) + 1
+              persona_parts = []
+              for p in ACTIVE_PERSONAS:
+                  emoji = persona_emojis.get(p, "·")
+                  persona_parts.append(f"{emoji} {p}: {persona_counts.get(p, 0)}")
+              persona_line = "  " + "  ·  ".join(persona_parts)
               msg += f"*🗽 {state_name}* — {len(added_st)} leads added\n"
+              msg += f"{persona_line}\n"
               msg += f"  📍 *Now:* {county}{curr_badge} — {active_count} leads assigned\n"
               msg += f"{next_line}\n"
               if exhausted_line:

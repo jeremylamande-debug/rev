@@ -1,4 +1,4 @@
-name: Daily Outbound Agent — CA Law Enforcement
+name: Daily Outbound Agent — NY & MA Law Enforcement
 on:
   schedule:
     - cron: '0 6 * * 1-5'  # 2:00 AM ET (UTC-4 EDT), Mon–Fri
@@ -27,18 +27,31 @@ jobs:
           GIST_TOKEN    = os.environ.get("GIST_TOKEN", "")
           GIST_ID       = os.environ.get("GIST_ID", "")
           PORTAL_ID     = "21451281"
-          # ── Daily lead caps per AE ────────────────────────────────
-          # Reduced from 50/25/50 → 20/10/20 on 2026-05-19 to lower
-          # daily volume. To restore, bump these back to:
-          #   Dillon DeWitt: 50, Will Weis: 25, James Gregory: 50
-          LEADS_PER_AE  = {
-              "Dillon DeWitt":  20,
-              "Will Weis":      10,
-              "James Gregory":  20,
+
+          # ════════════════════════════════════════════════════════════
+          # ACTIVE CONFIG — NY & MA Law Enforcement (Mike Merritts only)
+          # Pivoted from CA on 2026-05-20. Full CA block preserved
+          # commented-out below for instant revival when you ask.
+          # ════════════════════════════════════════════════════════════
+
+          # ── Daily lead cap ─────────────────────────────────────────
+          # 50 leads/day total, split 25 NY / 25 MA.
+          LEADS_PER_STATE = {
+              "NY": 25,
+              "MA": 25,
           }
-          SLACK_USER    = "U08JJMM2QSW"
+          TOTAL_DAILY_CAP = sum(LEADS_PER_STATE.values())
+
+          # ── Single owner: Mike Merritts ────────────────────────────
+          OWNER_NAME  = "Mike Merritts"
+          OWNER_EMAIL = "mike.merritts@rev.com"
+          MEETING_LINK = "https://meetings.hubspot.com/mike-merritts"
+          CONSOLIDATED_LIST_URL = f"https://app.hubspot.com/contacts/{PORTAL_ID}/objects/0-1/views/65837308/list"
+
+          SLACK_USER       = "U08JJMM2QSW"
           DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
-          SEQUENCE_ID   = "304238924"
+          SEQUENCE_ID      = "304238924"
+
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
           ANTH_HEADERS  = {
@@ -46,55 +59,67 @@ jobs:
               "x-api-key": ANTHROPIC_KEY,
               "anthropic-version": "2023-06-01"
           }
-          # ── Per-AE county assignments (no overlap ever) ───────────
-          AE_COUNTIES = {
-              "Dillon DeWitt": [
-                  "Santa Clara", "Nevada", "Shasta", "Napa", "Imperial",
-                  "Amador", "Siskiyou", "Humboldt", "Mono", "Sierra",
+
+          # ── NY counties (mid-size, population ≤500K, prioritized) ─
+          # Excludes NYC 5 boroughs, Nassau, Suffolk, Westchester, Erie (Buffalo),
+          # Monroe (Rochester) — all over the 500K cap.
+          STATE_COUNTIES = {
+              "NY": [
+                  "Albany",       # ~315K, state capital region
+                  "Onondaga",     # ~470K, Syracuse — borderline but mid-size LE
+                  "Dutchess",     # ~295K, Poughkeepsie
+                  "Orange",       # ~400K, lower Hudson Valley
+                  "Saratoga",     # ~235K, Saratoga Springs
+                  "Rockland",     # ~340K, NYC suburbs
+                  "Ulster",       # ~180K, Kingston
+                  "Niagara",      # ~210K, Niagara Falls
+                  "Oneida",       # ~230K, Utica
+                  "Broome",       # ~200K, Binghamton
+                  "Rensselaer",   # ~160K, Troy
+                  "Schenectady",  # ~160K
+                  "Chautauqua",   # ~125K
+                  "Jefferson",    # ~115K, Watertown
+                  "Tompkins",     # ~105K, Ithaca
+                  "Putnam",       # ~98K
+                  "Sullivan",     # ~80K
+                  "Ontario",      # ~115K, Canandaigua
+                  "St. Lawrence", # ~108K
+                  "Cattaraugus",  # ~77K
               ],
-              "Will Weis": [
-                  "Contra Costa", "Placer", "Merced", "Kings", "Tehama",
-                  "San Benito", "Del Norte", "Mendocino", "Inyo", "Alpine",
-              ],
-              "James Gregory": [
-                  "Alameda", "Solano", "Butte", "Madera", "Lake",
-                  "Colusa", "Trinity", "Plumas", "Modoc", "Lassen",
+              # ── MA: orgs structured by DA District, county Sheriff (jails),
+              # CPCS regions (Public Defender), and municipal PDs. We map
+              # work to counties for territory/reporting but the agent's
+              # search prompts adjust per-org-type below.
+              "MA": [
+                  "Hampden",      # ~465K, Springfield
+                  "Bristol",      # ~580K — JUST over cap but core mid-size MA
+                  "Plymouth",     # ~530K — borderline, keeping for MA volume
+                  "Hampshire",    # ~163K, Northampton
+                  "Barnstable",   # ~230K, Cape Cod
+                  "Berkshire",    # ~120K, Pittsfield
+                  "Franklin",     # ~70K, Greenfield
+                  "Dukes",        # ~20K, Martha's Vineyard
+                  "Nantucket",    # ~14K
               ],
           }
-          # Overflow — partitioned per-AE (no overlap ever across sellers)
-          AE_OVERFLOW_COUNTIES = {
-              "Dillon DeWitt":  ["San Mateo", "Marin", "Santa Cruz"],
-              "Will Weis":      ["Sonoma", "Yolo", "El Dorado", "Calaveras"],
-              "James Gregory":  ["Tuolumne", "Glenn", "Sutter"],
-          }
-          EXCLUDED_COUNTIES = [
-              "Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
-              "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"
-          ]
-          # ── Active personas — toggle to expand back to full set ───
-          # Currently active (3): Public Defender, District Attorney, Police/Sheriff Investigators
-          # Full set available below in ORG_TYPES (11 total). To revert to all,
-          # set ACTIVE_PERSONAS = [o["type"] for o in ORG_TYPES] OR list them explicitly:
-          # ["Sheriff", "District Attorney", "Public Defender", "Police Department",
-          #  "City Attorney", "Court", "Investigator", "Corrections",
-          #  "Internal Affairs", "Human Resources", "Police/Sheriff Investigators"]
+          # NOTE: Bristol & Plymouth MA are slightly over 500K but kept because
+          # MA only has 14 counties total and the remaining sub-500K pool is thin.
+          # Norfolk (~725K), Essex (~810K), Middlesex (~1.6M), Worcester (~860K),
+          # and Suffolk MA (Boston ~800K) all excluded per cap.
+
+          # ── Active personas (locked to the 3 we established) ───────
           ACTIVE_PERSONAS = [
               "Public Defender",
               "District Attorney",
               "Police/Sheriff Investigators",
           ]
-          # ── Org types & titles (all defined; filtered by ACTIVE_PERSONAS below) ──
+
+          # ── Org types & titles (state-aware search guidance) ───────
+          # Search prompts per state adjust org structure (MA DAs are
+          # district-based; MA Public Defender = CPCS regional).
           ORG_TYPES = [
-              {"type": "Sheriff",           "titles": ["Sheriff", "Undersheriff", "Chief Deputy Sheriff", "Commander", "Captain", "Lieutenant", "Sergeant"]},
-              {"type": "District Attorney", "titles": ["District Attorney", "Chief Deputy DA", "Assistant District Attorney", "Deputy District Attorney", "Chief Investigator", "Senior Investigator"]},
-              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender"]},
-              {"type": "Police Department", "titles": ["Chief of Police", "Deputy Chief", "Assistant Chief", "Commander", "Captain", "Lieutenant"]},
-              {"type": "City Attorney",     "titles": ["City Attorney", "Deputy City Attorney", "Assistant City Attorney"]},
-              {"type": "Court",             "titles": ["Court Administrator", "Court Executive Officer", "Clerk of Court", "Chief Court Administrator", "Presiding Judge", "Assistant Presiding Judge"]},
-              {"type": "Investigator",      "titles": ["Chief Investigator", "Senior Investigator", "Criminal Investigator", "Detective Investigator", "Special Investigator", "Investigator"]},
-              {"type": "Corrections",       "titles": ["Corrections Investigator", "Correctional Investigative Officer", "Inspector General Corrections", "Internal Affairs Corrections", "Chief of Investigations"]},
-              {"type": "Internal Affairs",  "titles": ["Internal Affairs Director", "Internal Affairs Lieutenant", "Internal Affairs Sergeant", "Professional Standards Director", "Professional Standards Captain", "Professional Standards Lieutenant"]},
-              {"type": "Human Resources",   "titles": ["HR Director", "Chief Human Resources Officer", "HR Manager", "Employee Relations Manager", "Labor Relations Director", "HR Investigations Manager"]},
+              {"type": "District Attorney", "titles": ["District Attorney", "First Assistant DA", "Chief Assistant DA", "Assistant District Attorney", "Deputy District Attorney", "Chief Investigator", "Senior Investigator", "Investigator"]},
+              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender", "Staff Attorney", "Trial Attorney", "Supervising Attorney"]},
               {"type": "Police/Sheriff Investigators",
                "titles": [
                    # Command
@@ -108,32 +133,9 @@ jobs:
                    "Sergeant Investigations", "Investigations Sergeant",
                ]},
           ]
-          AES = ["Dillon DeWitt", "Will Weis", "James Gregory"]
-          MEETING_LINKS = {
-              "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
-              "Will Weis":      "https://meetings.hubspot.com/will-weis",
-              "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
-          }
-          def get_meeting_link(ae_name):
-              return MEETING_LINKS.get(ae_name, MEETING_LINKS["Dillon DeWitt"])
-          LIST_URLS = {
-              "Dillon DeWitt":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9561",
-              "Will Weis":      f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9562",
-              "James Gregory":  f"https://app.hubspot.com/contacts/{PORTAL_ID}/lists/9575",
-          }
-          ACTIVE_COLOR = "#7c3aed"
-          AE_COLORS = {
-              "Dillon DeWitt":  "#2563eb",
-              "Will Weis":      "#7c3aed",
-              "James Gregory":  "#059669",
-          }
-          # ── Persona angles (all defined; only active ones used) ───
+
+          # ── Persona angles (3 active personas) ─────────────────────
           PERSONA_ANGLES = {
-              "Sheriff": {
-                  "pain":     "managing body cam footage and interrogation recordings manually",
-                  "use_case": "body cam transcription and interrogation documentation",
-                  "proof":    "departments using Rev cut documentation time by 60%"
-              },
               "District Attorney": {
                   "pain":     "preparing court proceedings and managing evidence documentation",
                   "use_case": "court proceeding transcription and evidence documentation",
@@ -144,66 +146,32 @@ jobs:
                   "use_case": "client interview transcription and case prep documentation",
                   "proof":    "public defender offices using Rev improve case turnaround"
               },
-              "Police Department": {
-                  "pain":     "manually processing 911 calls and incident report recordings",
-                  "use_case": "911 call transcription and incident report automation",
-                  "proof":    "police departments using Rev process calls 3x faster"
-              },
-              "City Attorney": {
-                  "pain":     "transcribing depositions, hearings and legal proceedings manually",
-                  "use_case": "legal proceeding transcription and deposition documentation",
-                  "proof":    "city attorney offices using Rev reduce documentation time significantly"
-              },
-              "Court": {
-                  "pain":     "managing court proceeding recordings and transcription backlogs",
-                  "use_case": "court proceeding transcription and record management",
-                  "proof":    "court administrators using Rev process hearings 3x faster"
-              },
-              "Investigator": {
-                  "pain":     "manually transcribing witness interviews, recorded statements and investigative recordings",
-                  "use_case": "witness interview transcription and investigative documentation",
-                  "proof":    "investigative units using Rev cut interview documentation time by 60%"
-              },
-              "Corrections": {
-                  "pain":     "documenting inmate incidents, staff misconduct investigations and internal case recordings manually",
-                  "use_case": "corrections investigation transcription and incident documentation",
-                  "proof":    "corrections agencies using Rev reduce investigation documentation time significantly"
-              },
-              "Internal Affairs": {
-                  "pain":     "transcribing officer interviews, use-of-force recordings and misconduct investigation files manually",
-                  "use_case": "internal affairs interview transcription and misconduct investigation documentation",
-                  "proof":    "internal affairs units using Rev cut investigation documentation time by 50%"
-              },
-              "Human Resources": {
-                  "pain":     "manually transcribing harassment complaints, termination meetings and employee investigation recordings",
-                  "use_case": "HR investigation transcription and employee relations documentation",
-                  "proof":    "county HR departments using Rev reduce documentation risk and investigation turnaround significantly"
-              },
               "Police/Sheriff Investigators": {
                   "pain":     "investigators and command staff drowning in body cam, interview, and interrogation footage that has to be reviewed and documented manually",
                   "use_case": "interview/interrogation transcription, body cam documentation, and case-file evidence prep",
                   "proof":    "investigations units using Rev cut review and documentation time by 60%, freeing detectives to close more cases"
               },
           }
+
           DEPT_MAP = {
-              "Sheriff":                       "Sheriff Dept",
               "District Attorney":             "DA Office",
               "Public Defender":               "Public Defender",
-              "Police Department":             "Police Dept",
-              "City Attorney":                 "City Attorney",
-              "Court":                         "Court",
-              "Investigator":                  "Investigations",
-              "Corrections":                   "Corrections",
-              "Internal Affairs":              "Internal Affairs",
-              "Human Resources":               "Human Resources",
               "Police/Sheriff Investigators":  "Police/Sheriff Investigators",
           }
-          # ── Apply ACTIVE_PERSONAS filter ─────────────────────────
-          # Filters ORG_TYPES so the main loop only iterates over active personas.
-          # PERSONA_ANGLES and DEPT_MAP keep all definitions (inactive entries dormant
-          # but accessible) so reverting is a one-line edit to ACTIVE_PERSONAS above.
+
+          # ── Procurement notes per state ────────────────────────────
+          STATE_PROCUREMENT = {
+              "NY": "NY OGS Centralized Contract available — NYS Contract PT (Manageable Print Services / SaaS) and OGS IT Umbrella Contracts allow direct purchase without separate RFP. County agencies can piggyback on state contracts.",
+              "MA": "MA Statewide Contract via COMMBUYS — ITS78 (Software & Services) and ITC73 (IT Project Services) vehicles allow county/municipal LE agencies to purchase directly without standalone procurement.",
+          }
+
+          # ── Persona angles & DEPT_MAP filtered to ACTIVE_PERSONAS ──
           ORG_TYPES = [o for o in ORG_TYPES if o["type"] in ACTIVE_PERSONAS]
           print(f"🎯 Active personas ({len(ORG_TYPES)}): {[o['type'] for o in ORG_TYPES]}")
+          print(f"📍 States: NY ({len(STATE_COUNTIES['NY'])} counties) + MA ({len(STATE_COUNTIES['MA'])} counties)")
+          print(f"👤 Single owner: {OWNER_NAME} ({OWNER_EMAIL})")
+          print(f"📊 Daily cap: {TOTAL_DAILY_CAP} ({LEADS_PER_STATE['NY']} NY / {LEADS_PER_STATE['MA']} MA)")
+
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
               r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
@@ -211,61 +179,74 @@ jobs:
           def hs_post(path, payload):
               r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r.json()
-          # ── Owner map ─────────────────────────────────────────────
-          owners    = hs_get("/crm/v3/owners").get("results", [])
-          owner_map = {f"{o['firstName']} {o['lastName']}": o["id"] for o in owners}
-          print(f"Owners: {list(owner_map.keys())}")
+
+          # ── Resolve Mike Merritts' HubSpot owner ID at runtime ────
+          owners = hs_get("/crm/v3/owners").get("results", [])
+          owner_id = None
+          for o in owners:
+              if o.get("email", "").lower() == OWNER_EMAIL.lower():
+                  owner_id = o["id"]
+                  break
+          if not owner_id:
+              for o in owners:
+                  full = f"{o.get('firstName','')} {o.get('lastName','')}".strip()
+                  if full.lower() == OWNER_NAME.lower():
+                      owner_id = o["id"]
+                      break
+          if not owner_id:
+              raise RuntimeError(f"❌ Could not find HubSpot owner for {OWNER_NAME} ({OWNER_EMAIL}). Verify owner exists.")
+          print(f"✅ Resolved owner: {OWNER_NAME} → ID {owner_id}")
+
           LEADSOURCE_VALUE = "Claude"
-          # ── Build county → expected owner lookup ─────────────────────
-          ALL_COUNTIES = {
-              county: ae
-              for ae, counties in {**{ae: AE_COUNTIES[ae] + AE_OVERFLOW_COUNTIES.get(ae, []) for ae in AES}}.items()
-              for county in counties
-          }
-          # ── Ownership audit (runs every execution) ────────────────────
+
+          # ── State → county lookup (for ownership audit) ───────────
+          ALL_COUNTIES = {}
+          for state_code, counties in STATE_COUNTIES.items():
+              for c in counties:
+                  ALL_COUNTIES[(state_code, c)] = OWNER_NAME  # all → Mike
+
+          # ── Ownership audit (every OB contact → Mike) ─────────────
           def audit_ownership():
-              """Find & fix any OB contacts whose owner doesn't match their county territory."""
-              print("🔍 Auditing contact ownership...")
+              """Find & fix any OB contacts whose owner isn't Mike."""
+              print("🔍 Auditing contact ownership (all OB → Mike)...")
               fixes = []
               offset = 0
               while True:
                   resp = hs_post("/crm/v3/objects/contacts/search", {
                       "filterGroups": [{"filters": [
-                          {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"}
+                          {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"},
+                          {"propertyName": "state", "operator": "IN", "values": ["New York", "Massachusetts"]}
                       ]}],
-                      "properties": ["county", "hubspot_owner_id"],
+                      "properties": ["county", "state", "hubspot_owner_id"],
                       "limit": 200,
                       "after": offset if offset else None
                   })
                   results = resp.get("results", [])
                   for c in results:
-                      county    = (c["properties"].get("county") or "").strip()
                       actual_id = str(c["properties"].get("hubspot_owner_id") or "")
-                      expected_ae = ALL_COUNTIES.get(county)
-                      if not expected_ae:
-                          continue
-                      expected_id = str(owner_map.get(expected_ae, ""))
-                      if expected_id and actual_id != expected_id:
-                          fixes.append({"id": c["id"], "county": county,
-                                        "expected_ae": expected_ae, "expected_id": expected_id})
+                      if actual_id != str(owner_id):
+                          fixes.append({"id": c["id"],
+                                        "county": c["properties"].get("county", ""),
+                                        "state":  c["properties"].get("state",  "")})
                   paging = resp.get("paging", {})
                   next_after = paging.get("next", {}).get("after")
                   if not next_after:
                       break
                   offset = next_after
               if not fixes:
-                  print(f"  ✅ All OB contacts have correct ownership")
+                  print(f"  ✅ All NY/MA OB contacts already owned by Mike")
                   return
-              print(f"  ⚠️ Found {len(fixes)} ownership mismatches — correcting...")
+              print(f"  ⚠️ Found {len(fixes)} ownership mismatches — reassigning to Mike...")
               for i in range(0, len(fixes), 10):
                   batch = fixes[i:i+10]
-                  inputs = [{"id": f["id"], "properties": {"hubspot_owner_id": f["expected_id"]}} for f in batch]
+                  inputs = [{"id": f["id"], "properties": {"hubspot_owner_id": str(owner_id)}} for f in batch]
                   requests.patch("https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
                       headers=HS_HEADERS, json={"inputs": inputs})
                   for f in batch:
-                      print(f"    ✅ Fixed {f['county']} contact {f['id']} → {f['expected_ae']}")
+                      print(f"    ✅ Reassigned {f['state']}/{f['county']} contact {f['id']} → Mike")
               print(f"  ✅ Ownership audit complete — {len(fixes)} contacts corrected")
           audit_ownership()
+
           # ── Ensure county signal properties exist in HubSpot ──────
           COUNTY_PROPS = [
               {
@@ -278,7 +259,7 @@ jobs:
               {
                   "name":        "county_carahsoft__naspo",
                   "label":       "Procurement Context",
-                  "description": "Purchasing contract vehicle reps can reference to bypass RFP. Pre-filled for all CA counties with the statewide NASPO ValuePoint contract.",
+                  "description": "Purchasing contract vehicle reps can reference to bypass RFP. NY = OGS contracts; MA = COMMBUYS statewide.",
                   "type":        "string",
                   "fieldType":   "text",
               },
@@ -325,8 +306,9 @@ jobs:
                       print(f"  ✅ Property ready: {prop['name']} ({status})")
               except Exception as e:
                   print(f"  ⚠️ Property setup error ({prop['name']}): {e}")
+
           # ── State management ──────────────────────────────────────
-          STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
+          STATE_MARKER = "OUTBOUND_AGENT_STATE_V4_NYMA"  # bumped from V3 (CA)
           def load_state():
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
@@ -345,6 +327,7 @@ jobs:
               except Exception as e:
                   print(f"State load error: {e}")
               return None
+
           def save_state(state):
               try:
                   hs_post("/crm/v3/objects/notes", {
@@ -355,474 +338,34 @@ jobs:
                   })
               except Exception as e:
                   print(f"State save error: {e}")
+
           def init_state():
               return {
-                  "Dillon DeWitt":  {"county": AE_COUNTIES["Dillon DeWitt"][0],  "exhausted": [], "county_leads": {}},
-                  "Will Weis":      {"county": AE_COUNTIES["Will Weis"][0],       "exhausted": [], "county_leads": {}},
-                  "James Gregory":  {"county": AE_COUNTIES["James Gregory"][0],   "exhausted": [], "county_leads": {}},
+                  "NY": {"county": STATE_COUNTIES["NY"][0], "exhausted": [], "county_leads": {}},
+                  "MA": {"county": STATE_COUNTIES["MA"][0], "exhausted": [], "county_leads": {}},
               }
-          def next_county_for_ae(ae_name, state):
-              exhausted_self = set(state[ae_name].get("exhausted", []))
-              for county in AE_COUNTIES[ae_name]:
-                  if county not in exhausted_self:
-                      return county
-              for county in AE_OVERFLOW_COUNTIES.get(ae_name, []):
+
+          def next_county_for_state(state_code, state):
+              exhausted_self = set(state[state_code].get("exhausted", []))
+              for county in STATE_COUNTIES[state_code]:
                   if county not in exhausted_self:
                       return county
               return None
-          def get_upcoming_counties(ae_name, state, n=2):
+
+          def get_upcoming_counties(state_code, state, n=2):
               """Return the next N counties after the current active one (excluding exhausted)."""
-              exhausted_self = set(state[ae_name].get("exhausted", []))
-              current        = state[ae_name].get("county")
-              full_list      = AE_COUNTIES[ae_name] + AE_OVERFLOW_COUNTIES.get(ae_name, [])
+              exhausted_self = set(state[state_code].get("exhausted", []))
+              current        = state[state_code].get("county")
+              full_list      = STATE_COUNTIES[state_code]
               upcoming       = [c for c in full_list if c not in exhausted_self and c != current]
               return upcoming[:n]
-          # ── County scoring (runs weekly, cached in HubSpot note) ──
-          SCORE_MARKER   = "COUNTY_SCORE_STATE_V1"
+
+          # ── County scoring (will populate via Claude API on first run) ──
+          SCORE_MARKER   = "COUNTY_SCORE_STATE_V2_NYMA"  # bumped from V1 (CA)
           SCORE_MAX_DAYS = 7
-          # ── Seed scores (real PDF extractions + estimates) ───────
-          SEED_SCORES = {
-              "Contra Costa": {
-                  "county": "Contra Costa", "score": 91,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 343.0,
-                  "tier2_it_pct": 2.4, "tier2_it_growing": False,
-                  "tier3_transcription_line": True, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
-                  "procurement_note": "700 Axon BWCs on Evidence.com + DigitalOnQ DEMS with automated transcription in rollout. Justice Premier for DA/Pub Def/Probation. CA NASPO/Carahsoft (#AR2472) — no RFP required.",
-                  "evidence": "Public Defender implementing new Digital Evidence Management System with automated transcription of body cam footage. 700 BWCs deployed at $1.98M/yr via Axon. $343M Sheriff budget, $71.6M DA. $7.15B total county budget.",
-                  "snippet": "Saw Contra Costa DA's new digital evidence system specifically calls out 'automated transcriptions' in FY25-26 — they're already mapping this problem.\nYou're on NASPO so there's no RFP, and body cam footage is live with 700 Axon cameras deployed.",
-              },
-              "Santa Clara": {
-                  "county": "Santa Clara", "score": 89,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 588.0,
-                  "tier2_it_pct": 3.4, "tier2_it_growing": True,
-                  "tier3_transcription_line": True, "tier3_transcription_amt_k": 325,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
-                  "procurement_note": "$16M 5-yr Axon contract (all sworn BWC); 60-officer Taser pilot launched Sep 2024. 5 FT DA transcriptionists on payroll (~$325K/yr est). CA NASPO/Carahsoft (#AR2472) — no RFP needed.",
-                  "evidence": "DA has 5 full-time Transcriptionists on payroll (~$325K/yr est). $16M 5-yr Axon BWC contract; 60-officer Taser pilot Sep 2024. $588M combined Sheriff budget, $201M DA. $13B total county budget growing 8.9%.",
-                  "snippet": "Santa Clara DA has 5 full-time transcriptionists on payroll — that's a sign they're doing this manually at significant cost.\nBWC program is live and funded. You're on NASPO so procurement is a single PO via Carahsoft.",
-              },
-              "San Mateo": {
-                  "county": "San Mateo", "score": 72,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 200.0,
-                  "tier2_it_pct": 3.1, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
-                  "procurement_note": "$3.4M Peregrine Technologies data centralization contract (Jan 2026–Jul 2027) integrating Axon Evidence.com, Skydio DFR, ALPR, dispatch/RMS/JMS. CA NASPO/Carahsoft (#AR2472) available for SaaS add-ons.",
-                  "evidence": "$3.4M Peregrine Technologies contract (Jan 2026) centralizing Axon Evidence.com, ALPR, Skydio DFR, dispatch/RMS/JMS. ~$200M Sheriff budget. Tech-forward, Silicon Valley-adjacent.",
-                  "snippet": "San Mateo Sheriff just kicked off a $3.4M data centralization project (Jan 2026) — Axon, ALPR, dispatch all being integrated.\nYou're on NASPO so there's no procurement cycle, Carahsoft has the contract vehicle.",
-              },
-              "Napa": {
-                  "county": "Napa", "score": 69,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 56.4,
-                  "tier2_it_pct": 7.0, "tier2_it_growing": True,
-                  "tier3_transcription_line": True, "tier3_transcription_amt_k": 8,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "95 VieVu cameras deployed; $40K storage server for footage. DA FY25-26 budget has explicit transcription line (~$8K) for upcoming trials. Axon Fleet Expansion in current budget. CA NASPO/Carahsoft (#AR2472).",
-                  "evidence": "DA budget explicitly lists transcription costs for upcoming trials ($8K est). 95 VieVu BWCs deployed + $40K storage server. Axon Fleet Expansion underway. Sheriff budget increased 14% YoY. $56M Sheriff, $14.8M DA.",
-                  "snippet": "Napa DA's FY25-26 budget specifically calls out 'transcription costs for upcoming trials' as a line item — they're paying for this manually today.\nAxon Fleet Expansion is in this year's budget too, so body cam volume is about to go up.",
-              },
-              "Sonoma": {
-                  "county": "Sonoma", "score": 65,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 170.0,
-                  "tier2_it_pct": 2.8, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": True,
-                  "procurement_note": "Active BWC program; significant post-wildfire ARPA public safety tech investments. CA NASPO/Carahsoft (#AR2472) — cooperative contract experience across county departments.",
-                  "evidence": "Active BWC program. Significant post-fire tech investments. ~$170M Sheriff. ARPA-funded public safety projects. Strong law enforcement budget growth.",
-                  "snippet": "Sonoma Sheriff made significant tech investments post-wildfire — body cam program is active and funded.\nYou're on NASPO, and they've been receptive to SaaS purchases via cooperative contracts.",
-              },
-              "Alameda": {
-                  "county": "Alameda", "score": 59,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 636.4,
-                  "tier2_it_pct": 2.2, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "1,200 Axon BWCs on Evidence.com since 2017 (DOJ-funded); Digital Evidence Portal active; drones-as-first-responders program. CA NASPO/Carahsoft (#AR2472) — cooperative vehicle simplifies path in procurement-scrutiny environment.",
-                  "evidence": "1,200 Axon BWCs on Evidence.com since 2017 (DOJ-funded). Digital Evidence Portal + drones-as-first-responders active. $636M Sheriff budget — largest in cohort. $112M DA. Budget under stress: $12.8M Sheriff cuts.",
-                  "snippet": "Alameda has one of the largest Sheriff departments in CA at $636M — there's real operational scale here even with current budget pressure.\nYou're on NASPO which matters in a procurement-cautious environment like Alameda.",
-              },
-              "Solano": {
-                  "county": "Solano", "score": 55,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 120.0,
-                  "tier2_it_pct": 2.1, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Fairfield PD and Vallejo PD both on Axon Evidence.com within county. CA NASPO/Carahsoft (#AR2472) simplifies cross-jurisdictional purchase.",
-                  "evidence": "Fairfield PD + Vallejo PD on Axon Evidence.com. ~$120M Sheriff. BWC program active. Growing county budget.",
-                  "snippet": "Solano Sheriff handles Vallejo and Fairfield — high-volume patrol with an active body cam program.\nOn NASPO so procurement is straightforward.",
-              },
-              "Marin": {
-                  "county": "Marin", "score": 54,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 70.0,
-                  "tier2_it_pct": 3.2, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Active Digital Accelerator program (Chief Digital & Innovation Officer Crosby Burns; 90-day tech sprints). New county website 2024. CA NASPO/Carahsoft (#AR2472) — innovation office accelerates SaaS onboarding.",
-                  "evidence": "Digital Accelerator program with CDIO (90-day tech sprints). New county website 2024. ~$70M Sheriff. High per-capita IT spend. Active BWC program.",
-                  "snippet": "Marin County has an active Digital Accelerator program with a Chief Digital Officer running 90-day tech sprints.\nSmall enough that a single deal covers the whole department — and you're on NASPO.",
-              },
-              "Placer": {
-                  "county": "Placer", "score": 53,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 200.0,
-                  "tier2_it_pct": 2.6, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": False,
-                  "procurement_note": "437-camera BWC rollout ($4.8M program) funded; BJA $580K Byrne grant secured. DA on Axon Attorney Premier. CA NASPO/Carahsoft (#AR2472); Sourcewell used for prior buys.",
-                  "evidence": "437 BWCs deployed ($4.8M program); BJA $580K grant secured. DA on Axon Attorney Premier. ~$200M Sheriff budget (6 programs). $35M DA. Budget grew 9.5% YoY. 608 Sheriff + 13 new FTEs.",
-                  "snippet": "Placer Sheriff just rolled out 437 body cams ($4.8M program) and the DA is on Axon Attorney Premier — evidence volume is live and growing.\nBJA grant funded the program; you're on NASPO so a single PO via Carahsoft closes it.",
-              },
-              "Santa Cruz": {
-                  "county": "Santa Cruz", "score": 50,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
-                  "tier2_it_pct": 2.4, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "OIG 2024 annual report calls for expanded BWC-on policies and use-of-force overhaul — compliance pressure driving evidence volume up. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "OIG 2024 report calls for expanded BWC-on policies and use-of-force overhaul. ~$80M Sheriff. Active BWC program. University-adjacent (UCSC).",
-                  "snippet": "Santa Cruz's Inspector General just published a 2024 report pushing the Sheriff to expand body cam-on policies.\nMore footage = more transcription volume. You're on NASPO so no RFP required.",
-              },
-              "Merced": {
-                  "county": "Merced", "score": 51,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
-                  "tier2_it_pct": 1.8, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": True, "tier4_new_hire": True, "tier4_arpa": True,
-                  "procurement_note": "$2.5M ARPA public safety/justice programming active; new correctional center under construction. CA NASPO/Carahsoft (#AR2472) — ARPA funds can flow through cooperative contracts.",
-                  "evidence": "$1.12B total county budget. $2.5M ARPA public safety/justice programming. $1.1M radio replacement project. New correctional center. Fast-growing county (UC Merced effect).",
-                  "snippet": "Merced County has $2.5M in ARPA public safety funds actively being spent — new jail, radio replacement, and DA caseload growing with UC Merced.\nOn NASPO so there's no competitive bid process.",
-              },
-              "Butte": {
-                  "county": "Butte", "score": 51,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
-                  "tier2_it_pct": 2.0, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": True,
-                  "procurement_note": "LensLock BWC system processing ~30,000 submissions/year. Post-Camp Fire tech investment + ARPA public safety funds active. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "LensLock BWC system: ~30K body cam submissions/yr (Records Unit). ~$80M Sheriff. Post-Camp Fire tech investments. ARPA public safety funds active.",
-                  "snippet": "Butte County's Records Unit processes 30,000 body cam submissions a year — that's a real evidence management workload.\nARPA funds are still active, and you're on NASPO so procurement is a single PO.",
-              },
-              "Nevada": {
-                  "county": "Nevada", "score": 42,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 50.0,
-                  "tier2_it_pct": 1.9, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "BWC program approved 2021 and operational. CA NASPO/Carahsoft (#AR2472) available — small department, single PO covers all.",
-                  "evidence": "$415.5M county budget (conservative, balanced). BWC program approved 2021, now operational. ~$50M Sheriff. Budget growth flat.",
-                  "snippet": "Nevada County Sheriff approved body cams in 2021 and they're operational — that footage is going somewhere today.\nSmall department where one deal covers everything. On NASPO.",
-              },
-              "Yolo": {
-                  "county": "Yolo", "score": 50,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 60.0,
-                  "tier2_it_pct": 2.5, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "$200K BWC budget line in FY2023-24. UC Davis law enforcement generates steady evidence volume. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "$200K BWC budget line FY2023-24. $223.5M county revenues. Davis/Woodland area. ~$60M Sheriff. University-adjacent, moderate tech adoption.",
-                  "snippet": "Yolo County budgeted $200K for body cameras in FY2023-24 — that footage needs transcription and evidence management downstream.\nOn NASPO, no RFP needed.",
-              },
-              "El Dorado": {
-                  "county": "El Dorado", "score": 49,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 70.0,
-                  "tier2_it_pct": 2.0, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Axon BWC contract via Sourcewell ($2.1M + $750K/yr maintenance) approved 2021. FY2025-26 shows increased software license spend. CA NASPO/Carahsoft (#AR2472) also available — Sourcewell already in use.",
-                  "evidence": "Sourcewell/Axon BWC contract $2.1M + $750K/yr maintenance. FY2025-26 budget shows software license increases. ~$70M Sheriff. Growing foothill county between Sacramento and Tahoe.",
-                  "snippet": "El Dorado Sheriff is already using Sourcewell for their Axon BWC contract ($2.1M deal) — cooperative purchasing is already in their workflow.\nOn NASPO (Carahsoft) as well — single PO closes it.",
-              },
-              "Shasta": {
-                  "county": "Shasta", "score": 47,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 80.0,
-                  "tier2_it_pct": 1.8, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "GovConnection active via Sourcewell Contract 081419-GVC. CA NASPO/Carahsoft (#AR2472) available — cooperative purchasing already in workflow.",
-                  "evidence": "GovConnection via Sourcewell Contract 081419-GVC active. ~$80M Sheriff. Conservative budget. Redding-area county — historically busy DA caseload.",
-                  "snippet": "Shasta County is already buying through Sourcewell (GovConnection contract) — cooperative purchasing is in their workflow.\nRedding's DA caseload is one of the busiest in NorCal. On NASPO too.",
-              },
-              "Madera": {
-                  "county": "Madera", "score": 40,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 50.0,
-                  "tier2_it_pct": 1.7, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Central Valley county, Fresno-adjacent. CA NASPO/Carahsoft (#AR2472) — no competitive bid required.",
-                  "evidence": "Central Valley county, Fresno-adjacent. ~$50M Sheriff. Moderate law enforcement operations.",
-                  "snippet": "Madera County DA handles significant Central Valley caseloads — narcotics, ag crime, DUI.\nOn NASPO, clean procurement path.",
-              },
-              "Kings": {
-                  "county": "Kings", "score": 41,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 50.0,
-                  "tier2_it_pct": 1.6, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "BWC policy adopted Dec 2021; BJA grant recipient 2022 for camera deployment. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "BWC policy adopted Dec 2021; BJA grant recipient 2022. Hanford/Lemoore area. ~$50M Sheriff. Central Valley rural county.",
-                  "snippet": "Kings County Sheriff deployed body cams via a 2022 BJA grant — evidence is being generated and needs management.\nOn NASPO, no RFP needed.",
-              },
-              "Humboldt": {
-                  "county": "Humboldt", "score": 41,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 45.0,
-                  "tier2_it_pct": 1.7, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Smartphone-based (Android app) BWC deployed to all deputies — active footage generation. CA NASPO/Carahsoft (#AR2472) available; tight budget makes ROI framing essential.",
-                  "evidence": "Smartphone-based (Android app) BWC deployed to all deputies. ~$45M Sheriff. Budget under fiscal stress. OIS footage released Jan 2024.",
-                  "snippet": "Humboldt Sheriff issues every deputy a smartphone as a body cam — footage is being generated but storage/management is a real pain point.\nOn NASPO so procurement is simple even with a tight budget.",
-              },
-              "Imperial": {
-                  "county": "Imperial", "score": 36,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 60.0,
-                  "tier2_it_pct": 1.5, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": True,
-                  "procurement_note": "Federal border enforcement grants active; high patrol/interview/evidence volume. CA NASPO/Carahsoft (#AR2472) available — federal funds can flow through cooperative contracts.",
-                  "evidence": "Border county. ~$60M Sheriff (border ops). Federal grants active for border enforcement.",
-                  "snippet": "Imperial County Sheriff handles significant border-related law enforcement — high interview and evidence volume.\nFederal grants are flowing; on NASPO for any procurement.",
-              },
-              "Sutter": {
-                  "county": "Sutter", "score": 37,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 30.0,
-                  "tier2_it_pct": 1.6, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "BWCs operational (use-of-force footage publicly released). Yuba City area. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "BWCs operational — use-of-force footage released publicly. Yuba City area. ~$30M Sheriff. Small-medium county.",
-                  "snippet": "Sutter County Sheriff has body cams operational and releases use-of-force footage — evidence management is a live workload.\nOn NASPO — one PO to close a deal.",
-              },
-              "San Benito": {
-                  "county": "San Benito", "score": 34,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
-                  "tier2_it_pct": 1.5, "tier2_it_growing": True,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": True, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "$2.5M 10-year BWC upgrade contract approved by Board of Supervisors Mar 2023. Fastest-growing CA county by %. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "$2.5M 10-year BWC upgrade contract approved Mar 2023. Hollister. Fastest-growing CA county by %. ~$20M Sheriff but rapidly growing.",
-                  "snippet": "San Benito just approved a $2.5M 10-year body cam contract in 2023 — footage volume is ramping up in one of CA's fastest-growing counties.\nOn NASPO, easy procurement as they build out systems.",
-              },
-              "Calaveras": {
-                  "county": "Calaveras", "score": 28,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 18.0,
-                  "tier2_it_pct": 1.4, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Small foothill county, gold-rush corridor. CA NASPO/Carahsoft (#AR2472) — no competitive bid required.",
-                  "evidence": "Gold rush foothill county. ~$18M Sheriff. Small rural county.",
-                  "snippet": "Calaveras County is small but their Sheriff covers major highway corridors and tourist areas.\nOn NASPO.",
-              },
-              "Tuolumne": {
-                  "county": "Tuolumne", "score": 33,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
-                  "tier2_it_pct": 1.4, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "5-year Axon BWC contract via Sourcewell awarded 2022. CA NASPO/Carahsoft (#AR2472) also available.",
-                  "evidence": "5-year Axon BWC contract via Sourcewell (2022). $68M total county budget. Sonora. ~$20M Sheriff.",
-                  "snippet": "Tuolumne Sheriff is already on a 5-year Axon BWC contract via Sourcewell — cooperative purchasing is their norm.\nOn NASPO as well, Carahsoft makes it one PO.",
-              },
-              "Mendocino": {
-                  "county": "Mendocino", "score": 26,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 30.0,
-                  "tier2_it_pct": 1.4, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "$17.8M budget deficit FY25-26 — tight budget; ROI framing critical. CA NASPO/Carahsoft (#AR2472) reduces procurement friction for budget-scrutinized purchases.",
-                  "evidence": "$17.8M budget deficit in FY25-26. Sheriff and Jail missing attrition savings targets. Rural NorCal coast. Budget under significant stress.",
-                  "snippet": "Mendocino is navigating a serious budget deficit — any pitch needs to frame ROI clearly.\nOn NASPO, which matters when procurement is under scrutiny.",
-              },
-              "Tehama": {
-                  "county": "Tehama", "score": 27,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
-                  "tier2_it_pct": 1.3, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": True,
-                  "procurement_note": "60 LensLock BWCs approved May 2024 ($295,329 total) via BJA Small/Rural grant + $150K county match. Cloud evidence storage + redaction services included. CA NASPO/Carahsoft (#AR2472) also available.",
-                  "evidence": "60 LensLock BWCs approved May 2024 ($295,329) via BJA Small/Rural grant + county match. Cloud DEMS + redaction + CAD integration included. ~$20M Sheriff.",
-                  "snippet": "Tehama Sheriff just deployed 60 LensLock body cams in May 2024 — brand-new BWC program with cloud evidence storage already in the contract.\nBJA grant funded it; you're on NASPO too.",
-              },
-              "Lake": {
-                  "county": "Lake", "score": 25,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 20.0,
-                  "tier2_it_pct": 1.3, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Budget historically stressed; rural NorCal. CA NASPO/Carahsoft (#AR2472) — cooperative contract simplifies any purchase.",
-                  "evidence": "Lakeport. Rural NorCal. Budget historically stressed. ~$20M Sheriff.",
-                  "snippet": "Lake County DA handles drug and rural crime caseloads.\nOn NASPO.",
-              },
-              "Lassen": {
-                  "county": "Lassen", "score": 21,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 12.0,
-                  "tier2_it_pct": 1.2, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "State prison boosts LE activity and caseloads beyond county population. Susanville. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Susanville. Prison-town economy. ~$12M Sheriff. Small remote county.",
-                  "snippet": "Lassen County's law enforcement activity is boosted by its state prison operations.\nOn NASPO.",
-              },
-              "Amador": {
-                  "county": "Amador", "score": 22,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 15.0,
-                  "tier2_it_pct": 1.2, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Small foothill county. Jackson. CA NASPO/Carahsoft (#AR2472) — no competitive bid required.",
-                  "evidence": "Jackson. Small foothill county. ~$15M Sheriff.",
-                  "snippet": "Amador County is small but the Sheriff and DA handle a steady caseload.\nOn NASPO.",
-              },
-              "Glenn": {
-                  "county": "Glenn", "score": 16,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 10.0,
-                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Very small agricultural county. Willows. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Willows. Very small rural county. ~$10M Sheriff.",
-                  "snippet": "Glenn County is small, but any department using Rev saves time on a per-case basis.\nOn NASPO.",
-              },
-              "Del Norte": {
-                  "county": "Del Norte", "score": 20,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 10.0,
-                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": True,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "BWCs operational — body cam footage released from 2024 OIS incident in Crescent City. Most remote CA county. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "BWCs operational — OIS body cam footage released 2024. Crescent City. Most remote northern CA county. ~$10M Sheriff.",
-                  "snippet": "Del Norte is remote — body cam footage was released from a 2024 incident, so evidence management is a live workload.\nOn NASPO — one PO even from the most remote county in CA.",
-              },
-              "Siskiyou": {
-                  "county": "Siskiyou", "score": 21,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 12.0,
-                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "One of largest CA counties by area, small population. Yreka. FY2024-25 budget available. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Yreka. Large geographic territory, small population. ~$12M Sheriff. FY2024-25 budget posted.",
-                  "snippet": "Siskiyou Sheriff patrols one of the largest counties in CA by area — lots of patrol = lots of evidence.\nOn NASPO.",
-              },
-              "Colusa": {
-                  "county": "Colusa", "score": 16,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 8.0,
-                  "tier2_it_pct": 1.1, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Tiny agricultural county. Williams. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Williams. Tiny agricultural county. ~$8M Sheriff.",
-                  "snippet": "Colusa County is small but their DA still handles criminal caseloads.\nOn NASPO.",
-              },
-              "Trinity": {
-                  "county": "Trinity", "score": 11,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 6.0,
-                  "tier2_it_pct": 1.0, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Very small remote county. Weaverville. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Weaverville. Very small remote county. ~$6M Sheriff.",
-                  "snippet": "Trinity County is small and remote.\nOn NASPO.",
-              },
-              "Plumas": {
-                  "county": "Plumas", "score": 13,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 7.0,
-                  "tier2_it_pct": 1.0, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Mountain county in post-wildfire region. Quincy. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Quincy. Mountain county. ~$7M Sheriff.",
-                  "snippet": "Plumas County Sheriff covers remote mountain terrain.\nOn NASPO.",
-              },
-              "Inyo": {
-                  "county": "Inyo", "score": 13,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 8.0,
-                  "tier2_it_pct": 1.0, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Death Valley and eastern Sierra jurisdiction — vast territory, small force. Bishop. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Bishop. Desert/mountain county. ~$8M Sheriff. Death Valley jurisdiction.",
-                  "snippet": "Inyo County covers Death Valley and eastern Sierra — vast territory, small force.\nOn NASPO.",
-              },
-              "Modoc": {
-                  "county": "Modoc", "score": 9,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 4.0,
-                  "tier2_it_pct": 0.9, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Most remote CA county. Alturas. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Alturas. Most remote CA county. ~$4M Sheriff. Tiny population.",
-                  "snippet": "Modoc County is very small and remote.\nOn NASPO.",
-              },
-              "Mono": {
-                  "county": "Mono", "score": 13,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 10.0,
-                  "tier2_it_pct": 1.2, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Tourist corridor (Mammoth Mountain); busy seasonal LE activity. Bridgeport/Mammoth Lakes. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Mammoth Lakes / Bridgeport. Tourism-driven. ~$10M Sheriff.",
-                  "snippet": "Mono County Sheriff handles a busy tourist corridor with Mammoth Mountain.\nOn NASPO.",
-              },
-              "Alpine": {
-                  "county": "Alpine", "score": 4,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 1.5,
-                  "tier2_it_pct": 0.8, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "Least populous CA county (~1,200 residents). Markleeville. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Markleeville. Least populous CA county. ~1,200 residents. Minimal LE budget.",
-                  "snippet": "Alpine County is the smallest county in California by population.\nOn NASPO.",
-              },
-              "Sierra": {
-                  "county": "Sierra", "score": 6,
-                  "tier0_carahsoft": True, "tier1_sheriff_budget_m": 2.0,
-                  "tier2_it_pct": 0.9, "tier2_it_growing": False,
-                  "tier3_transcription_line": False, "tier3_transcription_amt_k": 0,
-                  "tier3_body_cam": False,
-                  "tier4_budget_increase": False, "tier4_new_hire": False, "tier4_arpa": False,
-                  "procurement_note": "One of smallest CA counties (~3,000 residents). Downieville. CA NASPO/Carahsoft (#AR2472) available.",
-                  "evidence": "Downieville. ~3,000 residents. Very small LE budget.",
-                  "snippet": "Sierra County is one of the smallest in California.\nOn NASPO.",
-              },
-          }
+          # No seed scores for NY/MA — Claude API will score on first run and cache.
+          # CA seed scores preserved in dormant block below.
+
           def load_county_scores():
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
@@ -847,8 +390,9 @@ jobs:
                           print(f"⚠️ County scores stale ({age_days:.1f}d) — will refresh via Claude API")
               except Exception as e:
                   print(f"Score load error: {e}")
-              print("🌱 No cached scores found — using seed scores")
+              print("🌱 No cached scores — will score all NY/MA counties via Claude API")
               return None
+
           def save_county_scores(scores):
               try:
                   hs_post("/crm/v3/objects/notes", {
@@ -860,13 +404,16 @@ jobs:
                   print(f"✅ County scores saved ({len(scores)} counties)")
               except Exception as e:
                   print(f"Score save error: {e}")
-          def score_county(county):
-              prompt = f"""You are a B2B sales intelligence analyst. Research {county} County, California
+
+          def score_county(county, state_code):
+              state_name = "New York" if state_code == "NY" else "Massachusetts"
+              procurement_hint = STATE_PROCUREMENT[state_code]
+              prompt = f"""You are a B2B sales intelligence analyst. Research {county} County, {state_name}
           for signals relevant to selling Rev's legal transcription software (~$15k/yr) to law enforcement.
-          Rev partners with Carahsoft for public sector distribution via NASPO ValuePoint and cooperative contracts.
+          Procurement context for this state: {procurement_hint}
           Search for and answer each question below with a number/boolean and 1-line evidence:
           TIER 0 — Procurement vehicle (most important)
-          T0a. Does {county} County purchase software via Carahsoft, NASPO ValuePoint, OMNIA Partners, or any cooperative purchasing contract? (yes=25pts / no=0)
+          T0a. Does {county} County purchase software via {state_code} statewide cooperative contracts (OGS for NY, COMMBUYS for MA), Sourcewell, OMNIA Partners, or any other cooperative purchasing contract? (yes=25pts / no=0)
           TIER 1 — Size
           T1a. What is the {county} County Sheriff's Office annual budget? (>$40M=10, $10-40M=7, $5-10M=4, <$5M=1)
           T1b. What is the {county} County District Attorney annual budget? (>$15M=10pts in context, note for reference)
@@ -885,8 +432,9 @@ jobs:
           Return a JSON object with this exact structure:
           {{
             "county": "{county}",
+            "state": "{state_code}",
             "score": <total 0-100>,
-            "tier0_carahsoft": <true/false>,
+            "tier0_coop_contract": <true/false>,
             "tier1_sheriff_budget_m": <float millions>,
             "tier2_it_pct": <float>,
             "tier2_it_growing": <true/false>,
@@ -897,7 +445,8 @@ jobs:
             "tier4_new_hire": <true/false>,
             "tier4_arpa": <true/false>,
             "evidence": "<2-3 sentence summary of top signals found>",
-            "snippet": "<EXACTLY 2 lines max. Line 1: the strongest signal. Line 2: the Carahsoft/procurement angle if applicable OR the body cam angle. No third line. Keep it conversational, not corporate.>"
+            "snippet": "<EXACTLY 2 lines max. Line 1: the strongest signal. Line 2: the procurement angle ({state_code} statewide contract) OR body cam angle. No third line. Keep it conversational, not corporate.>",
+            "procurement_note": "<1-2 sentence note tying this county to the {state_code} statewide contract vehicle and any relevant local contract>"
           }}
           Return ONLY the JSON object."""
               raw = claude(prompt, max_tokens=800, use_search=True)
@@ -908,13 +457,20 @@ jobs:
                   try:
                       result = attempt(raw)
                       if isinstance(result, dict) and "score" in result:
-                          print(f"  📊 {county}: {result['score']}/100 | T0={result.get('tier0_carahsoft')} T3_tx={result.get('tier3_transcription_line')} T3_bwc={result.get('tier3_body_cam')}")
+                          # Backfill state in case Claude omits it
+                          result["state"] = state_code
+                          print(f"  📊 {state_code}/{county}: {result['score']}/100 | T0={result.get('tier0_coop_contract')} T3_tx={result.get('tier3_transcription_line')} T3_bwc={result.get('tier3_body_cam')}")
                           return result
                   except: pass
-              print(f"  ⚠️ Could not parse score for {county}")
-              return {"county": county, "score": 0, "evidence": "parse error", "snippet": ""}
-          def sort_counties_by_score(county_list, scores):
-              return sorted(county_list, key=lambda c: scores.get(c, {}).get("score", 0), reverse=True)
+              print(f"  ⚠️ Could not parse score for {state_code}/{county}")
+              return {"county": county, "state": state_code, "score": 0, "evidence": "parse error", "snippet": ""}
+
+          def county_key(state_code, county):
+              return f"{state_code}::{county}"
+
+          def sort_counties_by_score(county_list, state_code, scores):
+              return sorted(county_list, key=lambda c: scores.get(county_key(state_code, c), {}).get("score", 0), reverse=True)
+
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
               body = {
@@ -927,67 +483,76 @@ jobs:
               resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
               return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
           # ── Load / init state ─────────────────────────────────────
           state = load_state()
           if not state:
-              print("No state — initializing fresh")
+              print("No state — initializing fresh NY/MA state")
               state = init_state()
           else:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
-              for ae in AES:
-                  if "county_leads" not in state[ae]:
-                      state[ae]["county_leads"] = {}
-          # ── County scoring pre-pass (weekly refresh) ──────────────
+              for sc in ["NY", "MA"]:
+                  if sc not in state:
+                      state[sc] = {"county": STATE_COUNTIES[sc][0], "exhausted": [], "county_leads": {}}
+                  if "county_leads" not in state[sc]:
+                      state[sc]["county_leads"] = {}
+
+          # ── County scoring pre-pass ───────────────────────────────
           county_scores = load_county_scores()
           if not county_scores:
-              print("🌱 Seeding county scores from PDF research baseline...")
-              county_scores = {k: v.copy() for k, v in SEED_SCORES.items()}
-              all_counties = list({
-                  c for ae in AES
-                  for c in (AE_COUNTIES[ae] + AE_OVERFLOW_COUNTIES.get(ae, []))
-              })
-              missing = [c for c in all_counties if c not in county_scores]
-              if missing:
-                  print(f"  🔍 Scoring {len(missing)} new counties via Claude API: {missing}")
-                  for county in missing:
+              print("🌱 Scoring all NY/MA counties via Claude API (first run)...")
+              county_scores = {}
+              for state_code in ["NY", "MA"]:
+                  for county in STATE_COUNTIES[state_code]:
                       try:
-                          result = score_county(county)
-                          county_scores[county] = result
+                          result = score_county(county, state_code)
+                          county_scores[county_key(state_code, county)] = result
                           time.sleep(2)
                       except Exception as e:
-                          print(f"  ⚠️ Scoring error for {county}: {e}")
-                          county_scores[county] = {"score": 0, "evidence": str(e), "snippet": ""}
+                          print(f"  ⚠️ Scoring error for {state_code}/{county}: {e}")
+                          county_scores[county_key(state_code, county)] = {
+                              "county": county, "state": state_code, "score": 0,
+                              "evidence": str(e), "snippet": ""
+                          }
               save_county_scores(county_scores)
-              if datetime.datetime.today().weekday() == 0:  # Monday
+              # Monday-only Slack post
+              if datetime.datetime.today().weekday() == 0:
                   week_of   = datetime.datetime.today().strftime("%B %d, %Y")
-                  score_lines = sorted(county_scores.items(), key=lambda x: x[1].get("score", 0), reverse=True)
-                  score_msg   = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
-                  for c, s in score_lines:
-                      t0  = "🤝" if s.get("tier0_carahsoft") else "  "
-                      t3  = "📝" if s.get("tier3_transcription_line") else "  "
-                      bwc = "📷" if s.get("tier3_body_cam") else "  "
-                      score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
-                      if s.get("snippet"):
-                          snippet_line1 = s["snippet"].split("\n")[0]
-                          score_msg += f"    _{snippet_line1}_\n"
+                  score_msg = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
+                  for state_code in ["NY", "MA"]:
+                      score_msg += f"*{state_code}:*\n"
+                      state_scores = [(c, county_scores.get(county_key(state_code, c), {})) for c in STATE_COUNTIES[state_code]]
+                      state_scores.sort(key=lambda x: x[1].get("score", 0), reverse=True)
+                      for c, s in state_scores:
+                          t0  = "🤝" if s.get("tier0_coop_contract") else "  "
+                          t3  = "📝" if s.get("tier3_transcription_line") else "  "
+                          bwc = "📷" if s.get("tier3_body_cam") else "  "
+                          score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
+                          if s.get("snippet"):
+                              snippet_line1 = s["snippet"].split("\n")[0]
+                              score_msg += f"    _{snippet_line1}_\n"
+                      score_msg += "\n"
                   requests.post("https://slack.com/api/chat.postMessage",
                       headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": score_msg})
               else:
                   print("📊 County scores refreshed — Slack post skipped (Monday only)")
           else:
               print(f"✅ Using cached county scores ({len(county_scores)} counties)")
-          # Re-sort each AE's county list by score
-          for ae in AES:
-              not_started  = [c for c in AE_COUNTIES[ae]
-                               if c not in state[ae].get("exhausted", [])
-                               and c != state[ae].get("county")]
-              already_done = state[ae].get("exhausted", [])
-              current      = state[ae].get("county")
-              sorted_next  = sort_counties_by_score(not_started, county_scores)
-              AE_COUNTIES[ae] = already_done + ([current] if current else []) + sorted_next
-              print(f"  {ae} county order: {AE_COUNTIES[ae]}")
-          # ── Find leads ────────────────────────────────────────────
-          def find_leads(county, org_type, titles, exclude_names=None, batch=1):
+
+          # Re-sort each state's county list by score (preserving exhausted + current at front)
+          for state_code in ["NY", "MA"]:
+              not_started  = [c for c in STATE_COUNTIES[state_code]
+                               if c not in state[state_code].get("exhausted", [])
+                               and c != state[state_code].get("county")]
+              already_done = state[state_code].get("exhausted", [])
+              current      = state[state_code].get("county")
+              sorted_next  = sort_counties_by_score(not_started, state_code, county_scores)
+              STATE_COUNTIES[state_code] = already_done + ([current] if current else []) + sorted_next
+              print(f"  {state_code} county order: {STATE_COUNTIES[state_code]}")
+
+          # ── Find leads (state-aware prompt) ───────────────────────
+          def find_leads(county, state_code, org_type, titles, exclude_names=None, batch=1):
+              state_name = "New York" if state_code == "NY" else "Massachusetts"
               exclude_str = ""
               if exclude_names:
                   sample = exclude_names[:30]
@@ -995,17 +560,29 @@ jobs:
               batch_str = ""
               if batch > 1:
                   batch_str = f"\nThis is search batch {batch} — find people not already captured in previous searches. Look deeper: staff directories, org charts, LinkedIn, department websites, press releases, court records."
-              prompt = f"""Search for real staff at the {org_type} in {county} County, California.
-          Find people with these titles: {', '.join(titles)}
+
+              # State-specific org structure hints
+              ma_hint = ""
+              if state_code == "MA":
+                  if org_type == "District Attorney":
+                      ma_hint = f"\nNOTE: Massachusetts DAs are organized by district, not county. {county} County falls under one of MA's 11 DA districts — search for the relevant District Attorney's office that prosecutes cases in {county} County (e.g., Berkshire DA, Hampden DA, Northwestern DA for Franklin/Hampshire, Cape & Islands DA for Barnstable/Dukes/Nantucket, Bristol DA, Plymouth DA, etc.)."
+                  elif org_type == "Public Defender":
+                      ma_hint = f"\nNOTE: MA Public Defenders work through the Committee for Public Counsel Services (CPCS). Search for CPCS regional offices, supervising attorneys, and trial attorneys serving {county} County. Also search for bar advocates and private counsel programs."
+                  elif org_type == "Police/Sheriff Investigators":
+                      ma_hint = f"\nNOTE: MA Sheriffs primarily run jails (not patrol). For investigators, focus on: (1) {county} County Sheriff's Office (jail-side investigators, internal affairs), (2) the major municipal Police Departments in {county} County (Detective Bureau, Investigations Unit), and (3) MA State Police barracks/detective units assigned to {county} County."
+
+              prompt = f"""Search for real staff at the {org_type} in {county} County, {state_name}.
+          Find people with these titles: {', '.join(titles)}{ma_hint}
           Look at official government websites, staff directories, LinkedIn, org charts, and public records.
           Find as many real people as possible — aim for 20+ contacts. Include all levels, not just top leadership.{exclude_str}{batch_str}
           Return a JSON array. Each item must have these exact keys:
-          first_name, last_name, title, organization, county, org_type, website, email, phone, address
+          first_name, last_name, title, organization, county, state, org_type, website, email, phone, address
+          The "state" field MUST be "{state_code}".
           Example format:
           [
             {{
-              "first_name": "John", "last_name": "Smith", "title": "Deputy District Attorney",
-              "organization": "{county} County District Attorney's Office", "county": "{county}",
+              "first_name": "John", "last_name": "Smith", "title": "Assistant District Attorney",
+              "organization": "{county} County District Attorney's Office", "county": "{county}", "state": "{state_code}",
               "org_type": "{org_type}", "website": "", "email": "", "phone": "", "address": ""
             }}
           ]
@@ -1020,11 +597,16 @@ jobs:
                   try:
                       result = attempt(text)
                       if isinstance(result, list):
+                          # Backfill state on every lead
+                          for lead in result:
+                              if isinstance(lead, dict):
+                                  lead["state"] = state_code
                           print(f"    Parsed {len(result)} leads")
                           return result
                   except: pass
               print(f"    ⚠️ Could not parse JSON")
               return []
+
           # ── Duplicate check ───────────────────────────────────────
           def is_duplicate(email, first_name, last_name):
               if email:
@@ -1038,6 +620,7 @@ jobs:
                       {"propertyName": "lastname",  "operator": "EQ", "value": last_name}
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
+
           # ── Text normalization ────────────────────────────────────
           ACRONYMS = {
               "HR", "IT", "PR", "IA", "IG", "HRIS", "CHRO", "HRO", "HRBP",
@@ -1048,9 +631,9 @@ jobs:
               "DOJ", "FBI", "CIA", "NSA", "DHS", "ICE", "IRS", "ATF", "DEA",
               "OIG", "EEOC", "HIPAA", "OSHA", "FOIA", "CJIS",
               "SWAT", "LAPD", "NYPD", "LASD", "USCIS", "CSI", "K9",
+              "NY", "MA", "NYS", "NYPD", "MSP", "CPCS",
           }
           def normalize_case(text):
-              """Title-case fully uppercase words that aren't known acronyms."""
               if not text:
                   return text
               def title_chunk(word):
@@ -1088,44 +671,30 @@ jobs:
                   if lead.get(field):
                       lead[field] = normalize_case(lead[field])
               return lead
+
           # ── Email sequence ────────────────────────────────────────
           def clean_email_body(text, first_name=None):
-              """Clean email body and ensure 'Hi {first_name},' is the canonical greeting.
-              If first_name is provided: rewrite any non-canonical greeting to 'Hi {first_name},',
-              prepend it if missing, and guarantee exactly <br><br> spacing after it."""
               if not text:
                   return text
-              # Strip any line starting with Subject:
               lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
               cleaned = "\n".join(lines).strip()
-              # Remove newlines — HubSpot renders \n as extra line breaks on top of <br>
               cleaned = cleaned.replace("\n", "")
-              # Normalize: any run of <br> tags becomes exactly <br><br>
               cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
-              # Ensure the existing "Hi Name," is followed by <br><br>
               cleaned = re.sub(r'^(Hi\s+[^,<]{1,40},)(?!\s*<br)\s*', r'\1<br><br>', cleaned, flags=re.IGNORECASE)
-              # ── Greeting safety net (the "Hi {first_name}," change) ──
               if first_name:
-                  # 1. Rewrite any non-canonical greeting (Hello, Dear, Greetings, Good morning/afternoon/evening,
-                  #    or "Hi <wrong name>") to canonical "Hi {first_name},". Eat any trailing <br> tags so
-                  #    spacing doesn't compound.
                   cleaned = re.sub(
                       r'^\s*(?:Hello|Hi|Dear|Greetings|Good\s+(?:morning|afternoon|evening))\b[^,<]{0,60}\s*,\s*(?:<br\s*/?>\s*)*',
                       f"Hi {first_name},<br><br>",
                       cleaned, count=1, flags=re.IGNORECASE
                   )
-                  # 2. If still no canonical greeting present (model skipped it entirely — common on emails 3-4),
-                  #    strip any leading whitespace/orphan <br>s and prepend.
                   if not re.match(r'^\s*Hi\s+' + re.escape(first_name) + r'\s*,', cleaned, flags=re.IGNORECASE):
                       cleaned = re.sub(r'^(?:\s|<br\s*/?>)+', '', cleaned, flags=re.IGNORECASE)
                       cleaned = f"Hi {first_name},<br><br>" + cleaned
-                  # 3. Final normalize: exactly one "Hi {first_name},<br><br>" — no stray spaces, no extra breaks.
                   cleaned = re.sub(
                       r'^Hi\s+' + re.escape(first_name) + r'\s*,\s*(?:<br\s*/?>\s*)+',
                       f"Hi {first_name},<br><br>",
                       cleaned, count=1, flags=re.IGNORECASE
                   )
-              # Turn raw HubSpot meeting URLs into a human-sounding hyperlink ("my calendar").
               meet_url = r'https?://meetings\.hubspot\.com/[A-Za-z0-9_\-]+'
               cleaned = re.sub(
                   r'\b(?:here(?:\'s)?|at)\s*:?\s+(' + meet_url + r')',
@@ -1139,17 +708,21 @@ jobs:
               )
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
               return cleaned + '<br>'
-          def gen_email_sequence(contact, ae_name):
-              meeting_link = get_meeting_link(ae_name)
-              org_type     = contact.get("org_type", "Public Defender")
-              angles       = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
-              first_name   = contact["first_name"]
-              name         = f"{contact['title']} {contact['last_name']}"
-              org          = contact["organization"]
-              county       = contact["county"]
-              emails       = {}
-              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {county} County, CA.
-          Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {meeting_link}
+
+          def gen_email_sequence(contact):
+              org_type   = contact.get("org_type", "Public Defender")
+              angles     = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
+              first_name = contact["first_name"]
+              name       = f"{contact['title']} {contact['last_name']}"
+              org        = contact["organization"]
+              county     = contact["county"]
+              state_code = contact.get("state", "")
+              state_name = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
+              emails     = {}
+              loc_str    = f"{county} County, {state_name}" if state_name else f"{county} County"
+
+              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {loc_str}.
+          Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
           - Follow the greeting with <br><br> then the body
@@ -1157,7 +730,7 @@ jobs:
           - Open the body with something specific to their role as {contact['title']}
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
-          - CTA: invite them to grab a time on <a href="{meeting_link}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
+          - CTA: invite them to grab a time on <a href="{MEETING_LINK}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           - No pricing
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=400), first_name=first_name)
@@ -1172,7 +745,7 @@ jobs:
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Ask if this is a priority right now
-          - CTA: link to <a href="{meeting_link}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
+          - CTA: link to <a href="{MEETING_LINK}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           - No "just following up"
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=350), first_name=first_name)
@@ -1187,7 +760,7 @@ jobs:
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Feel like a helpful resource not a sales pitch
-          - CTA: "Worth a quick 30-minute call?" with a link to <a href="{meeting_link}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
+          - CTA: "Worth a quick 30-minute call?" with a link to <a href="{MEETING_LINK}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=350), first_name=first_name)
               time.sleep(1)
@@ -1200,11 +773,12 @@ jobs:
           - Acknowledge they're busy, leave door open "if timing changes"
           - Never use em dashes (—), use commas or periods instead
           - Separate paragraphs with <br><br> (no newlines, HTML only)
-          - Soft CTA: mention <a href="{meeting_link}">my calendar</a> is open if timing changes — use this exact HTML hyperlink, never paste the raw URL
+          - Soft CTA: mention <a href="{MEETING_LINK}">my calendar</a> is open if timing changes — use this exact HTML hyperlink, never paste the raw URL
           - No sign-off name, the sender is automated
           - Warm not passive aggressive
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=250), first_name=first_name)
               return emails
+
           def gen_subject(contact, email_num=1):
               if email_num in (2, 4):
                   return ""
@@ -1215,36 +789,32 @@ jobs:
                   3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
               }
               return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
+
           # ── Buying role ───────────────────────────────────────────
           def get_buying_role(title):
               t = title.lower()
               if any(x in t for x in [
                   "sheriff", "district attorney", "chief of police", "public defender", "chief deputy",
-                  "internal affairs director", "professional standards director",
-                  "hr director", "chief human resources", "chief of investigations",
-                  "inspector general", "corrections director"
+                  "first assistant", "chief assistant", "chief investigator", "chief of investigations"
               ]):
                   return "DECISION_MAKER"
-              if any(x in t for x in ["commander", "captain", "lieutenant"]):
+              if any(x in t for x in ["commander", "captain", "lieutenant", "supervising"]):
                   return "INFLUENCER"
-              if any(x in t for x in ["investigator", "detective", "analyst"]):
+              if any(x in t for x in ["investigator", "detective", "analyst", "trial attorney", "staff attorney"]):
                   return "END_USER"
               if any(x in t for x in ["legal", "compliance"]):
                   return "LEGAL_AND_COMPLIANCE"
               return "BUDGET_HOLDER"
+
           # ── Enroll contact in HubSpot Sequence ───────────────────
-          def enroll_in_sequence(contact_id, ae_name, contact_email):
+          def enroll_in_sequence(contact_id, contact_email):
               if not contact_email:
                   print(f"    ⚠️ No email — skipping sequence enrollment for contact {contact_id}")
-                  return False
-              sender_id = owner_map.get(ae_name)
-              if not sender_id:
-                  print(f"    ⚠️ No owner ID for {ae_name} — skipping enrollment")
                   return False
               payload = {
                   "sequenceId":       SEQUENCE_ID,
                   "contactId":        contact_id,
-                  "enrolledByUserId": sender_id,
+                  "enrolledByUserId": owner_id,
               }
               resp = requests.post(
                   "https://api.hubapi.com/automation/v4/sequences/enrollments",
@@ -1257,18 +827,21 @@ jobs:
               else:
                   print(f"    ⚠️ Sequence enrollment failed ({resp.status_code}): {resp.text[:300]}")
                   return False
+
           # ── Create HubSpot contact ────────────────────────────────
-          def create_contact(contact, email_body, subject, ae_name, emails=None, subjects=None):
+          def create_contact(contact, email_body, subject, emails=None, subjects=None):
               emails   = emails   or {}
               subjects = subjects or {}
               buying_role = get_buying_role(contact.get("title", ""))
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
+              state_code  = contact.get("state", "")
+              state_name  = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
               props = {
                   "firstname":             contact["first_name"],
                   "lastname":              contact["last_name"],
                   "jobtitle":              contact["title"],
                   "company":               contact["organization"],
-                  "state":                 "California",
+                  "state":                 state_name,
                   "city":                  f"{contact['county']} County",
                   "county":                contact["county"],
                   "hs_lead_status":        "NEW",
@@ -1283,19 +856,23 @@ jobs:
                   "ob_email_4_subject":    subjects.get(4, ""),
                   "ob_email_4_body":       emails.get("email_4", ""),
               }
-              c_sig = county_scores.get(contact.get("county", ""), {})
+              c_sig = county_scores.get(county_key(state_code, contact.get("county", "")), {})
               if c_sig:
-                  props["county_signal_score"]          = c_sig.get("score", 0)
-                  props["county_carahsoft__naspo"]      = c_sig.get("procurement_note", "CA NASPO ValuePoint Cloud Solutions Contract — no RFP required. Any CA county can purchase directly via Carahsoft (contract #AR2472).")
+                  props["county_signal_score"]           = c_sig.get("score", 0)
+                  props["county_carahsoft__naspo"]       = c_sig.get("procurement_note", STATE_PROCUREMENT.get(state_code, ""))
                   props["county_transcription_budget_k"] = c_sig.get("tier3_transcription_amt_k", 0)
-                  props["county_body_cam_program"]      = "true" if c_sig.get("tier3_body_cam") else "false"
+                  props["county_body_cam_program"]       = "true" if c_sig.get("tier3_body_cam") else "false"
                   snippet = c_sig.get("snippet", "")
                   if snippet:
                       props["county_signal_snippet"] = snippet
-              if owner_map.get(ae_name):       props["hubspot_owner_id"] = owner_map[ae_name]
-              if contact.get("email"):         props["email"]   = contact["email"]
-              if contact.get("phone"):         props["phone"]   = contact["phone"]
-              if contact.get("website"):       props["website"] = contact["website"]
+              else:
+                  # Fallback procurement note if score not cached
+                  props["county_carahsoft__naspo"] = STATE_PROCUREMENT.get(state_code, "")
+
+              props["hubspot_owner_id"] = str(owner_id)
+              if contact.get("email"):   props["email"]   = contact["email"]
+              if contact.get("phone"):   props["phone"]   = contact["phone"]
+              if contact.get("website"): props["website"] = contact["website"]
               resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
               contact_id = resp.get("id")
               print(f"    Contact API response: {json.dumps(resp)[:500]}")
@@ -1304,7 +881,7 @@ jobs:
                   return None
               note = (
                   f"OUTBOUND EMAIL SEQUENCE\n"
-                  f"County: {contact.get('county','')}\nDept: {dept}\n"
+                  f"State: {state_name} | County: {contact.get('county','')}\nDept: {dept}\n"
                   f"Buying Role: {buying_role}\nLead Source: Claude\n\n"
                   f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
                   f"Subject: {subjects.get(1,'')}\n\n{emails.get('email_1','')}\n\n"
@@ -1323,8 +900,9 @@ jobs:
                   "associations": [{"to": {"id": contact_id},
                       "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
               })
-              enrolled = enroll_in_sequence(contact_id, ae_name, contact.get("email", ""))
+              enrolled = enroll_in_sequence(contact_id, contact.get("email", ""))
               return {"id": contact_id, "enrolled": enrolled}
+
           # ── Publish state to GitHub Gist ─────────────────────────
           def publish_gist(state):
               if not GIST_TOKEN:
@@ -1335,26 +913,29 @@ jobs:
               if GIST_ID:
                   r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
               else:
-                  payload["description"] = "OB Agent County State"
+                  payload["description"] = "OB Agent State — NY/MA (Mike Merritts)"
                   payload["public"] = True
                   r = requests.post("https://api.github.com/gists", headers=headers, json=payload)
               data = r.json()
               print(f"✅ Gist published: {data.get('html_url', '')}")
               return data.get("html_url", "")
-          # ── Generate county chart ─────────────────────────────────
+
+          # ── Generate chart (2-panel: NY + MA breakdown for Mike) ──
           def generate_chart(state, results, today_str):
-              fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+              fig, axes = plt.subplots(1, 2, figsize=(14, 6))
               fig.patch.set_facecolor('#1a1d21')
-              fig.suptitle(f'OB Agent — County Breakdown\n{today_str}',
+              fig.suptitle(f'OB Agent — Mike Merritts (NY & MA)\n{today_str}',
                            color='white', fontsize=14, fontweight='bold', y=1.02)
-              for idx, ae_name in enumerate(AES):
+              ACTIVE_COLOR = "#7c3aed"
+              STATE_COLORS = {"NY": "#2563eb", "MA": "#059669"}
+              for idx, state_code in enumerate(["NY", "MA"]):
                   ax = axes[idx]
                   ax.set_facecolor('#222529')
                   for spine in ax.spines.values():
                       spine.set_edgecolor('#444')
-                  county_leads = state[ae_name].get("county_leads", {})
-                  exhausted    = state[ae_name].get("exhausted", [])
-                  active       = results[ae_name]["county"]
+                  county_leads = state[state_code].get("county_leads", {})
+                  exhausted    = state[state_code].get("exhausted", [])
+                  active       = results[state_code]["county"]
                   if not county_leads:
                       ax.text(0.5, 0.5, 'No data yet', ha='center', va='center',
                               color='#888', transform=ax.transAxes)
@@ -1374,7 +955,8 @@ jobs:
                       ax.tick_params(colors='white')
                       ax.set_xlabel('Leads', color='#aaa', fontsize=9)
                   total = sum(county_leads.values()) if county_leads else 0
-                  ax.set_title(f'{ae_name}\n{total} total · {active} active',
+                  state_label = "New York" if state_code == "NY" else "Massachusetts"
+                  ax.set_title(f'{state_label}\n{total} total · {active} active',
                                color='white', fontsize=10, fontweight='bold', pad=10)
                   patches = [
                       mpatches.Patch(color='#4ade80', label='Exhausted'),
@@ -1389,6 +971,7 @@ jobs:
               plt.close()
               print(f"Chart saved: {chart_path}")
               return chart_path
+
           # ── Upload chart to Slack ─────────────────────────────────
           def upload_chart_to_slack(chart_path, channel_id, today_str):
               try:
@@ -1412,7 +995,7 @@ jobs:
                       "https://slack.com/api/files.completeUploadExternal",
                       headers=SLACK_HEADERS,
                       json={
-                          "files": [{"id": file_id, "title": f"County Breakdown — {today_str}"}],
+                          "files": [{"id": file_id, "title": f"NY+MA County Breakdown — {today_str}"}],
                           "channel_id": channel_id
                       }
                   )
@@ -1425,40 +1008,42 @@ jobs:
               except Exception as e:
                   print(f"Chart upload error: {e}")
                   return None
+
           # ── Main loop ─────────────────────────────────────────────
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
           results   = {}
-          for ae_name in AES:
-              added        = []
-              skipped      = 0
-              ae_leads_cap = LEADS_PER_AE[ae_name]
-              while len(added) < ae_leads_cap:
-                  county = state[ae_name]["county"]
+          for state_code in ["NY", "MA"]:
+              state_name = "New York" if state_code == "NY" else "Massachusetts"
+              added         = []
+              skipped       = 0
+              state_cap     = LEADS_PER_STATE[state_code]
+              while len(added) < state_cap:
+                  county = state[state_code]["county"]
                   if not county:
-                      alert = f"⚠️ *{ae_name}* has exhausted all available counties. Please add more counties to AE_COUNTIES."
+                      alert = f"⚠️ *{state_name}* has exhausted all available counties. Please add more counties to STATE_COUNTIES['{state_code}']."
                       requests.post("https://slack.com/api/chat.postMessage",
                           headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})
-                      print(f"  ⚠️ {ae_name} — all counties exhausted, alert sent")
+                      print(f"  ⚠️ {state_code} — all counties exhausted, alert sent")
                       break
                   print(f"\n{'='*50}")
-                  print(f"👤 {ae_name} → 📍 {county} County ({len(added)}/{ae_leads_cap} leads so far)")
+                  print(f"🗽 {state_code} → 📍 {county} County ({len(added)}/{state_cap} leads so far)")
                   county_new      = 0
                   county_skipped  = 0
                   found_any_leads = False
                   MAX_BATCHES_PER_ORG = 4
                   MAX_EMPTY_PASSES    = 2
                   for org in ORG_TYPES:
-                      if len(added) >= ae_leads_cap:
+                      if len(added) >= state_cap:
                           break
                       print(f"  Searching {org['type']}...")
                       org_found_names  = []
                       org_new_this_run = 0
                       for batch_num in range(1, MAX_BATCHES_PER_ORG + 1):
-                          if len(added) >= ae_leads_cap:
+                          if len(added) >= state_cap:
                               break
                           try:
                               leads = find_leads(
-                                  county, org["type"], org["titles"],
+                                  county, state_code, org["type"], org["titles"],
                                   exclude_names=org_found_names,
                                   batch=batch_num
                               )
@@ -1466,7 +1051,7 @@ jobs:
                                   found_any_leads = True
                               batch_new = 0
                               for lead in leads:
-                                  if len(added) >= ae_leads_cap:
+                                  if len(added) >= state_cap:
                                       break
                                   lead = normalize_lead(lead)
                                   fn = lead.get("first_name", "")
@@ -1480,7 +1065,7 @@ jobs:
                                       skipped += 1
                                       print(f"    ↩ Duplicate: {full_name}")
                                       continue
-                                  emails_body = gen_email_sequence(lead, ae_name)
+                                  emails_body = gen_email_sequence(lead)
                                   subjects = {
                                       1: gen_subject(lead, 1),
                                       2: gen_subject(lead, 2),
@@ -1491,7 +1076,6 @@ jobs:
                                       lead,
                                       email_body="",
                                       subject=subjects[1],
-                                      ae_name=ae_name,
                                       emails=emails_body,
                                       subjects=subjects,
                                   )
@@ -1506,11 +1090,12 @@ jobs:
                                           "subject":  subjects[1],
                                           "enrolled": enrolled,
                                           "email":    lead.get("email", ""),
+                                          "state":    state_code,
                                       })
                                       county_new       += 1
                                       org_new_this_run += 1
                                       batch_new        += 1
-                                      state[ae_name]["county_leads"][county] = state[ae_name]["county_leads"].get(county, 0) + 1
+                                      state[state_code]["county_leads"][county] = state[state_code]["county_leads"].get(county, 0) + 1
                                       enroll_icon = "📧" if enrolled else "📭"
                                       print(f"    ✅ Added: {full_name} — {lead.get('title')} {enroll_icon}")
                                   time.sleep(1)
@@ -1523,42 +1108,46 @@ jobs:
                           time.sleep(2)
                   print(f"  County pass: {county_new} new, {county_skipped} dupes, found_any={found_any_leads}")
                   if found_any_leads and county_new == 0 and county_skipped > 0:
-                      state[ae_name]["empty_passes"] = state[ae_name].get("empty_passes", {})
-                      state[ae_name]["empty_passes"][county] = state[ae_name]["empty_passes"].get(county, 0) + 1
-                      empty_count = state[ae_name]["empty_passes"][county]
+                      state[state_code]["empty_passes"] = state[state_code].get("empty_passes", {})
+                      state[state_code]["empty_passes"][county] = state[state_code]["empty_passes"].get(county, 0) + 1
+                      empty_count = state[state_code]["empty_passes"][county]
                       print(f"  ⚠️ All-dupe pass #{empty_count} for {county}")
                       if empty_count >= MAX_EMPTY_PASSES:
                           print(f"  ⚠️ {county} fully exhausted after {empty_count} empty passes — moving to next county")
-                          if county not in state[ae_name]["exhausted"]:
-                              state[ae_name]["exhausted"].append(county)
-                          next_county = next_county_for_ae(ae_name, state)
-                          state[ae_name]["county"] = next_county or None
-                          if next_county:
-                              print(f"  ➡️ Moving to: {next_county}")
+                          if county not in state[state_code]["exhausted"]:
+                              state[state_code]["exhausted"].append(county)
+                          next_c = next_county_for_state(state_code, state)
+                          state[state_code]["county"] = next_c or None
+                          if next_c:
+                              print(f"  ➡️ Moving to: {next_c}")
                           else:
-                              print(f"  ⚠️ No more counties for {ae_name}")
+                              print(f"  ⚠️ No more counties for {state_code}")
                       continue
                   if not found_any_leads:
                       print(f"  ℹ️ No leads found in {county} — keeping for next run")
                       break
-                  if len(added) < ae_leads_cap:
-                      print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{ae_leads_cap})")
-              results[ae_name] = {
-                  "county":  state[ae_name]["county"] or county,
+                  if len(added) < state_cap:
+                      print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{state_cap})")
+              results[state_code] = {
+                  "county":  state[state_code]["county"] or county,
                   "added":   added,
                   "skipped": skipped,
               }
+
           # ── Save state & publish Gist ─────────────────────────────
           save_state(state)
           print(f"\nState saved: {json.dumps(state, indent=2)}")
           publish_gist(state)
+
           # ── Open DM channel ───────────────────────────────────────
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})
           dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")
+
           # ── Generate & upload chart ───────────────────────────────
           chart_path = generate_chart(state, results, today_str)
           upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
+
           # ── Slack summary → #daily-ob ─────────────────────────────
           total_added    = sum(len(r["added"]) for r in results.values())
           total_skip     = sum(r["skipped"]    for r in results.values())
@@ -1566,46 +1155,118 @@ jobs:
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — {today_str}*\n"
           msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n"
-          msg += f"_Active personas: {', '.join(ACTIVE_PERSONAS)}_\n\n"
-          for ae_name, data in results.items():
+          msg += f"_Owner: {OWNER_NAME} · Personas: {', '.join(ACTIVE_PERSONAS)}_\n"
+          msg += f"_<{CONSOLIDATED_LIST_URL}|View consolidated list in HubSpot>_\n\n"
+          for state_code in ["NY", "MA"]:
+              data = results[state_code]
+              state_name = "New York" if state_code == "NY" else "Massachusetts"
               county       = data["county"]
-              added        = data["added"]
-              ae_skipped   = data["skipped"]
-              list_url     = LIST_URLS[ae_name]
-              county_leads = state[ae_name].get("county_leads", {})
-              exhausted    = state[ae_name].get("exhausted", [])
+              added_st     = data["added"]
+              skipped_st   = data["skipped"]
+              county_leads = state[state_code].get("county_leads", {})
+              exhausted    = state[state_code].get("exhausted", [])
               def sig_icons(cs):
                   icons = ""
                   if cs.get("tier3_body_cam"):           icons += "📷"
                   if cs.get("tier3_transcription_line"): icons += "📝"
                   if cs.get("tier4_arpa"):               icons += "💰"
                   return icons
-              cs_curr    = county_scores.get(county, {})
+              cs_curr    = county_scores.get(county_key(state_code, county), {})
               curr_score = cs_curr.get("score", "?")
               curr_icons = sig_icons(cs_curr)
               curr_badge = f"{' ' + curr_icons if curr_icons else ''} _{curr_score}/100_" if curr_score != "?" else ""
-              upcoming = get_upcoming_counties(ae_name, state, n=2)
+              upcoming = get_upcoming_counties(state_code, state, n=2)
               if upcoming:
                   up_parts = []
                   for c in upcoming:
-                      cs = county_scores.get(c, {})
+                      cs = county_scores.get(county_key(state_code, c), {})
                       sc = cs.get("score", "?")
                       ic = sig_icons(cs)
                       up_parts.append(f"*{c}*{' ' + ic if ic else ''} _{sc}/100_")
                   next_line = f"  ⏭ *Next:* {'  ·  '.join(up_parts)}"
               else:
-                  next_line = f"  ⚠️ All counties exhausted — add more to AE_COUNTIES"
+                  next_line = f"  ⚠️ All {state_code} counties exhausted — add more to STATE_COUNTIES"
               exhausted_parts = [f"{c} ({county_leads.get(c, 0)})" for c in exhausted if c in county_leads]
               exhausted_line  = f"  ✅ *Done:* {'  ·  '.join(exhausted_parts)}" if exhausted_parts else ""
               active_count = county_leads.get(county, 0)
-              msg += f"*👤 {ae_name}* — {len(added)} leads added | <{list_url}|View Segment>\n"
+              msg += f"*🗽 {state_name}* — {len(added_st)} leads added\n"
               msg += f"  📍 *Now:* {county}{curr_badge} — {active_count} leads assigned\n"
               msg += f"{next_line}\n"
               if exhausted_line:
                   msg += f"{exhausted_line}\n"
               msg += "\n"
-          msg += f"_Powered by Claude · CA Law Enforcement Outbound Agent v38 · {len(ACTIVE_PERSONAS)}-persona mode_"
+          msg += f"_Powered by Claude · NY+MA Law Enforcement Outbound Agent v1 · {len(ACTIVE_PERSONAS)}-persona mode_"
           requests.post("https://slack.com/api/chat.postMessage",
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")
           EOF
+
+# ═══════════════════════════════════════════════════════════════════════
+# ▼▼▼ DORMANT — CA LAW ENFORCEMENT CONFIG (DO NOT DELETE) ▼▼▼
+# ═══════════════════════════════════════════════════════════════════════
+# Preserved per JL request on 2026-05-20 when we pivoted to NY/MA.
+# To revive CA: rename this file back to the CA version, OR copy this
+# block into a sibling workflow file and uncomment.
+#
+# Everything below this banner was the previous active config:
+#   - 3 AEs: Dillon DeWitt, Will Weis, James Gregory
+#   - 50/25/50 daily lead caps (later reduced to 20/10/20)
+#   - 38 CA counties partitioned across AEs + overflow
+#   - Full SEED_SCORES dict with PDF-extracted signals per county
+#   - Per-AE meeting links + per-AE HubSpot list URLs (9561/9562/9575)
+#   - NASPO/Carahsoft #AR2472 procurement vehicle
+#   - STATE_MARKER = "OUTBOUND_AGENT_STATE_V3"
+#   - SCORE_MARKER = "COUNTY_SCORE_STATE_V1"
+#
+# CRITICAL when reviving:
+#   - Bump STATE_MARKER / SCORE_MARKER if NY/MA has been running (so
+#     CA picks up its own state, not NY/MA's).
+#   - Restore 3-panel chart (CA had 3 AEs vs NY/MA's 2 states).
+#   - Restore per-AE LIST_URLS and MEETING_LINKS dicts.
+#   - Restore audit_ownership() multi-AE territory logic (NY/MA
+#     version is simplified to "all → Mike").
+#
+# CA AE → County map (frozen state as of 2026-05-20):
+#
+# LEADS_PER_AE = {"Dillon DeWitt": 20, "Will Weis": 10, "James Gregory": 20}
+#
+# AE_COUNTIES = {
+#     "Dillon DeWitt": ["Santa Clara", "Nevada", "Shasta", "Napa", "Imperial",
+#                       "Amador", "Siskiyou", "Humboldt", "Mono", "Sierra"],
+#     "Will Weis":     ["Contra Costa", "Placer", "Merced", "Kings", "Tehama",
+#                       "San Benito", "Del Norte", "Mendocino", "Inyo", "Alpine"],
+#     "James Gregory": ["Alameda", "Solano", "Butte", "Madera", "Lake",
+#                       "Colusa", "Trinity", "Plumas", "Modoc", "Lassen"],
+# }
+# AE_OVERFLOW_COUNTIES = {
+#     "Dillon DeWitt":  ["San Mateo", "Marin", "Santa Cruz"],
+#     "Will Weis":      ["Sonoma", "Yolo", "El Dorado", "Calaveras"],
+#     "James Gregory":  ["Tuolumne", "Glenn", "Sutter"],
+# }
+# EXCLUDED_COUNTIES = ["Stanislaus", "Ventura", "Tulare", "San Luis Obispo",
+#                      "San Joaquin", "San Bernardino", "Monterey", "Santa Barbara"]
+#
+# MEETING_LINKS = {
+#     "Dillon DeWitt":  "https://meetings.hubspot.com/dillon-dewitt",
+#     "Will Weis":      "https://meetings.hubspot.com/will-weis",
+#     "James Gregory":  "https://meetings.hubspot.com/james-gregory2",
+# }
+# LIST_URLS = {
+#     "Dillon DeWitt":  "https://app.hubspot.com/contacts/21451281/lists/9561",
+#     "Will Weis":      "https://app.hubspot.com/contacts/21451281/lists/9562",
+#     "James Gregory":  "https://app.hubspot.com/contacts/21451281/lists/9575",
+# }
+#
+# Full SEED_SCORES dict (Contra Costa through Sierra) is preserved in the
+# git history of the prior file version. To restore, check out the file
+# at the commit immediately preceding the NY/MA pivot.
+#
+# CA PERSONA_ANGLES — 11 persona variants existed:
+#   Sheriff, District Attorney, Public Defender, Police Department,
+#   City Attorney, Court, Investigator, Corrections, Internal Affairs,
+#   Human Resources, Police/Sheriff Investigators
+# Only 3 (PD, DA, P/S Investigators) were active at time of pivot —
+# matching what's preserved as active in the NY/MA config.
+# ═══════════════════════════════════════════════════════════════════════
+# ▲▲▲ END DORMANT — CA LAW ENFORCEMENT CONFIG ▲▲▲
+# ═══════════════════════════════════════════════════════════════════════

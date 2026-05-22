@@ -695,6 +695,16 @@ jobs:
                       f"Hi {first_name},<br><br>",
                       cleaned, count=1, flags=re.IGNORECASE
                   )
+              # ── Hard strip em/en dashes (model leaks these despite prompt rules) ──
+              # Em dash (—, U+2014) and en dash (–, U+2013).
+              # Strategy: " — " or " – " (spaced) → ". " (sentence break).
+              #           "word—word" or "word–word" (unspaced) → ", " (clause join).
+              cleaned = re.sub(r'\s+[—–]\s+', '. ', cleaned)
+              cleaned = re.sub(r'[—–]', ', ', cleaned)
+              # Collapse any ". ." or ", ," artifacts from the swap
+              cleaned = re.sub(r'\.\s*\.', '.', cleaned)
+              cleaned = re.sub(r',\s*,', ',', cleaned)
+              cleaned = re.sub(r'\s+([.,])', r'\1', cleaned)
               meet_url = r'https?://meetings\.hubspot\.com/[A-Za-z0-9_\-]+'
               cleaned = re.sub(
                   r'\b(?:here(?:\'s)?|at)\s*:?\s+(' + meet_url + r')',
@@ -706,6 +716,14 @@ jobs:
                   r'<a href="\1">my calendar</a>',
                   cleaned, flags=re.IGNORECASE
               )
+              # ── Safety net: if NO scheduler hyperlink was rendered at all,
+              # append one before the closing <br>. This catches the case
+              # where Claude wrote a CTA like "15 minutes to show you how?"
+              # but forgot to include the link entirely.
+              if 'href="https://meetings.hubspot.com/' not in cleaned:
+                  body = re.sub(r'(<br\s*/?>)+\s*$', '', cleaned.rstrip(), flags=re.IGNORECASE)
+                  body += f' Grab a time on <a href="https://meetings.hubspot.com/mike-merritts">my calendar</a>.'
+                  cleaned = body
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
               return cleaned + '<br>'
 
@@ -728,9 +746,9 @@ jobs:
           - Follow the greeting with <br><br> then the body
           - Professional but warm, 100-130 words
           - Open the body with something specific to their role as {contact['title']}
-          - Never use em dashes (—), use commas or periods instead
+          - ABSOLUTELY NO em dashes (—) or en dashes (–) anywhere. Use periods or commas. This is a hard rule, not a style preference. If you write "—" or "–" the email will be rejected.
           - Separate paragraphs with <br><br> (no newlines, HTML only)
-          - CTA: invite them to grab a time on <a href="{MEETING_LINK}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
+          - CTA REQUIREMENT: The final paragraph MUST contain the exact HTML link <a href="{MEETING_LINK}">my calendar</a>. Example: "Grab a time on <a href="{MEETING_LINK}">my calendar</a>." Never paste the raw URL. Never omit the link. The CTA without the link is invalid.
           - No sign-off name, the sender is automated
           - No pricing
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=400), first_name=first_name)
@@ -742,10 +760,10 @@ jobs:
           - Follow the greeting with <br><br> then the body
           - 75-100 words (short and punchy)
           - Lead the body with: {angles['proof']}
-          - Never use em dashes (—), use commas or periods instead
+          - ABSOLUTELY NO em dashes (—) or en dashes (–) anywhere. Use periods or commas. This is a hard rule.
           - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Ask if this is a priority right now
-          - CTA: link to <a href="{MEETING_LINK}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
+          - CTA REQUIREMENT: The final paragraph MUST contain the exact HTML link <a href="{MEETING_LINK}">my calendar</a>. Never paste the raw URL. Never omit the link.
           - No sign-off name, the sender is automated
           - No "just following up"
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=350), first_name=first_name)
@@ -757,10 +775,10 @@ jobs:
           - Follow the greeting with <br><br> then the body
           - 75-100 words
           - Lead the body with an insight about AI transcription in law enforcement
-          - Never use em dashes (—), use commas or periods instead
+          - ABSOLUTELY NO em dashes (—) or en dashes (–) anywhere. Use periods or commas. This is a hard rule.
           - Separate paragraphs with <br><br> (no newlines, HTML only)
           - Feel like a helpful resource not a sales pitch
-          - CTA: "Worth a quick 30-minute call?" with a link to <a href="{MEETING_LINK}">my calendar</a> — use this exact HTML hyperlink, never paste the raw URL
+          - CTA REQUIREMENT: The final paragraph MUST contain the exact HTML link <a href="{MEETING_LINK}">my calendar</a>. Example: "Worth a quick 30-minute call? <a href="{MEETING_LINK}">My calendar</a> is open." Never paste the raw URL. Never omit the link.
           - No sign-off name, the sender is automated
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=350), first_name=first_name)
               time.sleep(1)
@@ -771,9 +789,9 @@ jobs:
           - Follow the greeting with <br><br> then the body
           - 60-75 words
           - Acknowledge they're busy, leave door open "if timing changes"
-          - Never use em dashes (—), use commas or periods instead
+          - ABSOLUTELY NO em dashes (—) or en dashes (–) anywhere. Use periods or commas. This is a hard rule.
           - Separate paragraphs with <br><br> (no newlines, HTML only)
-          - Soft CTA: mention <a href="{MEETING_LINK}">my calendar</a> is open if timing changes — use this exact HTML hyperlink, never paste the raw URL
+          - CTA REQUIREMENT: The final paragraph MUST contain the exact HTML link <a href="{MEETING_LINK}">my calendar</a>. Example: "<a href="{MEETING_LINK}">My calendar</a> is always open if timing changes." Never paste the raw URL. Never omit the link.
           - No sign-off name, the sender is automated
           - Warm not passive aggressive
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=250), first_name=first_name)

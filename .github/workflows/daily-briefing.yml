@@ -17,7 +17,7 @@ jobs:
           import urllib.request, urllib.parse, json, os, datetime, pytz, time
           HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
           SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
-          SLACK_CHANNEL = "C0APDRMLN1Z"  # #daily-sales
+          SLACK_CHANNEL = "C0APDRMLN1Z"  # #daily-pipe (renamed from #daily-sales)
           SLACK_USER    = "U08JJMM2QSW"
           PORTAL_ID     = "21451281"
           # ── Rep roster & bucket membership ────────────────────────

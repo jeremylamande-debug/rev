@@ -27,13 +27,11 @@ jobs:
           GIST_TOKEN    = os.environ.get("GIST_TOKEN", "")
           GIST_ID       = os.environ.get("GIST_ID", "")
           PORTAL_ID     = "21451281"
-
           # ════════════════════════════════════════════════════════════
           # ACTIVE CONFIG — NY & MA Law Enforcement (Mike Merritts only)
           # Pivoted from CA on 2026-05-20. Full CA block preserved
           # commented-out below for instant revival when you ask.
           # ════════════════════════════════════════════════════════════
-
           # ── Daily lead cap ─────────────────────────────────────────
           # 50 leads/day total, split 25 NY / 25 MA.
           LEADS_PER_STATE = {
@@ -41,17 +39,14 @@ jobs:
               "MA": 25,
           }
           TOTAL_DAILY_CAP = sum(LEADS_PER_STATE.values())
-
           # ── Single owner: Mike Merritts ────────────────────────────
           OWNER_NAME  = "Mike Merritts"
           OWNER_EMAIL = "mike.merritts@rev.com"
           MEETING_LINK = "https://meetings.hubspot.com/mike-merritts"
           CONSOLIDATED_LIST_URL = f"https://app.hubspot.com/contacts/{PORTAL_ID}/objects/0-1/views/65837308/list"
-
           SLACK_USER       = "U08JJMM2QSW"
           DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
           SEQUENCE_ID      = "304238924"
-
           HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
           SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
           ANTH_HEADERS  = {
@@ -59,31 +54,56 @@ jobs:
               "x-api-key": ANTHROPIC_KEY,
               "anthropic-version": "2023-06-01"
           }
-
-          # ── NY counties (mid-size, population ≤500K, prioritized) ─
-          # Excludes NYC 5 boroughs, Nassau, Suffolk, Westchester, Erie (Buffalo),
-          # Monroe (Rochester) — all over the 500K cap.
+          # ── NY + MA counties (all enabled, large-first) ────────────
+          # 2026-05-25: Per JL, the ≤500K population cap restriction has
+          # been removed for both states. Trigger was the Bronx Public
+          # Defender inbound that converted well — large urban counties
+          # are now in scope for Mike to prospect into.
+          #
+          # NY now includes the 5 NYC boroughs (New York/Manhattan,
+          # Kings/Brooklyn, Queens, Bronx, Richmond/Staten Island) plus
+          # Nassau, Suffolk, Westchester, Erie (Buffalo), and Monroe
+          # (Rochester). MA now includes Middlesex, Worcester, Essex,
+          # Suffolk (Boston), and Norfolk.
+          #
+          # Counties are listed large-first because Claude API county
+          # scoring re-sorts by signal score on first run; on cold-start
+          # days (no cached scores) the large counties get worked first
+          # by virtue of their list position, which matches the new
+          # prioritization intent.
           STATE_COUNTIES = {
               "NY": [
-                  "Albany",       # ~315K, state capital region
-                  "Onondaga",     # ~470K, Syracuse — borderline but mid-size LE
-                  "Dutchess",     # ~295K, Poughkeepsie
+                  # Large counties (re-enabled 2026-05-25)
+                  "New York",     # ~1.6M, Manhattan
+                  "Kings",        # ~2.6M, Brooklyn
+                  "Queens",       # ~2.3M, Queens
+                  "Bronx",        # ~1.4M, Bronx — recent Bronx PD inbound win
+                  "Richmond",     # ~495K, Staten Island
+                  "Nassau",       # ~1.4M, Long Island
+                  "Suffolk",      # ~1.5M, Long Island
+                  "Westchester",  # ~1.0M, NYC suburbs
+                  "Erie",         # ~950K, Buffalo
+                  "Monroe",       # ~750K, Rochester
+                  # Mid-size counties
+                  "Onondaga",     # ~470K, Syracuse
                   "Orange",       # ~400K, lower Hudson Valley
-                  "Saratoga",     # ~235K, Saratoga Springs
                   "Rockland",     # ~340K, NYC suburbs
-                  "Ulster",       # ~180K, Kingston
-                  "Niagara",      # ~210K, Niagara Falls
+                  "Albany",       # ~315K, state capital region
+                  "Dutchess",     # ~295K, Poughkeepsie
+                  "Saratoga",     # ~235K, Saratoga Springs
                   "Oneida",       # ~230K, Utica
+                  "Niagara",      # ~210K, Niagara Falls
                   "Broome",       # ~200K, Binghamton
+                  "Ulster",       # ~180K, Kingston
                   "Rensselaer",   # ~160K, Troy
                   "Schenectady",  # ~160K
                   "Chautauqua",   # ~125K
                   "Jefferson",    # ~115K, Watertown
+                  "Ontario",      # ~115K, Canandaigua
+                  "St. Lawrence", # ~108K
                   "Tompkins",     # ~105K, Ithaca
                   "Putnam",       # ~98K
                   "Sullivan",     # ~80K
-                  "Ontario",      # ~115K, Canandaigua
-                  "St. Lawrence", # ~108K
                   "Cattaraugus",  # ~77K
               ],
               # ── MA: orgs structured by DA District, county Sheriff (jails),
@@ -91,29 +111,30 @@ jobs:
               # work to counties for territory/reporting but the agent's
               # search prompts adjust per-org-type below.
               "MA": [
+                  # Large counties (re-enabled 2026-05-25)
+                  "Middlesex",    # ~1.6M, Cambridge/Lowell
+                  "Worcester",    # ~860K, Worcester
+                  "Essex",        # ~810K, Salem/Lawrence
+                  "Suffolk",      # ~800K, Boston
+                  "Norfolk",      # ~725K, Quincy/Dedham
+                  # Mid-size + smaller counties
+                  "Bristol",      # ~580K, Fall River/New Bedford
+                  "Plymouth",     # ~530K, Plymouth/Brockton
                   "Hampden",      # ~465K, Springfield
-                  "Bristol",      # ~580K — JUST over cap but core mid-size MA
-                  "Plymouth",     # ~530K — borderline, keeping for MA volume
-                  "Hampshire",    # ~163K, Northampton
                   "Barnstable",   # ~230K, Cape Cod
+                  "Hampshire",    # ~163K, Northampton
                   "Berkshire",    # ~120K, Pittsfield
                   "Franklin",     # ~70K, Greenfield
                   "Dukes",        # ~20K, Martha's Vineyard
                   "Nantucket",    # ~14K
               ],
           }
-          # NOTE: Bristol & Plymouth MA are slightly over 500K but kept because
-          # MA only has 14 counties total and the remaining sub-500K pool is thin.
-          # Norfolk (~725K), Essex (~810K), Middlesex (~1.6M), Worcester (~860K),
-          # and Suffolk MA (Boston ~800K) all excluded per cap.
-
           # ── Active personas (locked to the 3 we established) ───────
           ACTIVE_PERSONAS = [
               "Public Defender",
               "District Attorney",
               "Police/Sheriff Investigators",
           ]
-
           # ── Org types & titles (state-aware search guidance) ───────
           # Search prompts per state adjust org structure (MA DAs are
           # district-based; MA Public Defender = CPCS regional).
@@ -133,7 +154,6 @@ jobs:
                    "Sergeant Investigations", "Investigations Sergeant",
                ]},
           ]
-
           # ── Persona angles (3 active personas) ─────────────────────
           PERSONA_ANGLES = {
               "District Attorney": {
@@ -152,26 +172,22 @@ jobs:
                   "proof":    "investigations units using Rev cut review and documentation time by 60%, freeing detectives to close more cases"
               },
           }
-
           DEPT_MAP = {
               "District Attorney":             "DA Office",
               "Public Defender":               "Public Defender",
               "Police/Sheriff Investigators":  "Police/Sheriff Investigators",
           }
-
           # ── Procurement notes per state ────────────────────────────
           STATE_PROCUREMENT = {
               "NY": "NY OGS Centralized Contract available — NYS Contract PT (Manageable Print Services / SaaS) and OGS IT Umbrella Contracts allow direct purchase without separate RFP. County agencies can piggyback on state contracts.",
               "MA": "MA Statewide Contract via COMMBUYS — ITS78 (Software & Services) and ITC73 (IT Project Services) vehicles allow county/municipal LE agencies to purchase directly without standalone procurement.",
           }
-
           # ── Persona angles & DEPT_MAP filtered to ACTIVE_PERSONAS ──
           ORG_TYPES = [o for o in ORG_TYPES if o["type"] in ACTIVE_PERSONAS]
           print(f"🎯 Active personas ({len(ORG_TYPES)}): {[o['type'] for o in ORG_TYPES]}")
           print(f"📍 States: NY ({len(STATE_COUNTIES['NY'])} counties) + MA ({len(STATE_COUNTIES['MA'])} counties)")
           print(f"👤 Single owner: {OWNER_NAME} ({OWNER_EMAIL})")
           print(f"📊 Daily cap: {TOTAL_DAILY_CAP} ({LEADS_PER_STATE['NY']} NY / {LEADS_PER_STATE['MA']} MA)")
-
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
               r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
@@ -179,7 +195,6 @@ jobs:
           def hs_post(path, payload):
               r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r.json()
-
           # ── Resolve Mike Merritts' HubSpot owner ID at runtime ────
           owners = hs_get("/crm/v3/owners").get("results", [])
           owner_id = None
@@ -196,15 +211,12 @@ jobs:
           if not owner_id:
               raise RuntimeError(f"❌ Could not find HubSpot owner for {OWNER_NAME} ({OWNER_EMAIL}). Verify owner exists.")
           print(f"✅ Resolved owner: {OWNER_NAME} → ID {owner_id}")
-
           LEADSOURCE_VALUE = "Claude"
-
           # ── State → county lookup (for ownership audit) ───────────
           ALL_COUNTIES = {}
           for state_code, counties in STATE_COUNTIES.items():
               for c in counties:
                   ALL_COUNTIES[(state_code, c)] = OWNER_NAME  # all → Mike
-
           # ── Ownership audit (every OB contact → Mike) ─────────────
           def audit_ownership():
               """Find & fix any OB contacts whose owner isn't Mike."""
@@ -246,7 +258,6 @@ jobs:
                       print(f"    ✅ Reassigned {f['state']}/{f['county']} contact {f['id']} → Mike")
               print(f"  ✅ Ownership audit complete — {len(fixes)} contacts corrected")
           audit_ownership()
-
           # ── Ensure county signal properties exist in HubSpot ──────
           COUNTY_PROPS = [
               {
@@ -306,9 +317,8 @@ jobs:
                       print(f"  ✅ Property ready: {prop['name']} ({status})")
               except Exception as e:
                   print(f"  ⚠️ Property setup error ({prop['name']}): {e}")
-
           # ── State management ──────────────────────────────────────
-          STATE_MARKER = "OUTBOUND_AGENT_STATE_V4_NYMA"  # bumped from V3 (CA)
+          STATE_MARKER = "OUTBOUND_AGENT_STATE_V5_NYMA"  # bumped from V4 — large-counties expansion 2026-05-25 (fresh start so NY begins at New York/Manhattan, not the old next-county pointer)
           def load_state():
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
@@ -327,7 +337,6 @@ jobs:
               except Exception as e:
                   print(f"State load error: {e}")
               return None
-
           def save_state(state):
               try:
                   hs_post("/crm/v3/objects/notes", {
@@ -338,20 +347,17 @@ jobs:
                   })
               except Exception as e:
                   print(f"State save error: {e}")
-
           def init_state():
               return {
                   "NY": {"county": STATE_COUNTIES["NY"][0], "exhausted": [], "county_leads": {}},
                   "MA": {"county": STATE_COUNTIES["MA"][0], "exhausted": [], "county_leads": {}},
               }
-
           def next_county_for_state(state_code, state):
               exhausted_self = set(state[state_code].get("exhausted", []))
               for county in STATE_COUNTIES[state_code]:
                   if county not in exhausted_self:
                       return county
               return None
-
           def get_upcoming_counties(state_code, state, n=2):
               """Return the next N counties after the current active one (excluding exhausted)."""
               exhausted_self = set(state[state_code].get("exhausted", []))
@@ -359,13 +365,11 @@ jobs:
               full_list      = STATE_COUNTIES[state_code]
               upcoming       = [c for c in full_list if c not in exhausted_self and c != current]
               return upcoming[:n]
-
           # ── County scoring (will populate via Claude API on first run) ──
-          SCORE_MARKER   = "COUNTY_SCORE_STATE_V2_NYMA"  # bumped from V1 (CA)
+          SCORE_MARKER   = "COUNTY_SCORE_STATE_V3_NYMA"  # bumped from V2 — large-counties expansion 2026-05-25 (forces re-score of all 44 counties so new NY/MA large counties get full signal data)
           SCORE_MAX_DAYS = 7
           # No seed scores for NY/MA — Claude API will score on first run and cache.
           # CA seed scores preserved in dormant block below.
-
           def load_county_scores():
               try:
                   resp = hs_post("/crm/v3/objects/notes/search", {
@@ -392,7 +396,6 @@ jobs:
                   print(f"Score load error: {e}")
               print("🌱 No cached scores — will score all NY/MA counties via Claude API")
               return None
-
           def save_county_scores(scores):
               try:
                   hs_post("/crm/v3/objects/notes", {
@@ -404,7 +407,6 @@ jobs:
                   print(f"✅ County scores saved ({len(scores)} counties)")
               except Exception as e:
                   print(f"Score save error: {e}")
-
           def score_county(county, state_code):
               state_name = "New York" if state_code == "NY" else "Massachusetts"
               procurement_hint = STATE_PROCUREMENT[state_code]
@@ -464,13 +466,10 @@ jobs:
                   except: pass
               print(f"  ⚠️ Could not parse score for {state_code}/{county}")
               return {"county": county, "state": state_code, "score": 0, "evidence": "parse error", "snippet": ""}
-
           def county_key(state_code, county):
               return f"{state_code}::{county}"
-
           def sort_counties_by_score(county_list, state_code, scores):
               return sorted(county_list, key=lambda c: scores.get(county_key(state_code, c), {}).get("score", 0), reverse=True)
-
           # ── Claude helper ─────────────────────────────────────────
           def claude(prompt, max_tokens=1000, use_search=False):
               body = {
@@ -483,7 +482,6 @@ jobs:
               resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
               return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
-
           # ── Load / init state ─────────────────────────────────────
           state = load_state()
           if not state:
@@ -496,26 +494,34 @@ jobs:
                       state[sc] = {"county": STATE_COUNTIES[sc][0], "exhausted": [], "county_leads": {}}
                   if "county_leads" not in state[sc]:
                       state[sc]["county_leads"] = {}
-
           # ── County scoring pre-pass ───────────────────────────────
-          county_scores = load_county_scores()
-          if not county_scores:
-              print("🌱 Scoring all NY/MA counties via Claude API (first run)...")
-              county_scores = {}
-              for state_code in ["NY", "MA"]:
-                  for county in STATE_COUNTIES[state_code]:
-                      try:
-                          result = score_county(county, state_code)
-                          county_scores[county_key(state_code, county)] = result
-                          time.sleep(2)
-                      except Exception as e:
-                          print(f"  ⚠️ Scoring error for {state_code}/{county}: {e}")
-                          county_scores[county_key(state_code, county)] = {
-                              "county": county, "state": state_code, "score": 0,
-                              "evidence": str(e), "snippet": ""
-                          }
+          # Resilient to STATE_COUNTIES growing over time: future expansions
+          # (e.g. adding a new state, more counties) patch the cache in-place
+          # rather than requiring a SCORE_MARKER bump. Only bump SCORE_MARKER
+          # when the scoring schema / prompt itself changes.
+          county_scores = load_county_scores() or {}
+          was_empty     = len(county_scores) == 0
+          missing = []
+          for state_code in ["NY", "MA"]:
+              for county in STATE_COUNTIES[state_code]:
+                  if county_key(state_code, county) not in county_scores:
+                      missing.append((state_code, county))
+          if missing:
+              label = "first run — scoring all counties" if was_empty else f"incremental — scoring {len(missing)} new/missing counties"
+              print(f"🌱 Scoring counties via Claude API ({label})...")
+              for state_code, county in missing:
+                  try:
+                      result = score_county(county, state_code)
+                      county_scores[county_key(state_code, county)] = result
+                      time.sleep(2)
+                  except Exception as e:
+                      print(f"  ⚠️ Scoring error for {state_code}/{county}: {e}")
+                      county_scores[county_key(state_code, county)] = {
+                          "county": county, "state": state_code, "score": 0,
+                          "evidence": str(e), "snippet": ""
+                      }
               save_county_scores(county_scores)
-              # Monday-only Slack post
+              # Monday-only Slack scoreboard post — fires whenever any scoring happened
               if datetime.datetime.today().weekday() == 0:
                   week_of   = datetime.datetime.today().strftime("%B %d, %Y")
                   score_msg = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
@@ -537,8 +543,7 @@ jobs:
               else:
                   print("📊 County scores refreshed — Slack post skipped (Monday only)")
           else:
-              print(f"✅ Using cached county scores ({len(county_scores)} counties)")
-
+              print(f"✅ Using cached county scores ({len(county_scores)} counties — all current)")
           # Re-sort each state's county list by score (preserving exhausted + current at front)
           for state_code in ["NY", "MA"]:
               not_started  = [c for c in STATE_COUNTIES[state_code]
@@ -549,7 +554,6 @@ jobs:
               sorted_next  = sort_counties_by_score(not_started, state_code, county_scores)
               STATE_COUNTIES[state_code] = already_done + ([current] if current else []) + sorted_next
               print(f"  {state_code} county order: {STATE_COUNTIES[state_code]}")
-
           # ── Find leads (state-aware prompt) ───────────────────────
           def find_leads(county, state_code, org_type, titles, exclude_names=None, batch=1):
               state_name = "New York" if state_code == "NY" else "Massachusetts"
@@ -560,19 +564,29 @@ jobs:
               batch_str = ""
               if batch > 1:
                   batch_str = f"\nThis is search batch {batch} — find people not already captured in previous searches. Look deeper: staff directories, org charts, LinkedIn, department websites, press releases, court records."
-
               # State-specific org structure hints
               ma_hint = ""
               if state_code == "MA":
                   if org_type == "District Attorney":
-                      ma_hint = f"\nNOTE: Massachusetts DAs are organized by district, not county. {county} County falls under one of MA's 11 DA districts — search for the relevant District Attorney's office that prosecutes cases in {county} County (e.g., Berkshire DA, Hampden DA, Northwestern DA for Franklin/Hampshire, Cape & Islands DA for Barnstable/Dukes/Nantucket, Bristol DA, Plymouth DA, etc.)."
+                      ma_hint = f"\nNOTE: Massachusetts DAs are organized by district, not county. {county} County falls under one of MA's 11 DA districts — search for the relevant District Attorney's office that prosecutes cases in {county} County (e.g., Berkshire DA, Hampden DA, Northwestern DA for Franklin/Hampshire, Cape & Islands DA for Barnstable/Dukes/Nantucket, Bristol DA, Plymouth DA, Suffolk DA for Boston, Middlesex DA, Norfolk DA, Essex DA, Worcester DA, etc.)."
                   elif org_type == "Public Defender":
                       ma_hint = f"\nNOTE: MA Public Defenders work through the Committee for Public Counsel Services (CPCS). Search for CPCS regional offices, supervising attorneys, and trial attorneys serving {county} County. Also search for bar advocates and private counsel programs."
                   elif org_type == "Police/Sheriff Investigators":
                       ma_hint = f"\nNOTE: MA Sheriffs primarily run jails (not patrol). For investigators, focus on: (1) {county} County Sheriff's Office (jail-side investigators, internal affairs), (2) the major municipal Police Departments in {county} County (Detective Bureau, Investigations Unit), and (3) MA State Police barracks/detective units assigned to {county} County."
-
+              # NY borough/NYC-specific hint
+              ny_hint = ""
+              if state_code == "NY" and county in ("New York", "Kings", "Queens", "Bronx", "Richmond"):
+                  borough_map = {
+                      "New York": "Manhattan",
+                      "Kings":    "Brooklyn",
+                      "Queens":   "Queens",
+                      "Bronx":    "the Bronx",
+                      "Richmond": "Staten Island",
+                  }
+                  borough = borough_map[county]
+                  ny_hint = f"\nNOTE: {county} County is the NYC borough of {borough}. For District Attorney, search for the {county} County District Attorney's Office (often referred to by borough name, e.g., 'Manhattan DA', 'Brooklyn DA', 'Bronx DA', 'Queens DA', 'Staten Island DA'). For Public Defender, search for borough-specific defender orgs (Legal Aid Society, Bronx Defenders, Brooklyn Defender Services, Queens Defenders, Neighborhood Defender Service of Harlem, New York County Defender Services, etc.). For Police/Sheriff Investigators, the NYPD operates borough commands and detective bureaus — search NYPD precincts, detective squads, and specialized investigations units assigned to {borough}, plus the NYC Department of Investigation and NYC Sheriff's Office where relevant."
               prompt = f"""Search for real staff at the {org_type} in {county} County, {state_name}.
-          Find people with these titles: {', '.join(titles)}{ma_hint}
+          Find people with these titles: {', '.join(titles)}{ma_hint}{ny_hint}
           Look at official government websites, staff directories, LinkedIn, org charts, and public records.
           Find as many real people as possible — aim for 20+ contacts. Include all levels, not just top leadership.{exclude_str}{batch_str}
           Return a JSON array. Each item must have these exact keys:
@@ -606,7 +620,6 @@ jobs:
                   except: pass
               print(f"    ⚠️ Could not parse JSON")
               return []
-
           # ── Duplicate check ───────────────────────────────────────
           def is_duplicate(email, first_name, last_name):
               if email:
@@ -620,7 +633,6 @@ jobs:
                       {"propertyName": "lastname",  "operator": "EQ", "value": last_name}
                   ]}], "limit": 1})
               return r.get("total", 0) > 0
-
           # ── Text normalization ────────────────────────────────────
           ACRONYMS = {
               "HR", "IT", "PR", "IA", "IG", "HRIS", "CHRO", "HRO", "HRBP",
@@ -671,7 +683,6 @@ jobs:
                   if lead.get(field):
                       lead[field] = normalize_case(lead[field])
               return lead
-
           # ── Email sequence ────────────────────────────────────────
           def clean_email_body(text, first_name=None):
               if not text:
@@ -726,7 +737,6 @@ jobs:
                   cleaned = body
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
               return cleaned + '<br>'
-
           def gen_email_sequence(contact):
               org_type   = contact.get("org_type", "Public Defender")
               angles     = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
@@ -738,7 +748,6 @@ jobs:
               state_name = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
               emails     = {}
               loc_str    = f"{county} County, {state_name}" if state_name else f"{county} County"
-
               emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {loc_str}.
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
@@ -796,7 +805,6 @@ jobs:
           - Warm not passive aggressive
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=250), first_name=first_name)
               return emails
-
           def gen_subject(contact, email_num=1):
               if email_num in (2, 4):
                   return ""
@@ -807,7 +815,6 @@ jobs:
                   3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
               }
               return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
-
           # ── Buying role ───────────────────────────────────────────
           def get_buying_role(title):
               t = title.lower()
@@ -823,7 +830,6 @@ jobs:
               if any(x in t for x in ["legal", "compliance"]):
                   return "LEGAL_AND_COMPLIANCE"
               return "BUDGET_HOLDER"
-
           # ── Enroll contact in HubSpot Sequence ───────────────────
           def enroll_in_sequence(contact_id, contact_email):
               if not contact_email:
@@ -845,7 +851,6 @@ jobs:
               else:
                   print(f"    ⚠️ Sequence enrollment failed ({resp.status_code}): {resp.text[:300]}")
                   return False
-
           # ── Create HubSpot contact ────────────────────────────────
           def create_contact(contact, email_body, subject, emails=None, subjects=None):
               emails   = emails   or {}
@@ -886,7 +891,6 @@ jobs:
               else:
                   # Fallback procurement note if score not cached
                   props["county_carahsoft__naspo"] = STATE_PROCUREMENT.get(state_code, "")
-
               props["hubspot_owner_id"] = str(owner_id)
               if contact.get("email"):   props["email"]   = contact["email"]
               if contact.get("phone"):   props["phone"]   = contact["phone"]
@@ -920,7 +924,6 @@ jobs:
               })
               enrolled = enroll_in_sequence(contact_id, contact.get("email", ""))
               return {"id": contact_id, "enrolled": enrolled}
-
           # ── Publish state to GitHub Gist ─────────────────────────
           def publish_gist(state):
               if not GIST_TOKEN:
@@ -937,7 +940,6 @@ jobs:
               data = r.json()
               print(f"✅ Gist published: {data.get('html_url', '')}")
               return data.get("html_url", "")
-
           # ── Generate chart (2-panel: NY + MA breakdown for Mike) ──
           def generate_chart(state, results, today_str):
               fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -989,7 +991,6 @@ jobs:
               plt.close()
               print(f"Chart saved: {chart_path}")
               return chart_path
-
           # ── Upload chart to Slack ─────────────────────────────────
           def upload_chart_to_slack(chart_path, channel_id, today_str):
               try:
@@ -1026,7 +1027,6 @@ jobs:
               except Exception as e:
                   print(f"Chart upload error: {e}")
                   return None
-
           # ── Main loop ─────────────────────────────────────────────
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
           results   = {}
@@ -1163,21 +1163,17 @@ jobs:
                   "added":   added,
                   "skipped": skipped,
               }
-
           # ── Save state & publish Gist ─────────────────────────────
           save_state(state)
           print(f"\nState saved: {json.dumps(state, indent=2)}")
           publish_gist(state)
-
           # ── Open DM channel ───────────────────────────────────────
           dm = requests.post("https://slack.com/api/conversations.open",
               headers=SLACK_HEADERS, json={"users": SLACK_USER})
           dm_ch = dm.json().get("channel", {}).get("id", "D08JJMN2L66")
-
           # ── Generate & upload chart ───────────────────────────────
           chart_path = generate_chart(state, results, today_str)
           upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
-
           # ── Slack summary → #daily-ob ─────────────────────────────
           total_added    = sum(len(r["added"]) for r in results.values())
           total_skip     = sum(r["skipped"]    for r in results.values())
@@ -1247,7 +1243,6 @@ jobs:
               headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
           print(f"\n✅ Done! {total_added} leads added, {total_enrolled} enrolled in sequence.")
           EOF
-
 # ═══════════════════════════════════════════════════════════════════════
 # ▼▼▼ DORMANT — CA LAW ENFORCEMENT CONFIG (DO NOT DELETE) ▼▼▼
 # ═══════════════════════════════════════════════════════════════════════

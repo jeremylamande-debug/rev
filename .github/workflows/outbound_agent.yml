@@ -366,7 +366,7 @@ jobs:
               upcoming       = [c for c in full_list if c not in exhausted_self and c != current]
               return upcoming[:n]
           # ── County scoring (will populate via Claude API on first run) ──
-          SCORE_MARKER   = "COUNTY_SCORE_STATE_V3_NYMA"  # bumped from V2 — large-counties expansion 2026-05-25 (forces re-score of all 44 counties so new NY/MA large counties get full signal data)
+          SCORE_MARKER   = "COUNTY_SCORE_STATE_V4_NYMA"  # bumped from V3 on 2026-05-26 — invalidates the cache that came back 43/44 zeros on the Monday 5/25 run (web-search rate-limit cascade after Ontario succeeded); paired with the resilience fixes below this is a one-shot reset.
           SCORE_MAX_DAYS = 7
           # No seed scores for NY/MA — Claude API will score on first run and cache.
           # CA seed scores preserved in dormant block below.
@@ -452,9 +452,15 @@ jobs:
           }}
           Return ONLY the JSON object."""
               raw = claude(prompt, max_tokens=800, use_search=True)
-              for attempt in [
-                  lambda t: json.loads(t.strip()),
-                  lambda t: json.loads(t[t.find("{"):t.rfind("}")+1]),
+              # Strip common wrappers Claude sometimes adds around JSON
+              # (markdown fences, leading prose, citation footnotes from web_search).
+              def _clean(t):
+                  t = t.replace("```json", "").replace("```", "").strip()
+                  return t
+              parse_errors = []
+              for attempt_name, attempt in [
+                  ("strict",   lambda t: json.loads(_clean(t))),
+                  ("substring", lambda t: json.loads(_clean(t)[_clean(t).find("{"):_clean(t).rfind("}")+1])),
               ]:
                   try:
                       result = attempt(raw)
@@ -463,15 +469,30 @@ jobs:
                           result["state"] = state_code
                           print(f"  📊 {state_code}/{county}: {result['score']}/100 | T0={result.get('tier0_coop_contract')} T3_tx={result.get('tier3_transcription_line')} T3_bwc={result.get('tier3_body_cam')}")
                           return result
-                  except: pass
+                  except Exception as e:
+                      parse_errors.append(f"{attempt_name}: {type(e).__name__}: {e}")
+              # ── All parse attempts failed — log loudly so we know WHY ─────
               print(f"  ⚠️ Could not parse score for {state_code}/{county}")
-              return {"county": county, "state": state_code, "score": 0, "evidence": "parse error", "snippet": ""}
+              for err in parse_errors:
+                  print(f"      parse-error: {err}")
+              print(f"      raw response (first 500 chars): {raw[:500]!r}")
+              return {
+                  "county": county, "state": state_code, "score": 0,
+                  "evidence": f"parse error — {parse_errors[0] if parse_errors else 'unknown'}",
+                  "snippet": "",
+                  "_parse_failed": True,  # flag so the cache-save guard can count these
+              }
           def county_key(state_code, county):
               return f"{state_code}::{county}"
           def sort_counties_by_score(county_list, state_code, scores):
               return sorted(county_list, key=lambda c: scores.get(county_key(state_code, c), {}).get("score", 0), reverse=True)
           # ── Claude helper ─────────────────────────────────────────
-          def claude(prompt, max_tokens=1000, use_search=False):
+          # Retry/backoff added 2026-05-26 — Monday 5/25 county scoring run
+          # collapsed because web_search calls hit 429s after Ontario and the
+          # script silently treated every subsequent failure as score=0. Now
+          # we retry on 429/5xx + empty content, raise on terminal failure,
+          # and let the caller decide whether to swallow.
+          def claude(prompt, max_tokens=1000, use_search=False, max_retries=4):
               body = {
                   "model": "claude-sonnet-4-6",
                   "max_tokens": max_tokens,
@@ -479,9 +500,41 @@ jobs:
               }
               if use_search:
                   body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
-              resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
-              data = resp.json()
-              return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+              last_err = None
+              for attempt in range(max_retries):
+                  try:
+                      resp = requests.post(
+                          "https://api.anthropic.com/v1/messages",
+                          headers=ANTH_HEADERS, json=body, timeout=120
+                      )
+                      # 429 / 529 / 5xx → backoff & retry
+                      if resp.status_code in (429, 529) or resp.status_code >= 500:
+                          retry_after = resp.headers.get("retry-after")
+                          delay = float(retry_after) if retry_after else (2 ** attempt) * 5
+                          print(f"    ⏳ Claude API {resp.status_code} (attempt {attempt+1}/{max_retries}) — sleeping {delay}s")
+                          time.sleep(delay)
+                          last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                          continue
+                      if resp.status_code >= 400:
+                          # Non-retryable client error — bubble up
+                          raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:300]}")
+                      data = resp.json()
+                      text = "".join(
+                          b.get("text", "") for b in data.get("content", [])
+                          if b.get("type") == "text"
+                      ).strip()
+                      if not text:
+                          # Empty response (sometimes happens with web_search) — retry
+                          print(f"    ⚠️ Empty Claude response (attempt {attempt+1}/{max_retries}) — retrying")
+                          time.sleep((2 ** attempt) * 3)
+                          last_err = "empty content"
+                          continue
+                      return text
+                  except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                      last_err = f"network: {e}"
+                      print(f"    ⚠️ Claude API network error (attempt {attempt+1}/{max_retries}): {e}")
+                      time.sleep((2 ** attempt) * 3)
+              raise RuntimeError(f"Claude API exhausted {max_retries} retries — last error: {last_err}")
           # ── Load / init state ─────────────────────────────────────
           state = load_state()
           if not state:
@@ -506,42 +559,79 @@ jobs:
               for county in STATE_COUNTIES[state_code]:
                   if county_key(state_code, county) not in county_scores:
                       missing.append((state_code, county))
+          # Tunables for the scoring pre-pass (2026-05-26 — resilience pass)
+          SCORE_SLEEP_SEC         = 8     # was 2; 8s is conservative enough to avoid web_search throttling
+          SCORE_FAIL_THRESHOLD    = 0.30  # if >30% of newly-scored counties are 0, refuse to persist + skip Slack post
           if missing:
               label = "first run — scoring all counties" if was_empty else f"incremental — scoring {len(missing)} new/missing counties"
-              print(f"🌱 Scoring counties via Claude API ({label})...")
+              print(f"🌱 Scoring counties via Claude API ({label}) — sleep {SCORE_SLEEP_SEC}s between calls")
+              newly_scored = {}  # only counties we actually attempted this run (for the failure-rate guard)
               for state_code, county in missing:
                   try:
                       result = score_county(county, state_code)
                       county_scores[county_key(state_code, county)] = result
-                      time.sleep(2)
+                      newly_scored[county_key(state_code, county)]  = result
+                      time.sleep(SCORE_SLEEP_SEC)
                   except Exception as e:
                       print(f"  ⚠️ Scoring error for {state_code}/{county}: {e}")
-                      county_scores[county_key(state_code, county)] = {
+                      bad = {
                           "county": county, "state": state_code, "score": 0,
-                          "evidence": str(e), "snippet": ""
+                          "evidence": f"exception: {e}", "snippet": "",
+                          "_scoring_exception": True,
                       }
-              save_county_scores(county_scores)
-              # Monday-only Slack scoreboard post — fires whenever any scoring happened
-              if datetime.datetime.today().weekday() == 0:
-                  week_of   = datetime.datetime.today().strftime("%B %d, %Y")
-                  score_msg = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
-                  for state_code in ["NY", "MA"]:
-                      score_msg += f"*{state_code}:*\n"
-                      state_scores = [(c, county_scores.get(county_key(state_code, c), {})) for c in STATE_COUNTIES[state_code]]
-                      state_scores.sort(key=lambda x: x[1].get("score", 0), reverse=True)
-                      for c, s in state_scores:
-                          t0  = "🤝" if s.get("tier0_coop_contract") else "  "
-                          t3  = "📝" if s.get("tier3_transcription_line") else "  "
-                          bwc = "📷" if s.get("tier3_body_cam") else "  "
-                          score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
-                          if s.get("snippet"):
-                              snippet_line1 = s["snippet"].split("\n")[0]
-                              score_msg += f"    _{snippet_line1}_\n"
-                      score_msg += "\n"
-                  requests.post("https://slack.com/api/chat.postMessage",
-                      headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": score_msg})
+                      county_scores[county_key(state_code, county)] = bad
+                      newly_scored[county_key(state_code, county)]  = bad
+                      # Even on failure, throttle so we don't hammer a degraded API
+                      time.sleep(SCORE_SLEEP_SEC)
+              # ── Failure-rate guard: don't poison the cache or Slack ───────
+              zero_count   = sum(1 for s in newly_scored.values() if s.get("score", 0) == 0)
+              fail_ratio   = zero_count / max(len(newly_scored), 1)
+              mass_failure = fail_ratio > SCORE_FAIL_THRESHOLD
+              if mass_failure:
+                  print(
+                      f"🛑 Scoring run looks broken: {zero_count}/{len(newly_scored)} counties came back 0 "
+                      f"({fail_ratio:.0%} > {SCORE_FAIL_THRESHOLD:.0%} threshold). "
+                      f"Refusing to save bad scores and skipping the Slack scoreboard post."
+                  )
+                  # Drop the bad newly-scored zeros from county_scores so we re-try next run.
+                  for k, v in list(newly_scored.items()):
+                      if v.get("score", 0) == 0:
+                          county_scores.pop(k, None)
+                  # Loud alert so we don't miss it
+                  try:
+                      alert = (
+                          f"<@{SLACK_USER}> ⚠️ *County Signal scoring run aborted* — "
+                          f"{zero_count}/{len(newly_scored)} counties scored 0 "
+                          f"(likely web_search rate-limit). Cache NOT saved; "
+                          f"will retry on next run. Check workflow logs."
+                      )
+                      requests.post("https://slack.com/api/chat.postMessage",
+                          headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})
+                  except Exception as e:
+                      print(f"  ⚠️ Failed to post mass-failure alert: {e}")
               else:
-                  print("📊 County scores refreshed — Slack post skipped (Monday only)")
+                  save_county_scores(county_scores)
+                  # Monday-only Slack scoreboard post — only when scoring looked healthy
+                  if datetime.datetime.today().weekday() == 0:
+                      week_of   = datetime.datetime.today().strftime("%B %d, %Y")
+                      score_msg = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
+                      for state_code in ["NY", "MA"]:
+                          score_msg += f"*{state_code}:*\n"
+                          state_scores = [(c, county_scores.get(county_key(state_code, c), {})) for c in STATE_COUNTIES[state_code]]
+                          state_scores.sort(key=lambda x: x[1].get("score", 0), reverse=True)
+                          for c, s in state_scores:
+                              t0  = "🤝" if s.get("tier0_coop_contract") else "  "
+                              t3  = "📝" if s.get("tier3_transcription_line") else "  "
+                              bwc = "📷" if s.get("tier3_body_cam") else "  "
+                              score_msg += f"{t0}{t3}{bwc} *{c}* — {s.get('score', 0)}/100\n"
+                              if s.get("snippet"):
+                                  snippet_line1 = s["snippet"].split("\n")[0]
+                                  score_msg += f"    _{snippet_line1}_\n"
+                          score_msg += "\n"
+                      requests.post("https://slack.com/api/chat.postMessage",
+                          headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": score_msg})
+                  else:
+                      print("📊 County scores refreshed — Slack post skipped (Monday only)")
           else:
               print(f"✅ Using cached county scores ({len(county_scores)} counties — all current)")
           # Re-sort each state's county list by score (preserving exhausted + current at front)

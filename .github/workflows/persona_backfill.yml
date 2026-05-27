@@ -1,0 +1,318 @@
+name: OB Persona Backfill — Populate `persona` property on all JL OB contacts
+# One-shot backfill to set a new `persona` enum property on every contact
+# created by the OB agent. Same population as the Office backfill (matches
+# HubSpot view 64051171 — leadsource = Claude AND lead_source_details = JL OB).
+# Classifies each contact into one of the 3 ACTIVE_PERSONAS:
+#   - "Public Defender"
+#   - "District Attorney"
+#   - "Police/Sheriff Investigators"
+# Inference uses the contact's `company` (most reliable) then falls back to
+# the `jobtitle` if company doesn't yield a clear signal. Unmatched contacts
+# are logged but NOT set (so they can be reviewed manually).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (preview changes only, no writes to HubSpot)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+jobs:
+  persona-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Backfill persona property on all JL OB contacts
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DRY_RUN:         ${{ github.event.inputs.dry_run }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, json, os, time, re
+
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() == "true"
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
+          SLACK_USER       = "U08JJMM2QSW"
+
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          # The 3 canonical personas — must match ACTIVE_PERSONAS in the
+          # daily agent exactly so the field value lines up everywhere.
+          PERSONAS = [
+              "Public Defender",
+              "District Attorney",
+              "Police/Sheriff Investigators",
+          ]
+
+          def hs_post(path, payload):
+              r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r
+
+          # ── Step 1: ensure the `persona` enum property exists ──────────
+          # Idempotent — 409 means it already exists.
+          print("🔧 Ensuring `persona` property exists on Contact...")
+          prop_payload = {
+              "name":        "persona",
+              "label":       "Persona",
+              "description": "Which of the 3 OB agent personas this contact belongs to. Inferred from their office/company and job title.",
+              "type":        "enumeration",
+              "fieldType":   "select",
+              "groupName":   "contactinformation",
+              "options": [
+                  {"label": p, "value": p, "displayOrder": i}
+                  for i, p in enumerate(PERSONAS)
+              ],
+          }
+          prop_resp = requests.post(
+              "https://api.hubapi.com/crm/v3/properties/contacts",
+              headers=HS_HEADERS,
+              json=prop_payload,
+          )
+          if prop_resp.status_code in (200, 201):
+              print(f"  ✅ Created `persona` property ({prop_resp.status_code})")
+          elif prop_resp.status_code == 409:
+              print(f"  ✅ `persona` property already exists")
+          else:
+              print(f"  ⚠️ Unexpected status {prop_resp.status_code}: {prop_resp.text[:200]}")
+
+          # ── Step 2: persona inference ─────────────────────────────────
+          # Order matters: DA first (signal is the cleanest), then PD
+          # (defenders / legal aid / CPCS), then Police/Sheriff (catch-all
+          # for law enforcement). Company > title because the agent
+          # records the office name verbatim from Claude/web search, but
+          # titles can be ambiguous (e.g. "Chief Investigator" exists at
+          # both DA offices and Sheriff's Offices).
+          DA_COMPANY    = re.compile(r"district\s+attorney|d\.?a\.?\s*('?s)?\s*office|prosecut", re.I)
+          PD_COMPANY    = re.compile(
+              r"public\s+defender|"
+              r"\bdefenders?\b|"        # "Bronx Defenders", "Brooklyn Defender Services", etc.
+              r"legal\s+aid|"
+              r"cpcs|"                  # Committee for Public Counsel Services (MA)
+              r"committee\s+for\s+public\s+counsel|"
+              r"indigent\s+defense|"
+              r"neighborhood\s+defender",
+              re.I,
+          )
+          POLICE_COMPANY = re.compile(
+              r"sheriff|"
+              r"police|"
+              r"\bnypd\b|\blapd\b|\bmsp\b|"
+              r"state\s+police|"
+              r"detective\s+bureau|"
+              r"investigations?\s+(unit|bureau|division)|"
+              r"law\s+enforcement",
+              re.I,
+          )
+          DA_TITLE = re.compile(
+              r"district\s+attorney|"
+              r"\bada\b|"
+              r"assistant\s+district\s+attorney|"
+              r"deputy\s+district\s+attorney|"
+              r"prosecutor",
+              re.I,
+          )
+          PD_TITLE = re.compile(
+              r"public\s+defender|"
+              r"trial\s+attorney|"
+              r"staff\s+attorney|"
+              r"supervising\s+attorney|"
+              r"bar\s+advocate",
+              re.I,
+          )
+          POLICE_TITLE = re.compile(
+              r"sheriff|undersheriff|"
+              r"chief\s+of\s+police|deputy\s+chief|assistant\s+chief|"
+              r"commander|captain|lieutenant|sergeant|"
+              r"detective|investigator|"
+              r"\bofficer\b",
+              re.I,
+          )
+
+          def infer_persona(company, title):
+              company = company or ""
+              title   = title   or ""
+              # Pass 1 — company string (most reliable)
+              if DA_COMPANY.search(company):     return "District Attorney"
+              if PD_COMPANY.search(company):     return "Public Defender"
+              if POLICE_COMPANY.search(company): return "Police/Sheriff Investigators"
+              # Pass 2 — fall back to title if company didn't signal
+              if DA_TITLE.search(title):     return "District Attorney"
+              if PD_TITLE.search(title):     return "Public Defender"
+              if POLICE_TITLE.search(title): return "Police/Sheriff Investigators"
+              return None
+
+          # ── Step 3: fetch all JL OB contacts (same view as office backfill) ──
+          # leadsource = "Claude" AND lead_source_details = "JL OB"
+          # → matches HubSpot view 64051171 (verified count: 4099).
+          def fetch_all_ob_contacts():
+              contacts = []
+              after    = None
+              page     = 0
+              while True:
+                  page += 1
+                  payload = {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "leadsource",           "operator": "EQ", "value": "Claude"},
+                          {"propertyName": "lead_source_details",  "operator": "EQ", "value": "JL OB"},
+                      ]}],
+                      "properties": [
+                          "firstname", "lastname", "email",
+                          "company", "office", "jobtitle",
+                          "persona",
+                          "county", "state",
+                      ],
+                      "limit": 100,
+                  }
+                  if after:
+                      payload["after"] = after
+                  resp_obj = hs_post("/crm/v3/objects/contacts/search", payload)
+                  resp     = resp_obj.json()
+                  if resp_obj.status_code >= 400:
+                      print(f"  ❌ Search failed status={resp_obj.status_code}: {resp_obj.text[:300]}")
+                      break
+                  results = resp.get("results", [])
+                  contacts.extend(results)
+                  print(f"  Page {page}: +{len(results)} (total {len(contacts)})")
+                  paging = resp.get("paging", {})
+                  after  = paging.get("next", {}).get("after")
+                  if not after:
+                      break
+                  time.sleep(0.3)
+              return contacts
+
+          mode = "🧪 DRY RUN" if DRY_RUN else "🔧 LIVE RUN"
+          print(f"\n{mode} — fetching all JL OB contacts...")
+          contacts = fetch_all_ob_contacts()
+          print(f"\n📋 Found {len(contacts)} JL OB contacts. Classifying personas...\n")
+
+          # ── Step 4: classify each contact ─────────────────────────────
+          to_update      = []  # (id, persona)
+          already_set    = 0
+          unmatched      = 0
+          per_persona    = {p: 0 for p in PERSONAS}
+          unmatched_samples = []   # first 10 with no inference
+          sample_diffs      = []   # first 10 updates per persona
+          per_persona_samples = {p: [] for p in PERSONAS}
+
+          for c in contacts:
+              cid     = c["id"]
+              props   = c.get("properties", {}) or {}
+              persona = (props.get("persona")  or "").strip()
+              company = (props.get("company")  or "").strip()
+              office  = (props.get("office")   or "").strip()
+              title   = (props.get("jobtitle") or "").strip()
+              # Prefer `office` (just-backfilled, highest signal) but fall
+              # back to `company` if office is empty (e.g. brand-new
+              # contacts post-deploy that haven't been office-backfilled).
+              signal_string = office or company
+              if persona:
+                  already_set += 1
+                  continue
+              inferred = infer_persona(signal_string, title)
+              if not inferred:
+                  unmatched += 1
+                  if len(unmatched_samples) < 10:
+                      fn = (props.get("firstname") or "").strip()
+                      ln = (props.get("lastname")  or "").strip()
+                      county = (props.get("county") or "").strip()
+                      unmatched_samples.append(f"{fn} {ln} ({county}) — title='{title}' company='{company}'")
+                  continue
+              to_update.append((cid, inferred))
+              per_persona[inferred] += 1
+              if len(per_persona_samples[inferred]) < 3:
+                  fn = (props.get("firstname") or "").strip()
+                  ln = (props.get("lastname")  or "").strip()
+                  county = (props.get("county") or "").strip()
+                  per_persona_samples[inferred].append(f"{fn} {ln} ({county}) — '{title}' @ {signal_string}")
+
+          print(f"📊 Classification complete:")
+          print(f"   • Need backfill:        {len(to_update)}")
+          print(f"     • District Attorney:           {per_persona['District Attorney']}")
+          print(f"     • Public Defender:             {per_persona['Public Defender']}")
+          print(f"     • Police/Sheriff Investigators:{per_persona['Police/Sheriff Investigators']}")
+          print(f"   • Already had persona:  {already_set}")
+          print(f"   • Unmatched (skipped):  {unmatched}")
+          print(f"   • Total scanned:        {len(contacts)}\n")
+
+          for p in PERSONAS:
+              if per_persona_samples[p]:
+                  print(f"🔎 Sample — {p}:")
+                  for s in per_persona_samples[p]:
+                      print(f"   • {s}")
+              else:
+                  print(f"🔎 Sample — {p}: (no matches)")
+          if unmatched_samples:
+              print(f"\n❓ Unmatched samples (review manually):")
+              for s in unmatched_samples:
+                  print(f"   • {s}")
+          print()
+
+          # ── Step 5: batch-update HubSpot (100/req) ─────────────────────
+          updated   = 0
+          batch_err = 0
+          if to_update and not DRY_RUN:
+              print(f"🚀 Writing {len(to_update)} persona updates to HubSpot...")
+              for i in range(0, len(to_update), 100):
+                  batch  = to_update[i:i+100]
+                  inputs = [{"id": cid, "properties": {"persona": p}}
+                            for cid, p in batch]
+                  r = requests.post(
+                      "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                      headers=HS_HEADERS,
+                      json={"inputs": inputs}
+                  )
+                  if r.status_code in (200, 207):
+                      updated += len(batch)
+                      print(f"  ✅ Batch {i//100 + 1}: updated {len(batch)} (running total {updated})")
+                  else:
+                      batch_err += 1
+                      print(f"  ❌ Batch {i//100 + 1} failed status={r.status_code}: {r.text[:300]}")
+                  time.sleep(0.5)
+          elif to_update and DRY_RUN:
+              print(f"🧪 DRY RUN — would have updated {len(to_update)} contacts. No writes performed.")
+          else:
+              print("✅ Nothing to backfill — every OB contact already has `persona` set.")
+
+          # ── Step 6: Slack summary ─────────────────────────────────────
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*🏷️ OB Persona Backfill — {mode}*\n"
+          msg += f"_Filter: `leadsource = Claude AND lead_source_details = JL OB` (HubSpot view 64051171)_\n\n"
+          msg += f"• Total OB contacts scanned: *{len(contacts)}*\n"
+          msg += f"• Need backfill: *{len(to_update)}*\n"
+          msg += f"    ⚖️  District Attorney: *{per_persona['District Attorney']}*\n"
+          msg += f"    👨‍⚖️ Public Defender: *{per_persona['Public Defender']}*\n"
+          msg += f"    🚓 Police/Sheriff: *{per_persona['Police/Sheriff Investigators']}*\n"
+          msg += f"• Already had persona: *{already_set}*\n"
+          msg += f"• Unmatched (skipped): *{unmatched}*\n"
+          if not DRY_RUN:
+              msg += f"• Successfully updated: *{updated}*\n"
+              if batch_err:
+                  msg += f"• Batch errors: *{batch_err}* (see workflow logs)\n"
+          else:
+              msg += f"• _Re-run with `dry_run = false` to apply._\n"
+          if unmatched_samples:
+              msg += f"\n*Unmatched samples (need manual review):*\n"
+              for s in unmatched_samples[:5]:
+                  msg += f"• `{s}`\n"
+
+          try:
+              r = requests.post(
+                  "https://slack.com/api/chat.postMessage",
+                  headers=SLACK_HEADERS,
+                  json={"channel": DAILY_OB_CHANNEL, "text": msg}
+              )
+              if r.json().get("ok"):
+                  print("\n✅ Slack summary posted")
+              else:
+                  print(f"\n⚠️ Slack post failed: {r.json()}")
+          except Exception as e:
+              print(f"\n⚠️ Slack post error: {e}")
+          EOF

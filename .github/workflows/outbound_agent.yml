@@ -155,6 +155,21 @@ jobs:
               "District Attorney",
               "Police/Sheriff Investigators",
           ]
+          # ── Per-county persona omits ───────────────────────────────
+          # Used to skip prospecting a specific persona in a specific
+          # county when the org is already engaged in a sales cycle and
+          # we don't want to cold-outreach into them.
+          #
+          # Format: {(state_code, county): {persona, ...}}
+          # 2026-05-27 — Bronx Defenders engaged via recent inbound win
+          # (per the STATE_COUNTIES NY note at line 80). Public Defender
+          # in Bronx is now off-limits while the cycle is active. DA and
+          # Police/Sheriff in Bronx remain in scope.
+          PERSONA_OMIT = {
+              ("NY", "Bronx"): {"Public Defender"},
+          }
+          def persona_allowed(state_code, county, persona):
+              return persona not in PERSONA_OMIT.get((state_code, county), set())
           # ── Org types & titles (state-aware search guidance) ───────
           # Search prompts per state adjust org structure (MA DAs are
           # district-based; MA Public Defender = CPCS regional).
@@ -315,20 +330,54 @@ jobs:
                   "type":        "string",
                   "fieldType":   "textarea",
               },
+              {
+                  # 2026-05-27 — rep-facing label so it's easy to see at a
+                  # glance which exact office / org an OB contact belongs
+                  # to (Bronx DA vs Legal Aid NYC vs NYPD Manhattan South
+                  # Detective Bureau etc). Mirrors the `organization`
+                  # string Claude returns in find_leads.
+                  "name":        "office",
+                  "label":       "Office",
+                  "description": "Specific office / organization the contact belongs to (e.g. 'Bronx County District Attorney's Office', 'Legal Aid Society NYC', 'NYPD Manhattan South Detective Bureau'). Populated automatically by the OB agent.",
+                  "type":        "string",
+                  "fieldType":   "text",
+              },
+              {
+                  # 2026-05-27 — which of the 3 ACTIVE_PERSONAS this contact
+                  # represents. Mirrors `org_type` from find_leads so it can
+                  # be filtered/segmented in HubSpot views without
+                  # string-matching the company name. Enum to enforce the
+                  # canonical 3 values across NY/MA and the CA-era contacts.
+                  "name":        "persona",
+                  "label":       "Persona",
+                  "description": "Which of the 3 OB agent personas this contact belongs to: Public Defender, District Attorney, or Police/Sheriff Investigators. Set automatically by the OB agent (from org_type at create time).",
+                  "type":        "enumeration",
+                  "fieldType":   "select",
+                  "options": [
+                      {"label": "Public Defender",              "value": "Public Defender",              "displayOrder": 0},
+                      {"label": "District Attorney",            "value": "District Attorney",            "displayOrder": 1},
+                      {"label": "Police/Sheriff Investigators", "value": "Police/Sheriff Investigators", "displayOrder": 2},
+                  ],
+              },
           ]
           for prop in COUNTY_PROPS:
               try:
+                  body = {
+                      "name":        prop["name"],
+                      "label":       prop["label"],
+                      "description": prop["description"],
+                      "type":        prop["type"],
+                      "fieldType":   prop["fieldType"],
+                      "groupName":   "contactinformation",
+                  }
+                  # Enumeration properties (e.g. `persona`) need their
+                  # dropdown values passed at creation time.
+                  if "options" in prop:
+                      body["options"] = prop["options"]
                   r = requests.post(
                       "https://api.hubapi.com/crm/v3/properties/contacts",
                       headers=HS_HEADERS,
-                      json={
-                          "name":        prop["name"],
-                          "label":       prop["label"],
-                          "description": prop["description"],
-                          "type":        prop["type"],
-                          "fieldType":   prop["fieldType"],
-                          "groupName":   "contactinformation",
-                      }
+                      json=body
                   )
                   status = r.status_code
                   if status not in (200, 201, 409):
@@ -1074,11 +1123,17 @@ jobs:
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
               state_code  = contact.get("state", "")
               state_name  = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
+              # `persona` mirrors the org_type from find_leads — one of the 3
+              # ACTIVE_PERSONAS. Lets the HubSpot view be filtered by persona
+              # without string-matching the company name.
+              persona_val = contact.get("org_type", "") if contact.get("org_type", "") in ACTIVE_PERSONAS else ""
               props = {
                   "firstname":             contact["first_name"],
                   "lastname":              contact["last_name"],
                   "jobtitle":              contact["title"],
                   "company":               contact["organization"],
+                  "office":                contact.get("organization", ""),
+                  "persona":               persona_val,
                   "state":                 state_name,
                   "city":                  f"{contact['county']} County",
                   "county":                contact["county"],
@@ -1276,6 +1331,9 @@ jobs:
                   for org in ORG_TYPES:
                       if len(added) >= state_cap:
                           break
+                      if not persona_allowed(state_code, county, org["type"]):
+                          print(f"  ⏭️  Skipping {org['type']} in {county} (omitted — active sales cycle)")
+                          continue
                       print(f"  Searching {org['type']}...")
                       org_found_names  = []
                       org_new_this_run = 0

@@ -129,6 +129,26 @@ jobs:
                   "Nantucket",    # ~14K
               ],
           }
+          # ── Big-county tier (2026-05-27 fix) ───────────────────────
+          # Counties with deep LE org structures (NYPD borough commands,
+          # county-wide PDs, DA bureaus). Saturating these takes far more
+          # than the default MAX_EMPTY_PASSES=2 / MAX_BATCHES_PER_ORG=4
+          # would allow — a 1.4M-pop county like Nassau realistically has
+          # hundreds of DAs/PDs/detectives across precincts, defender
+          # offices, and the Sheriff's Office. Without this tier the
+          # 25-lead daily cap collides with the dupe-based exhaustion
+          # logic and retires these counties after ~25-40 leads total.
+          BIG_COUNTIES = {
+              "NY": {
+                  "New York", "Kings", "Queens", "Bronx", "Richmond",
+                  "Nassau", "Suffolk", "Westchester", "Erie", "Monroe",
+              },
+              "MA": {
+                  "Middlesex", "Worcester", "Essex", "Suffolk", "Norfolk",
+              },
+          }
+          def is_big_county(state_code, county):
+              return county in BIG_COUNTIES.get(state_code, set())
           # ── Active personas (locked to the 3 we established) ───────
           ACTIVE_PERSONAS = [
               "Public Defender",
@@ -352,10 +372,12 @@ jobs:
                   "NY": {"county": STATE_COUNTIES["NY"][0], "exhausted": [], "county_leads": {}},
                   "MA": {"county": STATE_COUNTIES["MA"][0], "exhausted": [], "county_leads": {}},
               }
-          def next_county_for_state(state_code, state):
+          def next_county_for_state(state_code, state, skip=None):
+              """Return the first non-exhausted county, optionally skipping a given county."""
               exhausted_self = set(state[state_code].get("exhausted", []))
+              skip_set = {skip} if skip else set()
               for county in STATE_COUNTIES[state_code]:
-                  if county not in exhausted_self:
+                  if county not in exhausted_self and county not in skip_set:
                       return county
               return None
           def get_upcoming_counties(state_code, state, n=2):
@@ -547,6 +569,46 @@ jobs:
                       state[sc] = {"county": STATE_COUNTIES[sc][0], "exhausted": [], "county_leads": {}}
                   if "county_leads" not in state[sc]:
                       state[sc]["county_leads"] = {}
+          # ── One-shot migration: un-exhaust big counties (2026-05-27) ──
+          # Counties like Nassau, Essex were getting marked exhausted after
+          # ~25-40 leads because of the MAX_EMPTY_PASSES=2 + 25/day cap
+          # collision, and NYC boroughs likely hit the zero-lead exhaust
+          # path during the Monday 5/25 web_search rate-limit cascade.
+          # This migration removes big counties from `exhausted` and zeros
+          # their `empty_passes` exactly once so the next run re-prospects
+          # them under the new (more lenient) exhaustion thresholds below.
+          MIGRATION_FLAG = "_migration_2026_05_27_big_county_reset"
+          if not state.get(MIGRATION_FLAG):
+              print("🔧 Running one-shot migration: un-exhausting big counties")
+              for sc in ["NY", "MA"]:
+                  exhausted = state[sc].get("exhausted", [])
+                  freed = [c for c in exhausted if is_big_county(sc, c)]
+                  if freed:
+                      state[sc]["exhausted"] = [c for c in exhausted if not is_big_county(sc, c)]
+                      print(f"  ✅ {sc}: freed from exhausted → {freed}")
+                  empty_passes = state[sc].get("empty_passes", {})
+                  reset_ep = [c for c in empty_passes if is_big_county(sc, c)]
+                  for c in reset_ep:
+                      empty_passes.pop(c, None)
+                  if reset_ep:
+                      print(f"  ✅ {sc}: zeroed empty_passes → {reset_ep}")
+                  # Also clear zero_lead_attempts (new tracking field) just in case.
+                  zla = state[sc].get("zero_lead_attempts", {})
+                  for c in list(zla.keys()):
+                      if is_big_county(sc, c):
+                          zla.pop(c, None)
+                  # Force the active county to a big county at the front if the
+                  # current active isn't already a big county. This guarantees
+                  # the next run lands on the biggest unfinished county first.
+                  current = state[sc].get("county")
+                  if current is None or not is_big_county(sc, current):
+                      for c in STATE_COUNTIES[sc]:
+                          if is_big_county(sc, c) and c not in state[sc].get("exhausted", []):
+                              print(f"  ✅ {sc}: active county pinned to big county → {c} (was {current})")
+                              state[sc]["county"] = c
+                              break
+              state[MIGRATION_FLAG] = True
+              print("🔧 Migration complete")
           # ── County scoring pre-pass ───────────────────────────────
           # Resilient to STATE_COUNTIES growing over time: future expansions
           # (e.g. adding a new state, more counties) patch the cache in-place
@@ -635,13 +697,25 @@ jobs:
           else:
               print(f"✅ Using cached county scores ({len(county_scores)} counties — all current)")
           # Re-sort each state's county list by score (preserving exhausted + current at front)
+          # 2026-05-27: BIG_COUNTIES are pinned to the front of the not-started
+          # list regardless of signal score — without this, mid-size counties
+          # with high LE-signal scores (Onondaga, Suffolk-MA) outrank the
+          # 1M+-pop counties (Nassau, NYC boroughs, Middlesex) and the agent
+          # never reaches them. Within each tier (big vs non-big) we still
+          # sort by score so the most-promising counties come first.
           for state_code in ["NY", "MA"]:
               not_started  = [c for c in STATE_COUNTIES[state_code]
                                if c not in state[state_code].get("exhausted", [])
                                and c != state[state_code].get("county")]
               already_done = state[state_code].get("exhausted", [])
               current      = state[state_code].get("county")
-              sorted_next  = sort_counties_by_score(not_started, state_code, county_scores)
+              big_ns       = sort_counties_by_score(
+                  [c for c in not_started if is_big_county(state_code, c)],
+                  state_code, county_scores)
+              other_ns     = sort_counties_by_score(
+                  [c for c in not_started if not is_big_county(state_code, c)],
+                  state_code, county_scores)
+              sorted_next  = big_ns + other_ns
               STATE_COUNTIES[state_code] = already_done + ([current] if current else []) + sorted_next
               print(f"  {state_code} county order: {STATE_COUNTIES[state_code]}")
           # ── Find leads (state-aware prompt) ───────────────────────
@@ -1134,12 +1208,20 @@ jobs:
                       print(f"  ⚠️ {state_code} — all counties exhausted, alert sent")
                       break
                   print(f"\n{'='*50}")
-                  print(f"🗽 {state_code} → 📍 {county} County ({len(added)}/{state_cap} leads so far)")
+                  is_big = is_big_county(state_code, county)
+                  size_tag = "BIG" if is_big else "std"
+                  print(f"🗽 {state_code} → 📍 {county} County [{size_tag}] ({len(added)}/{state_cap} leads so far)")
                   county_new      = 0
                   county_skipped  = 0
                   found_any_leads = False
-                  MAX_BATCHES_PER_ORG = 4
-                  MAX_EMPTY_PASSES    = 2
+                  # 2026-05-27: big counties (1M+ pop, deep LE org structures)
+                  # need a much higher exhaustion ceiling. With a 25/day cap
+                  # and 3 personas, a big county only really starts saturating
+                  # after ~5-8 runs (~125-200 leads). Old defaults (4 batches,
+                  # 2 empty passes) retired Nassau/Essex after ~25-40 leads.
+                  MAX_BATCHES_PER_ORG  = 8 if is_big else 4
+                  MAX_EMPTY_PASSES     = 6 if is_big else 2
+                  ZERO_LEAD_MAX_RUNS   = 3 if is_big else 2
                   for org in ORG_TYPES:
                       if len(added) >= state_cap:
                           break
@@ -1149,6 +1231,10 @@ jobs:
                       for batch_num in range(1, MAX_BATCHES_PER_ORG + 1):
                           if len(added) >= state_cap:
                               break
+                          # Defensive init so a raised claude() call doesn't leave
+                          # `leads` / `batch_new` undefined when we check them below.
+                          leads = []
+                          batch_new = 0
                           try:
                               leads = find_leads(
                                   county, state_code, org["type"], org["titles"],
@@ -1157,7 +1243,6 @@ jobs:
                               )
                               if leads:
                                   found_any_leads = True
-                              batch_new = 0
                               for lead in leads:
                                   if len(added) >= state_cap:
                                       break
@@ -1216,6 +1301,21 @@ jobs:
                           print(f"    Batch {batch_num}: {batch_new} new. Looping for more...")
                           time.sleep(2)
                   print(f"  County pass: {county_new} new, {county_skipped} dupes, found_any={found_any_leads}")
+                  # Reset the zero-lead counter as soon as we get a non-empty
+                  # pass — only consecutive zero-lead runs should exhaust.
+                  if found_any_leads:
+                      zla = state[state_code].setdefault("zero_lead_attempts", {})
+                      if county in zla:
+                          print(f"  🔄 Resetting zero_lead_attempts[{county}] (was {zla[county]})")
+                          zla.pop(county, None)
+                  # Reset empty_passes when we actually added new contacts —
+                  # only CONSECUTIVE all-dupe runs should count toward
+                  # exhaustion, not interleaved-with-success runs.
+                  if county_new > 0:
+                      ep = state[state_code].setdefault("empty_passes", {})
+                      if county in ep:
+                          print(f"  🔄 Resetting empty_passes[{county}] (was {ep[county]})")
+                          ep.pop(county, None)
                   if found_any_leads and county_new == 0 and county_skipped > 0:
                       state[state_code]["empty_passes"] = state[state_code].get("empty_passes", {})
                       state[state_code]["empty_passes"][county] = state[state_code]["empty_passes"].get(county, 0) + 1
@@ -1234,18 +1334,42 @@ jobs:
                       continue
                   if not found_any_leads:
                       # No leads surfaced at all for this county across all org types.
-                      # Mark exhausted and advance so we still hit the daily cap (was: break, which left MA short).
-                      print(f"  ⚠️ No leads found in {county} across any persona — marking exhausted and advancing")
-                      if county not in state[state_code]["exhausted"]:
-                          state[state_code]["exhausted"].append(county)
-                      next_c = next_county_for_state(state_code, state)
-                      state[state_code]["county"] = next_c or None
-                      if next_c:
-                          print(f"  ➡️ Moving to: {next_c}")
-                          continue
+                      # 2026-05-27: a single zero-lead run no longer exhausts
+                      # the county — transient web_search rate limits (like
+                      # the Mon 5/25 cascade) would otherwise wipe out big
+                      # counties permanently. We now require ZERO_LEAD_MAX_RUNS
+                      # consecutive zero-lead runs before exhausting.
+                      state[state_code].setdefault("zero_lead_attempts", {})
+                      zla = state[state_code]["zero_lead_attempts"]
+                      zla[county] = zla.get(county, 0) + 1
+                      zl_count = zla[county]
+                      print(f"  ⚠️ No leads found in {county} (zero-lead run #{zl_count}/{ZERO_LEAD_MAX_RUNS})")
+                      if zl_count >= ZERO_LEAD_MAX_RUNS:
+                          print(f"  ⚠️ {county} marked exhausted after {zl_count} zero-lead runs")
+                          if county not in state[state_code]["exhausted"]:
+                              state[state_code]["exhausted"].append(county)
+                          next_c = next_county_for_state(state_code, state)
+                          state[state_code]["county"] = next_c or None
+                          if next_c:
+                              print(f"  ➡️ Moving to: {next_c}")
+                              continue
+                          else:
+                              print(f"  ⚠️ No more counties for {state_code} — stopping at {len(added)}/{state_cap}")
+                              break
                       else:
-                          print(f"  ⚠️ No more counties for {state_code} — stopping at {len(added)}/{state_cap}")
-                          break
+                          # Don't exhaust yet — advance to next county temporarily
+                          # so today's daily cap still gets filled, but leave
+                          # this county un-exhausted so it'll be retried.
+                          # Pass `skip=county` so we actually move on instead
+                          # of returning the same not-yet-exhausted county.
+                          next_c = next_county_for_state(state_code, state, skip=county)
+                          if next_c:
+                              state[state_code]["county"] = next_c
+                              print(f"  ➡️ Skipping (not exhausting) — moving to: {next_c}")
+                              continue
+                          else:
+                              print(f"  ⚠️ No alternative county available — stopping at {len(added)}/{state_cap}")
+                              break
                   if len(added) < state_cap:
                       print(f"  🔄 {county} still has leads — looping for more ({len(added)}/{state_cap})")
               results[state_code] = {

@@ -621,18 +621,39 @@ jobs:
               for county in STATE_COUNTIES[state_code]:
                   if county_key(state_code, county) not in county_scores:
                       missing.append((state_code, county))
-          # Tunables for the scoring pre-pass (2026-05-26 — resilience pass)
-          SCORE_SLEEP_SEC         = 8     # was 2; 8s is conservative enough to avoid web_search throttling
-          SCORE_FAIL_THRESHOLD    = 0.30  # if >30% of newly-scored counties are 0, refuse to persist + skip Slack post
+          # Tunables for the scoring pre-pass
+          # 2026-05-27 (after a second straight day of 43/44 cascade failures):
+          #  - bumped SCORE_SLEEP_SEC 8s → 15s — web_search quota is finer
+          #    than expected; 8s/call (≈7.5/min) was still tripping it
+          #  - added consecutive-failure tracking + long pause so we give
+          #    the rate-limit window time to actually reset
+          #  - hard-stop after N persistent failures so we don't burn
+          #    50 wasted Claude calls on a degraded API
+          SCORE_SLEEP_SEC          = 15    # was 8; further widened after 2026-05-27 cascade
+          SCORE_FAIL_THRESHOLD     = 0.30  # if >30% of newly-scored counties are 0, refuse to persist + skip Slack post
+          SCORE_COOLDOWN_AFTER     = 3     # after N consecutive 0-scores, take a long pause
+          SCORE_COOLDOWN_SEC       = 180   # 3-min cooldown to let web_search quota reset
+          SCORE_GIVEUP_AFTER       = 6     # if N consecutive 0-scores even after cooldown, abort the run
           if missing:
               label = "first run — scoring all counties" if was_empty else f"incremental — scoring {len(missing)} new/missing counties"
               print(f"🌱 Scoring counties via Claude API ({label}) — sleep {SCORE_SLEEP_SEC}s between calls")
               newly_scored = {}  # only counties we actually attempted this run (for the failure-rate guard)
+              consecutive_fails = 0
+              gave_up           = False
               for state_code, county in missing:
+                  if gave_up:
+                      # Don't even attempt remaining counties — leave them
+                      # unscored so they're tried fresh on the next run.
+                      print(f"  ⏭️  Skipping {state_code}/{county} (scoring giveup engaged)")
+                      continue
                   try:
                       result = score_county(county, state_code)
                       county_scores[county_key(state_code, county)] = result
                       newly_scored[county_key(state_code, county)]  = result
+                      if result.get("score", 0) > 0:
+                          consecutive_fails = 0
+                      else:
+                          consecutive_fails += 1
                       time.sleep(SCORE_SLEEP_SEC)
                   except Exception as e:
                       print(f"  ⚠️ Scoring error for {state_code}/{county}: {e}")
@@ -641,31 +662,61 @@ jobs:
                           "evidence": f"exception: {e}", "snippet": "",
                           "_scoring_exception": True,
                       }
-                      county_scores[county_key(state_code, county)] = bad
-                      newly_scored[county_key(state_code, county)]  = bad
+                      newly_scored[county_key(state_code, county)] = bad
+                      # IMPORTANT: do NOT write the bad entry into county_scores
+                      # itself — leaving the key absent means next run will
+                      # treat it as "missing" and retry, instead of caching a
+                      # poison-zero that masks the legitimate retry path.
+                      consecutive_fails += 1
                       # Even on failure, throttle so we don't hammer a degraded API
                       time.sleep(SCORE_SLEEP_SEC)
+                  # Adaptive cooldown: if we're seeing a rate-limit cascade,
+                  # take a long break and let the web_search quota reset before
+                  # giving up entirely. This was added after the 5/27 cascade
+                  # where 43/44 counties scored 0 because the run never paused
+                  # long enough for the quota window to roll over.
+                  if consecutive_fails == SCORE_COOLDOWN_AFTER:
+                      print(f"  ⏸  {consecutive_fails} consecutive failures — cooling down {SCORE_COOLDOWN_SEC}s to let rate-limit window reset")
+                      time.sleep(SCORE_COOLDOWN_SEC)
+                  elif consecutive_fails >= SCORE_GIVEUP_AFTER:
+                      print(f"  🛑 {consecutive_fails} consecutive failures even after cooldown — aborting scoring run, will resume tomorrow")
+                      gave_up = True
               # ── Failure-rate guard: don't poison the cache or Slack ───────
               zero_count   = sum(1 for s in newly_scored.values() if s.get("score", 0) == 0)
               fail_ratio   = zero_count / max(len(newly_scored), 1)
               mass_failure = fail_ratio > SCORE_FAIL_THRESHOLD
+              # 2026-05-27: even when mass_failure fires, persist any partial
+              # successes so we make incremental progress across days. The
+              # previous behavior threw the baby out with the bathwater — a
+              # 43/44-failure run dropped the 1 successful score, forcing the
+              # next run to re-attempt all 44 from scratch and re-trip the
+              # same cascade indefinitely.
+              success_count = sum(1 for s in newly_scored.values() if s.get("score", 0) > 0)
               if mass_failure:
                   print(
                       f"🛑 Scoring run looks broken: {zero_count}/{len(newly_scored)} counties came back 0 "
                       f"({fail_ratio:.0%} > {SCORE_FAIL_THRESHOLD:.0%} threshold). "
-                      f"Refusing to save bad scores and skipping the Slack scoreboard post."
+                      f"Skipping the Slack scoreboard post."
                   )
                   # Drop the bad newly-scored zeros from county_scores so we re-try next run.
+                  # (Scoring-exception entries were already kept out of county_scores
+                  # above; this catches the parse-error 0s too.)
                   for k, v in list(newly_scored.items()):
                       if v.get("score", 0) == 0:
                           county_scores.pop(k, None)
+                  # PERSIST PARTIAL PROGRESS — save whatever successes survived
+                  # so we don't have to re-score them next run.
+                  if success_count > 0:
+                      print(f"  💾 Persisting {success_count} successful score(s) anyway so progress isn't lost")
+                      save_county_scores(county_scores)
                   # Loud alert so we don't miss it
                   try:
                       alert = (
                           f"<@{SLACK_USER}> ⚠️ *County Signal scoring run aborted* — "
                           f"{zero_count}/{len(newly_scored)} counties scored 0 "
-                          f"(likely web_search rate-limit). Cache NOT saved; "
-                          f"will retry on next run. Check workflow logs."
+                          f"(likely web_search rate-limit). "
+                          f"{success_count} successes persisted; "
+                          f"will retry remaining on next run. Check workflow logs."
                       )
                       requests.post("https://slack.com/api/chat.postMessage",
                           headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})

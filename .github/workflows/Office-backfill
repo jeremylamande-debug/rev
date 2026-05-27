@@ -1,0 +1,207 @@
+name: OB Office Backfill — Populate `office` property on all JL OB contacts
+# One-shot backfill to set the new `office` contact property on every contact
+# created by the OB agent (Mike's NY/MA leads + the CA-era James/Will/Dillon
+# leads). All of them carry `lead_source_details = "JL OB"`, so a single
+# search filter covers the whole population. We copy `company` → `office`
+# only when `office` is empty so reruns are idempotent.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (preview changes only, no writes to HubSpot)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+jobs:
+  office-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Backfill office property on all JL OB contacts
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DRY_RUN:         ${{ github.event.inputs.dry_run }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, json, os, time
+
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() == "true"
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
+          SLACK_USER       = "U08JJMM2QSW"
+
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          def hs_post(path, payload):
+              r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r
+
+          # ── Step 1: ensure the `office` property exists ───────────────
+          # Idempotent — 409 means it already exists (either we created it
+          # on a prior run, or the user created it manually in the UI).
+          print("🔧 Ensuring `office` property exists on Contact...")
+          prop_resp = requests.post(
+              "https://api.hubapi.com/crm/v3/properties/contacts",
+              headers=HS_HEADERS,
+              json={
+                  "name":        "office",
+                  "label":       "Office",
+                  "description": "Specific office / organization the contact belongs to (e.g. 'Bronx County District Attorney's Office', 'Legal Aid Society NYC', 'NYPD Manhattan South Detective Bureau'). Populated by the OB agent.",
+                  "type":        "string",
+                  "fieldType":   "text",
+                  "groupName":   "contactinformation",
+              }
+          )
+          if prop_resp.status_code in (200, 201):
+              print(f"  ✅ Created `office` property ({prop_resp.status_code})")
+          elif prop_resp.status_code == 409:
+              print(f"  ✅ `office` property already exists")
+          else:
+              print(f"  ⚠️ Unexpected status {prop_resp.status_code}: {prop_resp.text[:200]}")
+
+          # ── Step 2: fetch all JL OB contacts ──────────────────────────
+          # `lead_source_details = "JL OB"` covers both the current NY/MA
+          # population (Mike Merritts) and the prior CA population (James
+          # Gregory, Will Weis, Dillon DeWitt) — the daily_outbound_agent
+          # has stamped this value on every contact it ever created.
+          def fetch_all_ob_contacts():
+              contacts = []
+              after    = None
+              page     = 0
+              while True:
+                  page += 1
+                  payload = {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"}
+                      ]}],
+                      "properties": [
+                          "firstname", "lastname", "email",
+                          "company", "office",
+                          "county", "state",
+                          "hubspot_owner_id",
+                      ],
+                      "limit": 100,
+                  }
+                  if after:
+                      payload["after"] = after
+                  resp_obj = hs_post("/crm/v3/objects/contacts/search", payload)
+                  resp     = resp_obj.json()
+                  if resp_obj.status_code >= 400:
+                      print(f"  ❌ Search failed status={resp_obj.status_code}: {resp_obj.text[:300]}")
+                      break
+                  results = resp.get("results", [])
+                  contacts.extend(results)
+                  print(f"  Page {page}: +{len(results)} (total {len(contacts)})")
+                  paging = resp.get("paging", {})
+                  after  = paging.get("next", {}).get("after")
+                  if not after:
+                      break
+                  time.sleep(0.3)
+              return contacts
+
+          mode = "🧪 DRY RUN" if DRY_RUN else "🔧 LIVE RUN"
+          print(f"\n{mode} — fetching all JL OB contacts...")
+          contacts = fetch_all_ob_contacts()
+          print(f"\n📋 Found {len(contacts)} JL OB contacts. Scanning for office backfills...\n")
+
+          # ── Step 3: classify each contact ─────────────────────────────
+          to_update    = []  # (id, company → office)
+          already_set  = 0   # office already populated, skip
+          no_company   = 0   # company is empty — nothing to copy from
+          sample_diffs = []  # first 10 for the Slack preview
+
+          for c in contacts:
+              cid     = c["id"]
+              props   = c.get("properties", {}) or {}
+              office  = (props.get("office")  or "").strip()
+              company = (props.get("company") or "").strip()
+              if office:
+                  already_set += 1
+                  continue
+              if not company:
+                  no_company += 1
+                  continue
+              to_update.append((cid, company))
+              if len(sample_diffs) < 10:
+                  fn = (props.get("firstname") or "").strip()
+                  ln = (props.get("lastname")  or "").strip()
+                  county = (props.get("county") or "").strip()
+                  sample_diffs.append(f"{fn} {ln} ({county}) → office = '{company}'")
+
+          print(f"📊 Scan complete:")
+          print(f"   • Need backfill:           {len(to_update)}")
+          print(f"   • Already have office set: {already_set}")
+          print(f"   • No company to copy from: {no_company}")
+          print(f"   • Total scanned:           {len(contacts)}\n")
+
+          if sample_diffs:
+              print("🔎 Sample diffs (first 10):")
+              for s in sample_diffs:
+                  print(f"   • {s}")
+              print()
+
+          # ── Step 4: batch-update HubSpot (100/req) ───────────────────
+          updated   = 0
+          batch_err = 0
+          if to_update and not DRY_RUN:
+              print(f"🚀 Writing {len(to_update)} updates to HubSpot...")
+              for i in range(0, len(to_update), 100):
+                  batch  = to_update[i:i+100]
+                  inputs = [{"id": cid, "properties": {"office": company}}
+                            for cid, company in batch]
+                  r = requests.post(
+                      "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                      headers=HS_HEADERS,
+                      json={"inputs": inputs}
+                  )
+                  if r.status_code in (200, 207):
+                      updated += len(batch)
+                      print(f"  ✅ Batch {i//100 + 1}: updated {len(batch)} (running total {updated})")
+                  else:
+                      batch_err += 1
+                      print(f"  ❌ Batch {i//100 + 1} failed status={r.status_code}: {r.text[:300]}")
+                  time.sleep(0.5)
+          elif to_update and DRY_RUN:
+              print(f"🧪 DRY RUN — would have updated {len(to_update)} contacts. No writes performed.")
+          else:
+              print("✅ Nothing to backfill — all OB contacts already have `office` set.")
+
+          # ── Step 5: Slack summary ─────────────────────────────────────
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*🏷️ OB Office Backfill — {mode}*\n"
+          msg += f"_Filter: `lead_source_details = JL OB` (covers Mike NY/MA + CA James/Will/Dillon)_\n\n"
+          msg += f"• Total OB contacts scanned: *{len(contacts)}*\n"
+          msg += f"• Backfill candidates: *{len(to_update)}*\n"
+          msg += f"• Already had office: *{already_set}*\n"
+          msg += f"• No `company` to copy: *{no_company}*\n"
+          if not DRY_RUN:
+              msg += f"• Successfully updated: *{updated}*\n"
+              if batch_err:
+                  msg += f"• Batch errors: *{batch_err}* (see workflow logs)\n"
+          else:
+              msg += f"• _Re-run with `dry_run = false` to apply._\n"
+          if sample_diffs:
+              msg += "\n*Sample diffs:*\n"
+              for s in sample_diffs:
+                  msg += f"• `{s}`\n"
+
+          try:
+              r = requests.post(
+                  "https://slack.com/api/chat.postMessage",
+                  headers=SLACK_HEADERS,
+                  json={"channel": DAILY_OB_CHANNEL, "text": msg}
+              )
+              if r.json().get("ok"):
+                  print("\n✅ Slack summary posted")
+              else:
+                  print(f"\n⚠️ Slack post failed: {r.json()}")
+          except Exception as e:
+              print(f"\n⚠️ Slack post error: {e}")
+          EOF

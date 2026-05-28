@@ -343,14 +343,21 @@ jobs:
                   "fieldType":   "text",
               },
               {
-                  # 2026-05-27 — which of the 3 ACTIVE_PERSONAS this contact
+                  # 2026-05-27 — which of the ACTIVE_PERSONAS this contact
                   # represents. Mirrors `org_type` from find_leads so it can
                   # be filtered/segmented in HubSpot views without
-                  # string-matching the company name. Enum to enforce the
-                  # canonical 3 values across NY/MA and the CA-era contacts.
-                  "name":        "persona",
-                  "label":       "Persona",
-                  "description": "Which of the 3 OB agent personas this contact belongs to: Public Defender, District Attorney, or Police/Sheriff Investigators. Set automatically by the OB agent (from org_type at create time).",
+                  # string-matching the company name.
+                  #
+                  # 2026-05-29: renamed from `persona`/`Persona` to
+                  # `ob_persona`/`OB Persona` to dodge a HubSpot label
+                  # collision — another property in this portal already
+                  # owns the label "Persona", which made every contact
+                  # create fail with PROPERTY_DOESNT_EXIST. Distinct name
+                  # + distinct label sidesteps both the 409-on-name and
+                  # 400-on-label-uniqueness paths.
+                  "name":        "ob_persona",
+                  "label":       "OB Persona",
+                  "description": "Which OB-agent persona this contact belongs to: Public Defender, District Attorney, or Police/Sheriff Investigators (Legal) — or HR/ER Leader, Workplace Investigator, Compliance/Ethics (Core). Set automatically at create time from the agent's org_type.",
                   "type":        "enumeration",
                   "fieldType":   "select",
                   "options": [
@@ -1123,9 +1130,10 @@ jobs:
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
               state_code  = contact.get("state", "")
               state_name  = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
-              # `persona` mirrors the org_type from find_leads — one of the 3
+              # `ob_persona` mirrors the org_type from find_leads — one of the
               # ACTIVE_PERSONAS. Lets the HubSpot view be filtered by persona
-              # without string-matching the company name.
+              # without string-matching the company name. Renamed from
+              # `persona` on 2026-05-29 to dodge a HubSpot label collision.
               persona_val = contact.get("org_type", "") if contact.get("org_type", "") in ACTIVE_PERSONAS else ""
               props = {
                   "firstname":             contact["first_name"],
@@ -1133,7 +1141,7 @@ jobs:
                   "jobtitle":              contact["title"],
                   "company":               contact["organization"],
                   "office":                contact.get("organization", ""),
-                  "persona":               persona_val,
+                  "ob_persona":            persona_val,
                   "state":                 state_name,
                   "city":                  f"{contact['county']} County",
                   "county":                contact["county"],

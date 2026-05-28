@@ -1,5 +1,5 @@
-name: OB Persona Backfill — Populate `persona` property on all JL OB contacts
-# One-shot backfill to set a new `persona` enum property on every contact
+name: OB Persona Backfill — Populate `ob_persona` property on all JL OB contacts
+# One-shot backfill to set a new `ob_persona` enum property on every contact
 # created by the OB agent. Same population as the Office backfill (matches
 # HubSpot view 64051171 — leadsource = Claude AND lead_source_details = JL OB).
 # Classifies each contact into one of the 3 ACTIVE_PERSONAS:
@@ -56,12 +56,15 @@ jobs:
               r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
               return r
 
-          # ── Step 1: ensure the `persona` enum property exists ──────────
+          # ── Step 1: ensure the `ob_persona` enum property exists ──────
+          # 2026-05-29: renamed from `persona`/`Persona` → `ob_persona`/
+          # `OB Persona` because another property in this portal already
+          # owns the label "Persona", which blocked all contact updates.
           # Idempotent — 409 means it already exists.
-          print("🔧 Ensuring `persona` property exists on Contact...")
+          print("🔧 Ensuring `ob_persona` property exists on Contact...")
           prop_payload = {
-              "name":        "persona",
-              "label":       "Persona",
+              "name":        "ob_persona",
+              "label":       "OB Persona",
               "description": "Which of the 3 OB agent personas this contact belongs to. Inferred from their office/company and job title.",
               "type":        "enumeration",
               "fieldType":   "select",
@@ -77,9 +80,9 @@ jobs:
               json=prop_payload,
           )
           if prop_resp.status_code in (200, 201):
-              print(f"  ✅ Created `persona` property ({prop_resp.status_code})")
+              print(f"  ✅ Created `ob_persona` property ({prop_resp.status_code})")
           elif prop_resp.status_code == 409:
-              print(f"  ✅ `persona` property already exists")
+              print(f"  ✅ `ob_persona` property already exists")
           else:
               print(f"  ⚠️ Unexpected status {prop_resp.status_code}: {prop_resp.text[:200]}")
 
@@ -166,7 +169,7 @@ jobs:
                       "properties": [
                           "firstname", "lastname", "email",
                           "company", "office", "jobtitle",
-                          "persona",
+                          "ob_persona",
                           "county", "state",
                       ],
                       "limit": 100,
@@ -205,7 +208,7 @@ jobs:
           for c in contacts:
               cid     = c["id"]
               props   = c.get("properties", {}) or {}
-              persona = (props.get("persona")  or "").strip()
+              persona = (props.get("ob_persona")  or "").strip()
               company = (props.get("company")  or "").strip()
               office  = (props.get("office")   or "").strip()
               title   = (props.get("jobtitle") or "").strip()
@@ -238,7 +241,7 @@ jobs:
           print(f"     • District Attorney:           {per_persona['District Attorney']}")
           print(f"     • Public Defender:             {per_persona['Public Defender']}")
           print(f"     • Police/Sheriff Investigators:{per_persona['Police/Sheriff Investigators']}")
-          print(f"   • Already had persona:  {already_set}")
+          print(f"   • Already had ob_persona: {already_set}")
           print(f"   • Unmatched (skipped):  {unmatched}")
           print(f"   • Total scanned:        {len(contacts)}\n")
 
@@ -262,7 +265,7 @@ jobs:
               print(f"🚀 Writing {len(to_update)} persona updates to HubSpot...")
               for i in range(0, len(to_update), 100):
                   batch  = to_update[i:i+100]
-                  inputs = [{"id": cid, "properties": {"persona": p}}
+                  inputs = [{"id": cid, "properties": {"ob_persona": p}}
                             for cid, p in batch]
                   r = requests.post(
                       "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
@@ -279,7 +282,7 @@ jobs:
           elif to_update and DRY_RUN:
               print(f"🧪 DRY RUN — would have updated {len(to_update)} contacts. No writes performed.")
           else:
-              print("✅ Nothing to backfill — every OB contact already has `persona` set.")
+              print("✅ Nothing to backfill — every OB contact already has `ob_persona` set.")
 
           # ── Step 6: Slack summary ─────────────────────────────────────
           msg  = f"<@{SLACK_USER}>\n"

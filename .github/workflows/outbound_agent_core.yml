@@ -1,0 +1,1153 @@
+name: Daily Outbound Agent — Core (HR/ER/Compliance & Workplace Investigations)
+# ═══════════════════════════════════════════════════════════════════════════
+# OB Agent — Core
+# ─────────────────────────────────────────────────────────────────────────────
+# Sister workflow to outbound_agent.yml (the Legal/NY+MA agent). Same daily
+# pattern — scrape leads, push to HubSpot, post Slack summary — but targeting
+# the Core ICP instead of Law Enforcement:
+#
+#   Owner:           Isabella Simpatico (isabella.simpatico@rev.com)
+#   Lead source:     Claude / JL OB (same value as Legal; differentiated by owner)
+#   Industry whitelist: every HubSpot Industry Group EXCEPT Legal, Government,
+#                       Law Enforcement (the Legal agent owns those)
+#   Seed companies:  21 Fortune-class orgs with mature HR/ER/Investigations
+#                    functions (Walmart, Amazon, UHG, FedEx, UPS, Home Depot,
+#                    Target, Marriott, Kroger, Accenture, GE, GE Aerospace,
+#                    Bloomberg, Disney, Kaiser, Walt Disney Co, Paramount,
+#                    Apple, News Corp, Fox, Meta).
+#   Personas (3):    HR/ER Leaders · Workplace Investigators · Compliance/Ethics
+#   Daily volume:    50 leads/day total, MAX 20 leads/company
+#   Rotation:        1 company at a time as "active". When a company is done
+#                    (saturated via dupes or yield), advance to next.
+#   ICP expansion:   When the seed list is exhausted, ask Claude for 5 more
+#                    similar-shape companies within the industry whitelist.
+#
+# Persistence:
+#   State (which company is active, which are exhausted, per-company counts)
+#   lives in a HubSpot note marked with OUTBOUND_AGENT_STATE_CORE_V1, mirroring
+#   the Legal agent's state-in-HS-notes pattern.
+#
+# TODOs before first push (search for `TODO_CORE` markers):
+#   - ISABELLA_MEETING_LINK — confirm Isabella's HubSpot scheduler URL
+#   - SEQUENCE_ID           — create a 4-email sequence in HubSpot and paste ID
+#   - CONSOLIDATED_LIST_URL — create the HubSpot list (lead_source_details=JL
+#                             OB AND owner=Isabella) and paste URL
+# ═══════════════════════════════════════════════════════════════════════════
+on:
+  schedule:
+    - cron: '0 6 * * 1-5'  # 2:00 AM ET, Mon-Fri (matches Legal agent timing)
+  workflow_dispatch:
+jobs:
+  run-outbound-agent-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Run Outbound Agent (Core)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HUBSPOT_API_KEY:   ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
+          GIST_TOKEN:        ${{ secrets.GIST_TOKEN }}
+          GIST_ID_CORE:      ${{ secrets.GIST_ID_CORE }}
+        run: |
+          pip install requests pytz matplotlib --quiet
+          python3 - <<'EOF'
+          import requests, json, os, time, datetime, re, matplotlib
+          matplotlib.use('Agg')
+          import matplotlib.pyplot as plt
+          import matplotlib.patches as mpatches
+
+          ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
+          HUBSPOT_KEY   = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+          GIST_TOKEN    = os.environ.get("GIST_TOKEN", "")
+          GIST_ID       = os.environ.get("GIST_ID_CORE", "")
+          PORTAL_ID     = "21451281"
+
+          # ═════════════════════════════════════════════════════════════
+          # CONFIG — Core (Isabella Simpatico)
+          # ═════════════════════════════════════════════════════════════
+          # ── Daily lead cap ─────────────────────────────────────────
+          # Per-persona daily cap mirrors the Legal pattern (25/state/day).
+          # With 3 personas active, the agent fills up to 25 of each per run,
+          # for a max total of 75/day. Each persona's cap is independent —
+          # if HR/ER saturates at 25 but Workplace Investigators only finds
+          # 12, we still take all 12; we don't roll over the unused quota.
+          LEADS_PER_PERSONA_PER_DAY = 25
+          MAX_LEADS_PER_COMPANY     = 20  # cap one company's contribution per day
+          # ── Owner ─────────────────────────────────────────────────
+          OWNER_NAME  = "Isabella Simpatico"
+          OWNER_EMAIL = "isabella.simpatico@rev.com"
+          # TODO_CORE: confirm Isabella's HubSpot scheduler URL
+          MEETING_LINK = "https://meetings.hubspot.com/isabella-simpatico"
+          # TODO_CORE: create the HubSpot list (filter: lead_source_details=JL OB
+          # AND hubspot_owner_id=<Isabella>) and paste the list view URL here
+          CONSOLIDATED_LIST_URL = f"https://app.hubspot.com/contacts/{PORTAL_ID}/objects/0-1/views/REPLACE_ME_CORE_LIST_ID/list"
+          # ── Slack ─────────────────────────────────────────────────
+          # TODO_CORE: confirm Isabella's Slack member ID (right-click profile → View profile → ⋮ → Copy member ID)
+          SLACK_USER       = "REPLACE_ME_ISABELLA_SLACK_USER_ID"
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob (same as Legal — change if Core gets its own channel)
+          # ── HubSpot sequence ──────────────────────────────────────
+          # TODO_CORE: create a 4-email sequence in HubSpot for Isabella and paste the numeric sequence ID
+          SEQUENCE_ID = "REPLACE_ME_CORE_SEQUENCE_ID"
+          # ── HTTP headers ──────────────────────────────────────────
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+          ANTH_HEADERS  = {
+              "Content-Type":      "application/json",
+              "x-api-key":         ANTHROPIC_KEY,
+              "anthropic-version": "2023-06-01",
+          }
+          # ── Seed company list ────────────────────────────────────
+          # Initial 21 companies provided by JL. The agent rotates through these
+          # one at a time. When the entire seed list is exhausted, the agent
+          # expands via expand_icp() — see below.
+          SEED_COMPANIES = [
+              "Walmart",
+              "Amazon",
+              "UnitedHealth Group",
+              "FedEx",
+              "UPS",
+              "The Home Depot",
+              "Target",
+              "Marriott International",
+              "Kroger",
+              "Accenture",
+              "General Electric",
+              "GE Aerospace",
+              "Bloomberg",
+              "Disney",
+              "Kaiser Permanente",
+              "The Walt Disney Company",
+              "Paramount Global",
+              "Apple",
+              "News Corp",
+              "Fox Corporation",
+              "Meta",
+          ]
+          # ── Industry whitelist ───────────────────────────────────
+          # Used for the ICP-expansion step. We tell Claude to find similar
+          # companies whose HubSpot Industry Group falls into one of these.
+          # Mirrors the dropdown JL captured (minus the Legal-agent-owned
+          # verticals: Legal, Government, Law Enforcement).
+          INDUSTRY_WHITELIST = [
+              "Consulting",
+              "Content Creation",
+              "Education",
+              "Finance",
+              "Healthcare",
+              "Marketing",
+              "Media",
+              "Other",
+              "Research",
+              "Technology",
+          ]
+          # ── Active personas ──────────────────────────────────────
+          # 3 personas mirror the Legal agent's 3-persona structure so chart
+          # / email / report code shapes are reusable. The Core titles map to
+          # these buckets.
+          ACTIVE_PERSONAS = [
+              "HR/ER Leader",
+              "Workplace Investigator",
+              "Compliance/Ethics",
+          ]
+          # ── Per-persona title lists ──────────────────────────────
+          # The agent passes these as search hints to Claude when scraping
+          # each company. Add new titles here as you learn what works.
+          ORG_TYPES = [
+              {"type": "HR/ER Leader",
+               "titles": [
+                   "HR Business Partner", "HRBP",
+                   "Human Resources Manager", "Human Resources Director",
+                   "Senior HR Business Partner", "Sr. HR Business Partner",
+                   "Employee Relations Specialist",
+                   "Employee Relations Manager",
+                   "Senior Employee Relations Manager",
+                   "Director of Employee Relations",
+                   "Labor Relations Manager",
+                   "Director of Labor Relations",
+                   "VP People", "VP Human Resources", "Chief People Officer",
+               ]},
+              {"type": "Workplace Investigator",
+               "titles": [
+                   "Workplace Investigator",
+                   "Senior Workplace Investigator",
+                   "HR Investigator",
+                   "Employee Relations Investigator",
+                   "Corporate Investigator",
+                   "People Operations Investigator",
+                   "Ethics & Compliance Investigator",
+                   "Employee Conduct Investigator",
+                   "Workplace Conduct Manager",
+                   "Internal Investigations Manager",
+                   "Director of Workplace Investigations",
+                   "EEO Investigator",
+               ]},
+              {"type": "Compliance/Ethics",
+               # 2026-05-28: pivoted from policy/leadership roles (CCO, VP
+               # Compliance, Ethics Officer) toward INVESTIGATIONS-flavored
+               # compliance roles. The thesis: people who actually run
+               # fraud/SOX/FCPA/ethics investigations have the same
+               # transcription pain as Workplace Investigators (persona 2),
+               # just on the regulatory/financial side. Policy executives
+               # don't sit in the interviews so they're not the right ICP.
+               "titles": [
+                   "Compliance Investigator",
+                   "Corporate Compliance Investigator",
+                   "Senior Compliance Investigator",
+                   "Ethics Investigator",
+                   "Ethics & Compliance Investigator",
+                   "Compliance & Ethics Investigator",
+                   "Internal Investigator",
+                   "Fraud Investigator",
+                   "Anti-Corruption Investigator",
+                   "Financial Crimes Investigator",
+                   "SOX Investigator",
+                   "FCPA Investigator",
+                   "Investigations Manager — Compliance",
+                   "Director of Compliance Investigations",
+                   "Ethics & Investigations Lead",
+                   "Head of Internal Investigations",
+                   "Manager, Internal Investigations",
+               ]},
+          ]
+          # ── Persona angles ───────────────────────────────────────
+          # Pain / use-case / proof used in cold emails. Hand-written for
+          # Core; distinct from the Legal agent's PD/DA/Police angles.
+          PERSONA_ANGLES = {
+              "HR/ER Leader": {
+                  "pain":     "documenting employee relations meetings, performance conversations, and exit interviews by hand while juggling 30+ active cases",
+                  "use_case": "auto-transcription of ER intake calls, performance reviews, and HR meeting notes so the case file writes itself",
+                  "proof":    "HR teams using Rev cut documentation time per case by 50% and free up enough capacity to take on more headcount investigations without growing the team",
+              },
+              "Workplace Investigator": {
+                  "pain":     "hours of witness interviews, complainant statements, and respondent testimony that all have to be transcribed manually before the report can be written",
+                  "use_case": "investigator-grade transcription of interviews, recordings, and evidence with timestamped speaker labels — ready for the case file",
+                  "proof":    "workplace investigations teams using Rev close cases 40% faster and reduce the interview-to-report turnaround from weeks to days",
+              },
+              "Compliance/Ethics": {
+                  # 2026-05-28: angle pivoted from policy/audit-readiness to
+                  # active investigations work — fraud, SOX, FCPA, anti-bribery,
+                  # ethics violations. The pain mirrors persona 2 (Workplace
+                  # Investigator) but on the regulatory/financial side.
+                  "pain":     "fraud, SOX, FCPA, and ethics-violation investigations stacking up — every interview, regulator call, and whistleblower follow-up has to be transcribed cleanly and defensibly before the report can be filed, and the volume keeps growing",
+                  "use_case": "investigator-grade transcription of compliance interviews, regulator-facing testimony, fraud allegations, and whistleblower intake — timestamped, speaker-labeled, and audit-ready for chain-of-custody",
+                  "proof":    "internal-investigations teams using Rev cut case turnaround by 40-50% and produce documentation that holds up under regulator or external-counsel review — without paying for outside scribe services",
+              },
+          }
+          # Dept-map used in note bodies and the chart legend.
+          DEPT_MAP = {
+              "HR/ER Leader":           "HR / Employee Relations",
+              "Workplace Investigator": "Workplace Investigations",
+              "Compliance/Ethics":      "Compliance & Ethics Investigations",
+          }
+          print(f"🎯 Active personas ({len(ACTIVE_PERSONAS)}): {ACTIVE_PERSONAS}")
+          print(f"📍 Seed companies: {len(SEED_COMPANIES)}")
+          print(f"👤 Owner: {OWNER_NAME} ({OWNER_EMAIL})")
+          print(f"📊 Daily cap: {LEADS_PER_PERSONA_PER_DAY}/persona ({MAX_LEADS_PER_COMPANY}/company max) — up to {LEADS_PER_PERSONA_PER_DAY * len(ACTIVE_PERSONAS)} total/day")
+          # ═════════════════════════════════════════════════════════════
+          # HUBSPOT HELPERS
+          # ═════════════════════════════════════════════════════════════
+          def hs_get(path):
+              r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
+              return r.json()
+          def hs_post(path, payload):
+              r = requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+              return r.json()
+          # ── Resolve Isabella's HubSpot owner ID ──────────────────
+          owners = hs_get("/crm/v3/owners").get("results", [])
+          owner_id = None
+          for o in owners:
+              if o.get("email", "").lower() == OWNER_EMAIL.lower():
+                  owner_id = o["id"]
+                  break
+          if not owner_id:
+              for o in owners:
+                  full = f"{o.get('firstName','')} {o.get('lastName','')}".strip()
+                  if full.lower() == OWNER_NAME.lower():
+                      owner_id = o["id"]
+                      break
+          if not owner_id:
+              raise RuntimeError(f"❌ Could not find HubSpot owner for {OWNER_NAME} ({OWNER_EMAIL}). Verify owner exists.")
+          print(f"✅ Resolved owner: {OWNER_NAME} → ID {owner_id}")
+          LEADSOURCE_VALUE = "Claude"
+          LEAD_SOURCE_DETAILS = "JL OB"  # same value Legal uses — distinguished by owner
+          # ═════════════════════════════════════════════════════════════
+          # HUBSPOT PROPERTY SETUP
+          # Ensures `office` and `persona` properties exist on Contact.
+          # (Same props as Legal — already created by the Legal agent / Office
+          # Backfill workflow; 409 = exists, harmless.)
+          # ═════════════════════════════════════════════════════════════
+          CORE_PROPS = [
+              {
+                  "name":        "office",
+                  "label":       "Office",
+                  "description": "Specific office / org / division the contact belongs to (e.g. 'Meta People Operations — NYC', 'Disney HR Investigations'). Populated automatically.",
+                  "type":        "string",
+                  "fieldType":   "text",
+              },
+              {
+                  "name":        "persona",
+                  "label":       "Persona",
+                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR-ER Leader / Workplace Investigator / Compliance-Ethics.",
+                  "type":        "enumeration",
+                  "fieldType":   "select",
+                  "options": [
+                      # Legal personas first (existing in HS — must include for the option list to be valid)
+                      {"label": "Public Defender",              "value": "Public Defender",              "displayOrder": 0},
+                      {"label": "District Attorney",            "value": "District Attorney",            "displayOrder": 1},
+                      {"label": "Police/Sheriff Investigators", "value": "Police/Sheriff Investigators", "displayOrder": 2},
+                      # Core personas added by this workflow
+                      {"label": "HR/ER Leader",                 "value": "HR/ER Leader",                 "displayOrder": 3},
+                      {"label": "Workplace Investigator",       "value": "Workplace Investigator",       "displayOrder": 4},
+                      {"label": "Compliance/Ethics",            "value": "Compliance/Ethics",            "displayOrder": 5},
+                  ],
+              },
+          ]
+          for prop in CORE_PROPS:
+              try:
+                  body = {
+                      "name":        prop["name"],
+                      "label":       prop["label"],
+                      "description": prop["description"],
+                      "type":        prop["type"],
+                      "fieldType":   prop["fieldType"],
+                      "groupName":   "contactinformation",
+                  }
+                  if "options" in prop:
+                      body["options"] = prop["options"]
+                  r = requests.post(
+                      "https://api.hubapi.com/crm/v3/properties/contacts",
+                      headers=HS_HEADERS,
+                      json=body,
+                  )
+                  status = r.status_code
+                  if status not in (200, 201, 409):
+                      print(f"  ⚠️ Property create issue ({prop['name']}): {status} {r.text[:120]}")
+                  else:
+                      print(f"  ✅ Property ready: {prop['name']} ({status})")
+              except Exception as e:
+                  print(f"  ⚠️ Property setup error ({prop['name']}): {e}")
+          # ═════════════════════════════════════════════════════════════
+          # STATE MANAGEMENT
+          # State shape:
+          #   {
+          #     "company":         "Walmart",           # current active
+          #     "exhausted":       ["Apple", ...],      # saturated companies
+          #     "company_leads":   {"Walmart": 12, ...},# per-company lead counts
+          #     "empty_passes":    {"Walmart": 1, ...}, # consecutive all-dupe runs
+          #     "zero_lead_attempts": {"Walmart": 0, ...},
+          #     "expanded_companies": ["Stripe", ...],  # ICP-expansion picks
+          #   }
+          # ═════════════════════════════════════════════════════════════
+          STATE_MARKER = "OUTBOUND_AGENT_STATE_CORE_V1"
+          def load_state():
+              try:
+                  resp = hs_post("/crm/v3/objects/notes/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN", "value": STATE_MARKER}
+                      ]}],
+                      "properties": ["hs_note_body", "hs_timestamp"],
+                      "sorts":      [{"propertyName": "hs_timestamp", "direction": "DESCENDING"}],
+                      "limit":      1,
+                  })
+                  results = resp.get("results", [])
+                  if results:
+                      body = results[0]["properties"]["hs_note_body"]
+                      json_str = body.split(STATE_MARKER)[1].strip()
+                      return json.loads(json_str)
+              except Exception as e:
+                  print(f"State load error: {e}")
+              return None
+          def save_state(state):
+              try:
+                  hs_post("/crm/v3/objects/notes", {
+                      "properties": {
+                          "hs_note_body": f"{STATE_MARKER}\n{json.dumps(state)}",
+                          "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000)),
+                      }
+                  })
+              except Exception as e:
+                  print(f"State save error: {e}")
+          def init_state():
+              return {
+                  "company":            SEED_COMPANIES[0],
+                  "exhausted":          [],
+                  "company_leads":      {},
+                  "empty_passes":       {},
+                  "zero_lead_attempts": {},
+                  "expanded_companies": [],
+              }
+          def all_companies(state):
+              """Seed list + any expansion picks. Order: seed first, then expansion."""
+              return SEED_COMPANIES + state.get("expanded_companies", [])
+          def next_company(state, skip=None):
+              exhausted_self = set(state.get("exhausted", []))
+              skip_set = {skip} if skip else set()
+              for c in all_companies(state):
+                  if c not in exhausted_self and c not in skip_set:
+                      return c
+              return None
+          # ═════════════════════════════════════════════════════════════
+          # CLAUDE HELPER — identical retry/backoff to the Legal agent
+          # ═════════════════════════════════════════════════════════════
+          def claude(prompt, max_tokens=1000, use_search=False, max_retries=4):
+              body = {
+                  "model":      "claude-sonnet-4-6",
+                  "max_tokens": max_tokens,
+                  "messages":   [{"role": "user", "content": prompt}],
+              }
+              if use_search:
+                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+              last_err = None
+              for attempt in range(max_retries):
+                  try:
+                      resp = requests.post(
+                          "https://api.anthropic.com/v1/messages",
+                          headers=ANTH_HEADERS, json=body, timeout=120,
+                      )
+                      if resp.status_code in (429, 529) or resp.status_code >= 500:
+                          retry_after = resp.headers.get("retry-after")
+                          delay = float(retry_after) if retry_after else (2 ** attempt) * 5
+                          print(f"    ⏳ Claude API {resp.status_code} (attempt {attempt+1}/{max_retries}) — sleeping {delay}s")
+                          time.sleep(delay)
+                          last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                          continue
+                      if resp.status_code >= 400:
+                          raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:300]}")
+                      data = resp.json()
+                      text = "".join(
+                          b.get("text", "") for b in data.get("content", [])
+                          if b.get("type") == "text"
+                      ).strip()
+                      if not text:
+                          print(f"    ⚠️ Empty Claude response (attempt {attempt+1}/{max_retries}) — retrying")
+                          time.sleep((2 ** attempt) * 3)
+                          last_err = "empty content"
+                          continue
+                      return text
+                  except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                      last_err = f"network: {e}"
+                      print(f"    ⚠️ Claude API network error (attempt {attempt+1}/{max_retries}): {e}")
+                      time.sleep((2 ** attempt) * 3)
+              raise RuntimeError(f"Claude API exhausted {max_retries} retries — last error: {last_err}")
+          # ═════════════════════════════════════════════════════════════
+          # ICP EXPANSION
+          # When the seed list is exhausted, asks Claude for 5 more companies
+          # similar in shape (large HR/ER/Investigations functions) within the
+          # industry whitelist. Picks are appended to state["expanded_companies"]
+          # so they persist across runs.
+          # ═════════════════════════════════════════════════════════════
+          def expand_icp(state, k=5):
+              already = set(all_companies(state))
+              prompt = f"""You are a B2B sales-intel analyst. Recommend {k} more US-based companies
+          we should prospect into for selling Rev's enterprise transcription software (~$15k-50k/yr) to
+          their HR/Employee Relations, Workplace Investigations, and Compliance/Ethics teams.
+          Constraints:
+          - Public or large private companies (5,000+ employees)
+          - Industry MUST fall in one of: {", ".join(INDUSTRY_WHITELIST)}
+          - DO NOT include Legal services firms, Government agencies, or Law Enforcement
+            (those are handled by a separate agent)
+          - Must have a known internal HR / Employee Relations / Investigations function
+          - DO NOT recommend any of these already-prospected companies: {", ".join(sorted(already))}
+          Return ONLY a JSON array of {k} company names (strings), nothing else.
+          Example: ["Stripe", "Salesforce", "Spotify", "Goldman Sachs", "Procter & Gamble"]"""
+              try:
+                  raw = claude(prompt, max_tokens=400, use_search=True)
+                  for attempt in [
+                      lambda t: json.loads(t.strip()),
+                      lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
+                  ]:
+                      try:
+                          result = attempt(raw)
+                          if isinstance(result, list):
+                              # De-dupe + drop empties + drop any that snuck through
+                              clean = [c.strip() for c in result if isinstance(c, str) and c.strip() and c.strip() not in already]
+                              return clean[:k]
+                      except Exception:
+                          continue
+                  print(f"  ⚠️ ICP expansion: couldn't parse response (first 200 chars): {raw[:200]!r}")
+                  return []
+              except Exception as e:
+                  print(f"  ⚠️ ICP expansion error: {e}")
+                  return []
+          # ═════════════════════════════════════════════════════════════
+          # FIND LEADS — given a company + persona, surface real people
+          # Scrapes website + LinkedIn via Claude web_search.
+          # ═════════════════════════════════════════════════════════════
+          def find_leads(company, org_type, titles, exclude_names=None, batch=1):
+              exclude_str = ""
+              if exclude_names:
+                  sample = exclude_names[:30]
+                  exclude_str = f"\nDo NOT return these people (already found): {', '.join(sample)}\nFind different people beyond this list."
+              batch_str = ""
+              if batch > 1:
+                  batch_str = (
+                      f"\nThis is search batch {batch} — find people not already captured in previous searches. "
+                      f"Look deeper: LinkedIn profiles, corporate org charts, press releases, internal job boards, "
+                      f"and the company's careers / leadership pages."
+                  )
+              prompt = f"""Search for real {org_type} staff at {company}.
+          Find people with these titles (or close variants): {', '.join(titles)}
+          Look at official corporate websites, LinkedIn, press releases, leadership pages,
+          and public org-chart data. {company} is a large enterprise — find as many real
+          people as possible. Aim for 15-25 contacts including all seniority levels, not
+          just executives.{exclude_str}{batch_str}
+          Return a JSON array. Each item must have these exact keys:
+          first_name, last_name, title, organization, division, location, org_type, website, linkedin, email, phone
+          - `organization` MUST be "{company}" (the parent org)
+          - `division` is the specific business unit / region / function if discoverable
+            (e.g. "People Operations — NYC", "Corporate Investigations", "Global Compliance"),
+            otherwise empty string
+          - `location` is the city/state/country if discoverable
+          - `org_type` MUST be "{org_type}"
+          - `linkedin` is the public LinkedIn profile URL if you can find it, else ""
+          - `email` and `phone` only if publicly findable
+          Example:
+          [
+            {{
+              "first_name": "Jane", "last_name": "Smith", "title": "Senior HR Business Partner",
+              "organization": "{company}", "division": "Corporate HQ",
+              "location": "Bentonville, AR", "org_type": "{org_type}",
+              "website": "", "linkedin": "https://www.linkedin.com/in/jane-smith-hrbp/",
+              "email": "", "phone": ""
+            }}
+          ]
+          Return ONLY the JSON array starting with [ and ending with ]. No other text."""
+              text = claude(prompt, max_tokens=4000, use_search=True)
+              print(f"    Raw response (first 200 chars): {text[:200]}")
+              for attempt in [
+                  lambda t: json.loads(t.strip()),
+                  lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
+                  lambda t: json.loads(t.replace("```json","").replace("```","").strip()[t.replace("```json","").replace("```","").strip().find("["):]),
+              ]:
+                  try:
+                      result = attempt(text)
+                      if isinstance(result, list):
+                          for lead in result:
+                              if isinstance(lead, dict):
+                                  lead["org_type"]     = org_type
+                                  lead["organization"] = company
+                          print(f"    Parsed {len(result)} leads")
+                          return result
+                  except Exception:
+                      pass
+              print(f"    ⚠️ Could not parse JSON")
+              return []
+          # ═════════════════════════════════════════════════════════════
+          # DEDUP CHECK
+          # ═════════════════════════════════════════════════════════════
+          def is_duplicate(email, first_name, last_name):
+              if email:
+                  r = hs_post("/crm/v3/objects/contacts/search", {
+                      "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
+                      "limit": 1,
+                  })
+                  if r.get("total", 0) > 0:
+                      return True
+              r = hs_post("/crm/v3/objects/contacts/search", {
+                  "filterGroups": [{"filters": [
+                      {"propertyName": "firstname", "operator": "EQ", "value": first_name},
+                      {"propertyName": "lastname",  "operator": "EQ", "value": last_name},
+                  ]}],
+                  "limit": 1,
+              })
+              return r.get("total", 0) > 0
+          # ═════════════════════════════════════════════════════════════
+          # TEXT NORMALIZATION — reused from Legal agent
+          # ═════════════════════════════════════════════════════════════
+          ACRONYMS = {
+              "HR", "IT", "PR", "IA", "IG", "HRIS", "CHRO", "HRO", "HRBP",
+              "CEO", "CFO", "COO", "CTO", "CIO", "CPO", "CSO", "CRO", "CMO",
+              "VP", "SVP", "EVP", "AVP", "GM", "MD", "PHD",
+              "LLC", "LLP", "INC", "CORP", "LTD", "CO", "NA",
+              "DOJ", "EEOC", "HIPAA", "OSHA", "FOIA", "SOX",
+              "ER", "L&D", "DEI",
+              "US", "USA", "UK", "EU",
+          }
+          def normalize_case(text):
+              if not text:
+                  return text
+              def title_chunk(word):
+                  out, cap_next, chunk_len = [], True, 0
+                  for c in word:
+                      if c.isalpha():
+                          out.append(c.upper() if cap_next else c.lower())
+                          cap_next = False
+                          chunk_len += 1
+                      elif c == "'":
+                          out.append(c)
+                          cap_next = chunk_len <= 2
+                          chunk_len = 0
+                      elif c == "-":
+                          out.append(c)
+                          cap_next = True
+                          chunk_len = 0
+                      else:
+                          out.append(c)
+                          cap_next = True
+                          chunk_len = 0
+                  return "".join(out)
+              result = []
+              for w in text.split(" "):
+                  core = re.sub(r'[^A-Za-z]', '', w)
+                  if core and core.isupper() and core not in ACRONYMS:
+                      result.append(title_chunk(w))
+                  else:
+                      result.append(w)
+              return " ".join(result)
+          def normalize_lead(lead):
+              if not isinstance(lead, dict):
+                  return lead
+              for field in ("first_name", "last_name", "title", "organization", "division", "location"):
+                  if lead.get(field):
+                      lead[field] = normalize_case(lead[field])
+              return lead
+          # ═════════════════════════════════════════════════════════════
+          # EMAIL CLEANING — reused from Legal agent
+          # ═════════════════════════════════════════════════════════════
+          def clean_email_body(text, first_name=None):
+              if not text:
+                  return text
+              lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
+              cleaned = "\n".join(lines).strip()
+              cleaned = cleaned.replace("\n", "")
+              cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
+              cleaned = re.sub(r'^(Hi\s+[^,<]{1,40},)(?!\s*<br)\s*', r'\1<br><br>', cleaned, flags=re.IGNORECASE)
+              if first_name:
+                  cleaned = re.sub(
+                      r'^\s*(?:Hello|Hi|Dear|Greetings|Good\s+(?:morning|afternoon|evening))\b[^,<]{0,60}\s*,\s*(?:<br\s*/?>\s*)*',
+                      f"Hi {first_name},<br><br>",
+                      cleaned, count=1, flags=re.IGNORECASE,
+                  )
+                  if not re.match(r'^\s*Hi\s+' + re.escape(first_name) + r'\s*,', cleaned, flags=re.IGNORECASE):
+                      cleaned = re.sub(r'^(?:\s|<br\s*/?>)+', '', cleaned, flags=re.IGNORECASE)
+                      cleaned = f"Hi {first_name},<br><br>" + cleaned
+                  cleaned = re.sub(
+                      r'^Hi\s+' + re.escape(first_name) + r'\s*,\s*(?:<br\s*/?>\s*)+',
+                      f"Hi {first_name},<br><br>",
+                      cleaned, count=1, flags=re.IGNORECASE,
+                  )
+              cleaned = re.sub(r'\s+[—–]\s+', '. ',  cleaned)
+              cleaned = re.sub(r'[—–]',         ', ', cleaned)
+              cleaned = re.sub(r'\.\s*\.', '.', cleaned)
+              cleaned = re.sub(r',\s*,', ',', cleaned)
+              cleaned = re.sub(r'\s+([.,])', r'\1', cleaned)
+              meet_url = r'https?://meetings\.hubspot\.com/[A-Za-z0-9_\-]+'
+              cleaned = re.sub(
+                  r'\b(?:here(?:\'s)?|at)\s*:?\s+(' + meet_url + r')',
+                  r'on <a href="\1">my calendar</a>',
+                  cleaned, flags=re.IGNORECASE,
+              )
+              cleaned = re.sub(
+                  r'(?<!href=")(?<!href=\')(' + meet_url + r')',
+                  r'<a href="\1">my calendar</a>',
+                  cleaned, flags=re.IGNORECASE,
+              )
+              if 'href="https://meetings.hubspot.com/' not in cleaned:
+                  body = re.sub(r'(<br\s*/?>)+\s*$', '', cleaned.rstrip(), flags=re.IGNORECASE)
+                  body += f' Grab a time on <a href="{MEETING_LINK}">my calendar</a>.'
+                  cleaned = body
+              cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
+              return cleaned + '<br>'
+          # ═════════════════════════════════════════════════════════════
+          # EMAIL SEQUENCE — 4 cold-email bodies + subjects per persona
+          # ═════════════════════════════════════════════════════════════
+          def gen_email_sequence(contact):
+              org_type   = contact.get("org_type", "HR/ER Leader")
+              angles     = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
+              first_name = contact["first_name"]
+              name       = f"{contact['title']} {contact['last_name']}"
+              org        = contact["organization"]
+              division   = contact.get("division", "")
+              loc        = contact.get("location", "")
+              loc_str    = f"{org}" + (f" ({division})" if division else "") + (f" — {loc}" if loc else "")
+              emails     = {}
+              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {loc_str}.
+          Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
+          Rules:
+          - MUST start with exactly this greeting on its own line: Hi {first_name},
+          - Follow the greeting with <br><br> then the body
+          - Professional, peer-to-peer tone — no corporate filler
+          - 100-130 words
+          - Open the body with something specific to their role as {contact['title']}
+          - Reference Rev's value in plain language (no marketing-speak)
+          - Close with a CTA: ask if they'd be open to a 15-min call; include the meeting link
+          - NO em dashes (—) or en dashes (–). Use periods or commas instead
+          - Return raw HTML body only. No "Subject:" line. No signature block.""", max_tokens=600), first_name)
+              emails["email_2"] = clean_email_body(claude(f"""Write cold outreach Email 2 of 4 (follow-up). Sent 4 days after Email 1.
+          Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Proof: {angles['proof']}. Meeting link: {MEETING_LINK}
+          Rules:
+          - MUST start with exactly: Hi {first_name},
+          - <br><br> after greeting
+          - 80-100 words, follow-up tone — acknowledge they probably didn't see Email 1
+          - Lead with the proof point ({angles['proof']}) — make it concrete
+          - End with a low-commitment CTA: "open to a 15-min look?" and include the meeting link
+          - NO em/en dashes. Raw HTML body only.""", max_tokens=500), first_name)
+              emails["email_3"] = clean_email_body(claude(f"""Write cold outreach Email 3 of 4. Sent 7 days after Email 2.
+          Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
+          Rules:
+          - MUST start with exactly: Hi {first_name},
+          - <br><br> after greeting
+          - 60-80 words
+          - Short, direct, value-forward
+          - Reference a peer company in the same vertical (without naming a specific one) that's seen results
+          - End with the meeting link CTA
+          - NO em/en dashes. Raw HTML body only.""", max_tokens=400), first_name)
+              emails["email_4"] = clean_email_body(claude(f"""Write cold outreach Email 4 of 4 — the breakup email. Sent 10 days after Email 3.
+          Recipient: {name} at {loc_str}. Meeting link: {MEETING_LINK}
+          Rules:
+          - MUST start with exactly: Hi {first_name},
+          - <br><br> after greeting
+          - 40-60 words
+          - Polite breakup — "I'll stop reaching out unless you'd like to chat"
+          - Include the meeting link one last time
+          - NO em/en dashes. Raw HTML body only.""", max_tokens=300), first_name)
+              return emails
+          def gen_subject(contact, idx):
+              org_type = contact.get("org_type", "HR/ER Leader")
+              angles   = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
+              prompts = {
+                  1: f"Write a cold-email subject line (≤8 words) for {contact['title']} about {angles['use_case']}. No emoji, no clickbait, no em dashes.",
+                  2: f"Write a follow-up subject line (≤6 words) referencing {angles['proof']}. Plain language. No emoji.",
+                  3: f"Write a short subject line (≤5 words) about transcription for {org_type}s. No emoji.",
+                  4: f"Write a breakup subject line (≤4 words). Polite, no emoji.",
+              }
+              raw = claude(prompts[idx], max_tokens=80)
+              return raw.strip().strip('"').strip("'")[:80]
+          # ═════════════════════════════════════════════════════════════
+          # CREATE CONTACT — pushes to HubSpot
+          # ═════════════════════════════════════════════════════════════
+          def enroll_in_sequence(contact_id, contact_email):
+              # TODO_CORE: enable once SEQUENCE_ID is set
+              if not SEQUENCE_ID or SEQUENCE_ID.startswith("REPLACE_ME"):
+                  print(f"    ⚠️ SEQUENCE_ID not set — skipping enrollment")
+                  return False
+              if not contact_email:
+                  return False
+              try:
+                  r = requests.post(
+                      "https://api.hubapi.com/automation/v3/workflows/{}/enrollments/contacts/{}".format(SEQUENCE_ID, contact_id),
+                      headers=HS_HEADERS,
+                  )
+                  return r.status_code in (200, 204)
+              except Exception as e:
+                  print(f"    ⚠️ Sequence enrollment error: {e}")
+                  return False
+          def get_buying_role(title):
+              t = (title or "").lower()
+              if any(k in t for k in ("chief", "vp ", "vp,", "head of", "director", "senior director")):
+                  return "Decision Maker"
+              if any(k in t for k in ("senior manager", "sr. manager", "lead", "principal")):
+                  return "Influencer"
+              return "End User"
+          def create_contact(contact, email_body, subject, emails=None, subjects=None):
+              emails   = emails   or {}
+              subjects = subjects or {}
+              buying_role = get_buying_role(contact.get("title", ""))
+              dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
+              persona_val = contact.get("org_type", "") if contact.get("org_type", "") in ACTIVE_PERSONAS else ""
+              props = {
+                  "firstname":             contact["first_name"],
+                  "lastname":              contact["last_name"],
+                  "jobtitle":              contact["title"],
+                  "company":               contact["organization"],
+                  "office":                contact.get("division") or contact.get("organization", ""),
+                  "persona":               persona_val,
+                  "city":                  (contact.get("location") or "").split(",")[0].strip(),
+                  "hs_lead_status":        "NEW",
+                  "leadsource":            LEADSOURCE_VALUE,
+                  "lead_source_details":   LEAD_SOURCE_DETAILS,
+                  "ob_email_1_subject":    subjects.get(1, ""),
+                  "ob_email_1_body":       emails.get("email_1", ""),
+                  "ob_email_2_subject":    subjects.get(2, ""),
+                  "ob_email_2_body":       emails.get("email_2", ""),
+                  "ob_email_3_subject":    subjects.get(3, ""),
+                  "ob_email_3_body":       emails.get("email_3", ""),
+                  "ob_email_4_subject":    subjects.get(4, ""),
+                  "ob_email_4_body":       emails.get("email_4", ""),
+                  "hubspot_owner_id":      str(owner_id),
+              }
+              if contact.get("email"):
+                  props["email"] = contact["email"]
+              if contact.get("phone"):
+                  props["phone"] = contact["phone"]
+              if contact.get("website"):
+                  props["website"] = contact["website"]
+              resp = hs_post("/crm/v3/objects/contacts", {"properties": props})
+              contact_id = resp.get("id")
+              if not contact_id:
+                  print(f"    ❌ Contact creation failed: {json.dumps(resp)[:300]}")
+                  return None
+              note = (
+                  f"OUTBOUND EMAIL SEQUENCE (Core — {OWNER_NAME})\n"
+                  f"Company: {contact['organization']} | Division: {contact.get('division','-')} | Location: {contact.get('location','-')}\n"
+                  f"Dept: {dept} | Persona: {persona_val}\nBuying Role: {buying_role}\nLead Source: Claude\n\n"
+                  f"━━━ EMAIL 1 — Day 1 (Cold Intro) ━━━\n"
+                  f"Subject: {subjects.get(1,'')}\n\n{emails.get('email_1','')}\n\n"
+                  f"━━━ EMAIL 2 — Day 5 (Follow-up) ━━━\n"
+                  f"Subject: {subjects.get(2,'')}\n\n{emails.get('email_2','')}\n\n"
+                  f"━━━ EMAIL 3 — Day 12 (Value) ━━━\n"
+                  f"Subject: {subjects.get(3,'')}\n\n{emails.get('email_3','')}\n\n"
+                  f"━━━ EMAIL 4 — Day 22 (Breakup) ━━━\n"
+                  f"Subject: {subjects.get(4,'')}\n\n{emails.get('email_4','')}"
+              )
+              try:
+                  note_resp = hs_post("/crm/v3/objects/notes", {
+                      "properties": {
+                          "hs_note_body": note,
+                          "hs_timestamp": str(int(datetime.datetime.now().timestamp() * 1000)),
+                      },
+                      "associations": [{
+                          "to":    {"id": contact_id},
+                          "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}],
+                      }],
+                  })
+              except Exception as e:
+                  print(f"    ⚠️ Note attach error: {e}")
+              enrolled = enroll_in_sequence(contact_id, contact.get("email", ""))
+              return {"id": contact_id, "enrolled": enrolled}
+          # ═════════════════════════════════════════════════════════════
+          # GIST PUBLISH (optional persistence)
+          # ═════════════════════════════════════════════════════════════
+          def publish_gist(state):
+              if not GIST_TOKEN:
+                  print("No GIST_TOKEN — skipping gist publish")
+                  return None
+              headers = {"Authorization": f"token {GIST_TOKEN}", "Content-Type": "application/json"}
+              payload = {"files": {"ob_agent_state_core.json": {"content": json.dumps(state, indent=2)}}}
+              if GIST_ID:
+                  r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
+              else:
+                  payload["description"] = "OB Agent State — Core (Isabella Simpatico)"
+                  payload["public"]      = True
+                  r = requests.post("https://api.github.com/gists", headers=headers, json=payload)
+              data = r.json()
+              print(f"✅ Gist published: {data.get('html_url', '')}")
+              return data.get("html_url", "")
+          # ═════════════════════════════════════════════════════════════
+          # CHART — per-company breakdown for the daily Slack post
+          # ═════════════════════════════════════════════════════════════
+          def generate_chart(state, today_str):
+              fig, ax = plt.subplots(figsize=(10, 6))
+              fig.patch.set_facecolor('#1a1d21')
+              ax.set_facecolor('#222529')
+              for spine in ax.spines.values():
+                  spine.set_edgecolor('#444')
+              company_leads = state.get("company_leads", {})
+              exhausted     = state.get("exhausted", [])
+              active        = state.get("company")
+              ACTIVE_COLOR  = "#7c3aed"
+              if not company_leads:
+                  ax.text(0.5, 0.5, 'No data yet', ha='center', va='center',
+                          color='#888', transform=ax.transAxes)
+              else:
+                  companies = list(company_leads.keys())
+                  counts    = list(company_leads.values())
+                  bar_colors = ['#4ade80' if c in exhausted else ACTIVE_COLOR for c in companies]
+                  bars = ax.barh(companies, counts, color=bar_colors, height=0.6)
+                  for bar, c, ct in zip(bars, companies, counts):
+                      ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2,
+                              f'{ct}', va='center', color='white', fontsize=9)
+                      if c == active:
+                          bar.set_edgecolor('white')
+                          bar.set_linewidth(2)
+                  ax.set_xlim(0, max(counts) * 1.25 if counts else 10)
+                  ax.tick_params(colors='white')
+                  ax.set_xlabel('Leads', color='#aaa', fontsize=9)
+              total = sum(company_leads.values()) if company_leads else 0
+              fig.suptitle(f'OB Agent — Core ({OWNER_NAME})\n{today_str}\n{total} total leads across {len(company_leads)} companies · Active: {active}',
+                           color='white', fontsize=12, fontweight='bold')
+              patches = [
+                  mpatches.Patch(color='#4ade80', label='Exhausted'),
+                  mpatches.Patch(color=ACTIVE_COLOR, label='Active'),
+              ]
+              ax.legend(handles=patches, loc='lower right', fontsize=8,
+                        facecolor='#333', labelcolor='white', edgecolor='#555')
+              plt.tight_layout()
+              chart_path = '/tmp/ob_core_chart.png'
+              plt.savefig(chart_path, dpi=150, bbox_inches='tight',
+                          facecolor='#1a1d21', edgecolor='none')
+              plt.close()
+              return chart_path
+          def upload_chart_to_slack(chart_path, channel_id, today_str):
+              try:
+                  file_size = os.path.getsize(chart_path)
+                  r = requests.get(
+                      "https://slack.com/api/files.getUploadURLExternal",
+                      headers=SLACK_HEADERS,
+                      params={"filename": "ob_core_chart.png", "length": file_size},
+                  )
+                  data = r.json()
+                  if not data.get("ok"):
+                      print(f"❌ Failed to get upload URL: {data.get('error')}")
+                      return None
+                  upload_url = data["upload_url"]
+                  file_id    = data["file_id"]
+                  with open(chart_path, "rb") as f:
+                      file_bytes = f.read()
+                  requests.post(upload_url, data=file_bytes,
+                                headers={"Content-Type": "application/octet-stream"})
+                  r3 = requests.post(
+                      "https://slack.com/api/files.completeUploadExternal",
+                      headers=SLACK_HEADERS,
+                      json={
+                          "files":      [{"id": file_id, "title": f"Core Company Breakdown — {today_str}"}],
+                          "channel_id": channel_id,
+                      },
+                  )
+                  result = r3.json()
+                  if result.get("ok"):
+                      print(f"✅ Chart uploaded successfully")
+                  else:
+                      print(f"❌ Chart upload failed: {result.get('error')}")
+                  return file_id
+              except Exception as e:
+                  print(f"Chart upload error: {e}")
+                  return None
+          # ═════════════════════════════════════════════════════════════
+          # LOAD STATE / RUN MIGRATION
+          # ═════════════════════════════════════════════════════════════
+          state = load_state()
+          if not state:
+              print("No state — initializing fresh Core state")
+              state = init_state()
+          else:
+              print(f"Loaded state: {json.dumps(state, indent=2)}")
+              for k, default in (
+                  ("company",            SEED_COMPANIES[0]),
+                  ("exhausted",          []),
+                  ("company_leads",      {}),
+                  ("empty_passes",       {}),
+                  ("zero_lead_attempts", {}),
+                  ("expanded_companies", []),
+              ):
+                  if k not in state:
+                      state[k] = default
+          # ═════════════════════════════════════════════════════════════
+          # MAIN LOOP — fill the per-persona caps, rotating companies as we go
+          # ═════════════════════════════════════════════════════════════
+          today_str = datetime.date.today().strftime("%A, %B %d, %Y")
+          added         = []
+          skipped       = 0
+          # Per-persona daily counter — caps each persona at LEADS_PER_PERSONA_PER_DAY
+          # independently. Loop exits when every persona has hit its cap, OR when
+          # we've exhausted all companies and can't expand further.
+          persona_today = {p: 0 for p in ACTIVE_PERSONAS}
+          TOTAL_DAILY_CAP = LEADS_PER_PERSONA_PER_DAY * len(ACTIVE_PERSONAS)
+          def all_personas_capped():
+              return all(persona_today[p] >= LEADS_PER_PERSONA_PER_DAY for p in ACTIVE_PERSONAS)
+          while not all_personas_capped() and len(added) < TOTAL_DAILY_CAP:
+              company = state.get("company")
+              if not company:
+                  # Try to advance to a non-exhausted company
+                  company = next_company(state)
+                  if not company:
+                      # All seed + expansion exhausted — try to expand more
+                      print(f"⚠️ All companies exhausted — calling expand_icp()")
+                      picks = expand_icp(state, k=5)
+                      if picks:
+                          state.setdefault("expanded_companies", []).extend(picks)
+                          state["company"] = picks[0]
+                          print(f"➕ ICP expanded with: {picks}")
+                          company = picks[0]
+                      else:
+                          alert = (
+                              f"<@{SLACK_USER}> ⚠️ *Core OB exhausted all companies* "
+                              f"AND auto-expansion returned nothing. Please add more seed "
+                              f"companies to SEED_COMPANIES or extend INDUSTRY_WHITELIST."
+                          )
+                          requests.post("https://slack.com/api/chat.postMessage",
+                              headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": alert})
+                          break
+                  else:
+                      state["company"] = company
+              print(f"\n{'='*60}")
+              persona_status = ", ".join(f"{p.split('/')[0]}:{persona_today[p]}/{LEADS_PER_PERSONA_PER_DAY}" for p in ACTIVE_PERSONAS)
+              print(f"🏢 Company: {company} (today: {persona_status} | total {len(added)})")
+              # Per-company state — total leads ever found for this company.
+              # When that count hits MAX_LEADS_PER_COMPANY we move on.
+              company_total = state["company_leads"].get(company, 0)
+              if company_total >= MAX_LEADS_PER_COMPANY:
+                  print(f"  ⚠️ {company} has hit the {MAX_LEADS_PER_COMPANY}-lead cap — marking exhausted")
+                  if company not in state["exhausted"]:
+                      state["exhausted"].append(company)
+                  state["company"] = next_company(state)
+                  continue
+              # Per-run loop state
+              company_new      = 0
+              company_skipped  = 0
+              found_any_leads  = False
+              MAX_BATCHES_PER_ORG = 6
+              MAX_EMPTY_PASSES    = 3
+              ZERO_LEAD_MAX_RUNS  = 3
+              for org in ORG_TYPES:
+                  if all_personas_capped():
+                      break
+                  if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
+                      break
+                  # Skip this persona if it's already hit its daily 25.
+                  if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY:
+                      print(f"  ⏭️  Skipping {org['type']} — already at {LEADS_PER_PERSONA_PER_DAY}/day cap")
+                      continue
+                  print(f"  Searching {org['type']}... ({persona_today[org['type']]}/{LEADS_PER_PERSONA_PER_DAY} so far today)")
+                  org_found_names  = []
+                  org_new_this_run = 0
+                  for batch_num in range(1, MAX_BATCHES_PER_ORG + 1):
+                      if all_personas_capped():
+                          break
+                      if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY:
+                          break
+                      if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
+                          break
+                      leads = []
+                      batch_new = 0
+                      try:
+                          leads = find_leads(
+                              company, org["type"], org["titles"],
+                              exclude_names=org_found_names,
+                              batch=batch_num,
+                          )
+                          if leads:
+                              found_any_leads = True
+                          for lead in leads:
+                              if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY:
+                                  break
+                              if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
+                                  break
+                              lead = normalize_lead(lead)
+                              fn = lead.get("first_name", "")
+                              ln = lead.get("last_name", "")
+                              if not fn or not ln:
+                                  continue
+                              full_name = f"{fn} {ln}"
+                              org_found_names.append(full_name)
+                              if is_duplicate(lead.get("email", ""), fn, ln):
+                                  company_skipped += 1
+                                  skipped         += 1
+                                  print(f"    ↩ Duplicate: {full_name}")
+                                  continue
+                              emails_body = gen_email_sequence(lead)
+                              subjects = {i: gen_subject(lead, i) for i in (1, 2, 3, 4)}
+                              result = create_contact(
+                                  lead, email_body="",
+                                  subject=subjects[1], emails=emails_body, subjects=subjects,
+                              )
+                              if result and result.get("id"):
+                                  contact_id = result["id"]
+                                  enrolled   = result.get("enrolled", False)
+                                  added.append({
+                                      "name":     full_name,
+                                      "title":    lead.get("title", ""),
+                                      "org":      lead.get("organization", ""),
+                                      "division": lead.get("division", ""),
+                                      "id":       contact_id,
+                                      "subject":  subjects[1],
+                                      "enrolled": enrolled,
+                                      "email":    lead.get("email", ""),
+                                      "org_type": lead.get("org_type", org["type"]),
+                                  })
+                                  company_new      += 1
+                                  org_new_this_run += 1
+                                  batch_new        += 1
+                                  persona_today[org["type"]] = persona_today.get(org["type"], 0) + 1
+                                  state["company_leads"][company] = state["company_leads"].get(company, 0) + 1
+                                  enroll_icon = "📧" if enrolled else "📭"
+                                  print(f"    ✅ Added: {full_name} — {lead.get('title')} {enroll_icon} (persona: {persona_today[org['type']]}/{LEADS_PER_PERSONA_PER_DAY})")
+                              time.sleep(1)
+                      except Exception as e:
+                          print(f"    Error: {e}")
+                      if not leads or batch_new == 0:
+                          print(f"    ℹ️ {org['type']} batch {batch_num} dry — moving to next persona")
+                          break
+                      print(f"    Batch {batch_num}: {batch_new} new. Looping for more...")
+                      time.sleep(2)
+              print(f"  Company pass: {company_new} new, {company_skipped} dupes, found_any={found_any_leads}")
+              if found_any_leads:
+                  state.setdefault("zero_lead_attempts", {}).pop(company, None)
+              if company_new > 0:
+                  state.setdefault("empty_passes", {}).pop(company, None)
+              # ── Saturation logic ────────────────────────────────
+              # 1) Hit per-company cap → mark exhausted, advance
+              if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
+                  print(f"  ✅ {company} hit {MAX_LEADS_PER_COMPANY}-lead cap — marking exhausted")
+                  if company not in state["exhausted"]:
+                      state["exhausted"].append(company)
+                  state["company"] = next_company(state)
+                  continue
+              # 2) All dupes (found leads but all already in HS) → empty pass
+              if found_any_leads and company_new == 0 and company_skipped > 0:
+                  ep = state.setdefault("empty_passes", {})
+                  ep[company] = ep.get(company, 0) + 1
+                  print(f"  ⚠️ All-dupe pass #{ep[company]} for {company}")
+                  if ep[company] >= MAX_EMPTY_PASSES:
+                      print(f"  ⚠️ {company} fully exhausted after {ep[company]} empty passes — advancing")
+                      if company not in state["exhausted"]:
+                          state["exhausted"].append(company)
+                      state["company"] = next_company(state)
+                  continue
+              # 3) Zero leads surfaced (find_leads returned nothing) — could be
+              #    a search hiccup. Don't exhaust until N consecutive runs.
+              if not found_any_leads:
+                  zla = state.setdefault("zero_lead_attempts", {})
+                  zla[company] = zla.get(company, 0) + 1
+                  print(f"  ⚠️ Zero-lead run #{zla[company]}/{ZERO_LEAD_MAX_RUNS} for {company}")
+                  if zla[company] >= ZERO_LEAD_MAX_RUNS:
+                      print(f"  ⚠️ {company} exhausted after {zla[company]} zero-lead runs")
+                      if company not in state["exhausted"]:
+                          state["exhausted"].append(company)
+                      state["company"] = next_company(state)
+                      continue
+                  else:
+                      # Skip but don't exhaust — try a different company today
+                      alt = next_company(state, skip=company)
+                      if alt:
+                          state["company"] = alt
+                          print(f"  ➡️ Skipping (not exhausting) — moving to: {alt}")
+                          continue
+                      else:
+                          print(f"  ⚠️ No alternative company — stopping at {len(added)}/{TOTAL_DAILY_CAP}")
+                          break
+              if not all_personas_capped():
+                  print(f"  🔄 {company} still has leads — looping for more ({len(added)}/{TOTAL_DAILY_CAP})")
+          # ═════════════════════════════════════════════════════════════
+          # SAVE STATE + GIST
+          # ═════════════════════════════════════════════════════════════
+          save_state(state)
+          print(f"\nState saved: {json.dumps(state, indent=2)}")
+          publish_gist(state)
+          # ═════════════════════════════════════════════════════════════
+          # SLACK SUMMARY
+          # ═════════════════════════════════════════════════════════════
+          chart_path = generate_chart(state, today_str)
+          upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
+          enrolled_count = sum(1 for c in added if c.get("enrolled"))
+          # Per-persona breakdown
+          per_persona = {p: 0 for p in ACTIVE_PERSONAS}
+          for c in added:
+              per_persona[c.get("org_type", "")] = per_persona.get(c.get("org_type", ""), 0) + 1
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*🎯 Daily Outbound Agent — Core — {today_str}*\n"
+          msg += f"*{len(added)} new leads added | {skipped} duplicates skipped | {enrolled_count} enrolled in sequence*\n"
+          msg += f"_Owner: {OWNER_NAME} · Personas: {', '.join(ACTIVE_PERSONAS)} · Cap: {LEADS_PER_PERSONA_PER_DAY}/persona/day_\n"
+          msg += f"_<{CONSOLIDATED_LIST_URL}|View consolidated Core list in HubSpot>_\n\n"
+          msg += f"*Per-persona today (cap {LEADS_PER_PERSONA_PER_DAY} each):*\n"
+          msg += f"• 👔 HR/ER Leader: *{per_persona.get('HR/ER Leader', 0)}/{LEADS_PER_PERSONA_PER_DAY}*\n"
+          msg += f"• 🔍 Workplace Investigator: *{per_persona.get('Workplace Investigator', 0)}/{LEADS_PER_PERSONA_PER_DAY}*\n"
+          msg += f"• ⚖️  Compliance & Ethics Investigations: *{per_persona.get('Compliance/Ethics', 0)}/{LEADS_PER_PERSONA_PER_DAY}*\n\n"
+          msg += f"*Active company:* {state.get('company') or '(none — all exhausted)'}\n"
+          exhausted_n = len(state.get("exhausted", []))
+          total_n     = len(all_companies(state))
+          msg += f"*Progress:* {exhausted_n}/{total_n} companies exhausted\n"
+          # Sample of today's leads (first 8)
+          if added:
+              msg += "\n*Sample leads:*\n"
+              for a in added[:8]:
+                  msg += f"• `{a['name']}` — {a['title']} @ {a['org']}" + (f" ({a.get('division','')})" if a.get('division') else "") + "\n"
+          try:
+              requests.post("https://slack.com/api/chat.postMessage",
+                  headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL, "text": msg})
+              print("\n✅ Slack summary posted")
+          except Exception as e:
+              print(f"\n⚠️ Slack post error: {e}")
+          EOF

@@ -509,7 +509,15 @@ jobs:
           T4a. Did {county} County law enforcement budget increase >5% YoY most recently? (yes=5, no=0)
           T4b. Any new Data Specialist, Analyst, or Investigator hires in Sheriff/DA/Courts in last 12 months? (yes=5, no=0)
           T4c. Any ARPA or federal tech grants active in {county} County for public safety? (yes=5, no=0)
-          Return a JSON object with this exact structure:
+
+          OUTPUT FORMAT — CRITICAL:
+          - Do NOT write any preamble like "Now I have sufficient data" or "Let me synthesize my findings" or "Based on my research"
+          - Do NOT write any commentary, analysis paragraphs, or summaries before or after the JSON
+          - Your ENTIRE response must be one JSON object: starts with `{{`, ends with `}}`, nothing else
+          - The JSON object MUST be complete — do not truncate. Use brief evidence strings if needed.
+          - If you must think, do it silently via web_search calls — do NOT think in your text output
+
+          JSON schema (use exactly this structure):
           {{
             "county": "{county}",
             "state": "{state_code}",
@@ -528,16 +536,53 @@ jobs:
             "snippet": "<EXACTLY 2 lines max. Line 1: the strongest signal. Line 2: the procurement angle ({state_code} statewide contract) OR body cam angle. No third line. Keep it conversational, not corporate.>",
             "procurement_note": "<1-2 sentence note tying this county to the {state_code} statewide contract vehicle and any relevant local contract>"
           }}
-          Return ONLY the JSON object."""
-              raw = claude(prompt, max_tokens=800, use_search=True)
-              # Strip common wrappers Claude sometimes adds around JSON
-              # (markdown fences, leading prose, citation footnotes from web_search).
+          Output ONLY the JSON object — no preamble, no postamble, no commentary."""
+              # 2026-05-29: max_tokens 800 → 2500. The 16-field JSON schema
+              # alone consumes ~600 output tokens; the model was burning the
+              # rest on "Now I have sufficient data... Let me synthesize..."
+              # research preamble and never reaching the JSON. Combined with
+              # the tightened prompt above (explicit anti-preamble rules),
+              # 2500 is comfortable headroom for the full structured output.
+              raw = claude(prompt, max_tokens=2500, use_search=True)
+              # 2026-05-29: more robust JSON extraction. The previous
+              # find/rfind substring approach would over-extract if the
+              # model included embedded `{` or `}` in its preamble prose
+              # (e.g. "the budget {is} ~$5M"). The new _extract_balanced
+              # helper walks the string tracking brace depth and returns
+              # the first complete balanced block — robust to prose noise.
               def _clean(t):
-                  t = t.replace("```json", "").replace("```", "").strip()
-                  return t
+                  return t.replace("```json", "").replace("```", "").strip()
+              def _extract_balanced(t, open_ch="{", close_ch="}"):
+                  start = t.find(open_ch)
+                  if start < 0:
+                      return None
+                  depth = 0
+                  in_str = False
+                  esc = False
+                  for i in range(start, len(t)):
+                      ch = t[i]
+                      if esc:
+                          esc = False
+                          continue
+                      if ch == "\\":
+                          esc = True
+                          continue
+                      if ch == '"':
+                          in_str = not in_str
+                          continue
+                      if in_str:
+                          continue
+                      if ch == open_ch:
+                          depth += 1
+                      elif ch == close_ch:
+                          depth -= 1
+                          if depth == 0:
+                              return t[start:i+1]
+                  return None
               parse_errors = []
               for attempt_name, attempt in [
-                  ("strict",   lambda t: json.loads(_clean(t))),
+                  ("strict",    lambda t: json.loads(_clean(t))),
+                  ("balanced",  lambda t: json.loads(_extract_balanced(_clean(t), "{", "}"))),
                   ("substring", lambda t: json.loads(_clean(t)[_clean(t).find("{"):_clean(t).rfind("}")+1])),
               ]:
                   try:
@@ -871,13 +916,58 @@ jobs:
               "org_type": "{org_type}", "website": "", "email": "", "phone": "", "address": ""
             }}
           ]
-          Return ONLY the JSON array starting with [ and ending with ]. No other text."""
-              text = claude(prompt, max_tokens=4000, use_search=True)
+
+          OUTPUT FORMAT — CRITICAL:
+          - Do NOT write any preamble like "Now I have enough data" or "Let me compile the JSON" or "Based on my research"
+          - Do NOT write any commentary, analysis, or summary before or after the JSON
+          - Your ENTIRE response must be ONE JSON array: starts with `[`, ends with `]`, nothing else
+          - The JSON array MUST be complete — do not truncate mid-object. If you only have N solid leads, return N — don't pad.
+          - If you must think, do it silently via web_search calls — do NOT think in your text output"""
+              # 2026-05-29: max_tokens 4000 → 8000. The verbose research
+              # preamble ("Based on all the research gathered... Let me
+              # compile the JSON...") was consuming 2000+ tokens before
+              # any JSON emission, often leaving the array truncated
+              # mid-object. Doubled the budget so even with preamble there's
+              # room for the full 15-20 lead JSON array.
+              text = claude(prompt, max_tokens=8000, use_search=True)
               print(f"    Raw response (first 200 chars): {text[:200]}")
+              # 2026-05-29: brace-depth-aware extraction. Walks the string,
+              # tracks `[` / `]` depth (skipping anything inside quoted
+              # strings), and returns the first balanced bracket block.
+              # Robust to prose preamble that includes embedded `[` or `]`.
+              def _clean(t):
+                  return t.replace("```json","").replace("```","").strip()
+              def _extract_balanced(t, open_ch="[", close_ch="]"):
+                  start = t.find(open_ch)
+                  if start < 0:
+                      return None
+                  depth = 0
+                  in_str = False
+                  esc = False
+                  for i in range(start, len(t)):
+                      ch = t[i]
+                      if esc:
+                          esc = False
+                          continue
+                      if ch == "\\":
+                          esc = True
+                          continue
+                      if ch == '"':
+                          in_str = not in_str
+                          continue
+                      if in_str:
+                          continue
+                      if ch == open_ch:
+                          depth += 1
+                      elif ch == close_ch:
+                          depth -= 1
+                          if depth == 0:
+                              return t[start:i+1]
+                  return None
               for attempt in [
-                  lambda t: json.loads(t.strip()),
-                  lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
-                  lambda t: json.loads(t.replace("```json","").replace("```","").strip()[t.replace("```json","").replace("```","").strip().find("["):]),
+                  lambda t: json.loads(_clean(t)),
+                  lambda t: json.loads(_extract_balanced(_clean(t), "[", "]")),
+                  lambda t: json.loads(_clean(t)[_clean(t).find("["):_clean(t).rfind("]")+1]),
               ]:
                   try:
                       result = attempt(text)
@@ -888,7 +978,8 @@ jobs:
                                   lead["state"] = state_code
                           print(f"    Parsed {len(result)} leads")
                           return result
-                  except: pass
+                  except Exception:
+                      pass
               print(f"    ⚠️ Could not parse JSON")
               return []
           # ── Duplicate check ───────────────────────────────────────

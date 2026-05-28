@@ -287,17 +287,21 @@ jobs:
                   "fieldType":   "text",
               },
               {
-                  "name":        "persona",
-                  "label":       "Persona",
-                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR-ER Leader / Workplace Investigator / Compliance-Ethics.",
+                  # 2026-05-29: renamed from `persona`/`Persona` to
+                  # `ob_persona`/`OB Persona` because another property in
+                  # this HubSpot portal already owns the label "Persona",
+                  # blocking creation of a contact property with that label.
+                  "name":        "ob_persona",
+                  "label":       "OB Persona",
+                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR/ER Leader / Workplace Investigator / Compliance/Ethics.",
                   "type":        "enumeration",
                   "fieldType":   "select",
                   "options": [
-                      # Legal personas first (existing in HS — must include for the option list to be valid)
+                      # Legal personas
                       {"label": "Public Defender",              "value": "Public Defender",              "displayOrder": 0},
                       {"label": "District Attorney",            "value": "District Attorney",            "displayOrder": 1},
                       {"label": "Police/Sheriff Investigators", "value": "Police/Sheriff Investigators", "displayOrder": 2},
-                      # Core personas added by this workflow
+                      # Core personas
                       {"label": "HR/ER Leader",                 "value": "HR/ER Leader",                 "displayOrder": 3},
                       {"label": "Workplace Investigator",       "value": "Workplace Investigator",       "displayOrder": 4},
                       {"label": "Compliance/Ethics",            "value": "Compliance/Ethics",            "displayOrder": 5},
@@ -753,7 +757,7 @@ jobs:
                   "jobtitle":              contact["title"],
                   "company":               contact["organization"],
                   "office":                contact.get("division") or contact.get("organization", ""),
-                  "persona":               persona_val,
+                  "ob_persona":            persona_val,
                   "city":                  (contact.get("location") or "").split(",")[0].strip(),
                   "hs_lead_status":        "NEW",
                   "leadsource":            LEADSOURCE_VALUE,

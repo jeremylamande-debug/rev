@@ -517,13 +517,54 @@ jobs:
               "email": "", "phone": ""
             }}
           ]
-          Return ONLY the JSON array starting with [ and ending with ]. No other text."""
-              text = claude(prompt, max_tokens=4000, use_search=True)
+
+          OUTPUT FORMAT — CRITICAL:
+          - Do NOT write any preamble like "Now I have enough data" or "Let me compile the JSON" or "Based on my research"
+          - Do NOT write any commentary, analysis, or summary before or after the JSON
+          - Your ENTIRE response must be ONE JSON array: starts with `[`, ends with `]`, nothing else
+          - The JSON array MUST be complete — do not truncate mid-object. If you only have N solid leads, return N — don't pad.
+          - If you must think, do it silently via web_search calls — do NOT think in your text output"""
+              # 2026-05-29: max_tokens 4000 → 8000 to give the model room
+              # to emit the full JSON array after its (suppressed-but-still-
+              # occurring) research preamble. Same fix applied to Legal agent.
+              text = claude(prompt, max_tokens=8000, use_search=True)
               print(f"    Raw response (first 200 chars): {text[:200]}")
+              # 2026-05-29: brace-depth-aware extraction. Same helper as
+               # Legal agent — walks the string tracking `[`/`]` depth (with
+              # string-quote awareness) and returns the first balanced block.
+              def _clean(t):
+                  return t.replace("```json","").replace("```","").strip()
+              def _extract_balanced(t, open_ch="[", close_ch="]"):
+                  start = t.find(open_ch)
+                  if start < 0:
+                      return None
+                  depth = 0
+                  in_str = False
+                  esc = False
+                  for i in range(start, len(t)):
+                      ch = t[i]
+                      if esc:
+                          esc = False
+                          continue
+                      if ch == "\\":
+                          esc = True
+                          continue
+                      if ch == '"':
+                          in_str = not in_str
+                          continue
+                      if in_str:
+                          continue
+                      if ch == open_ch:
+                          depth += 1
+                      elif ch == close_ch:
+                          depth -= 1
+                          if depth == 0:
+                              return t[start:i+1]
+                  return None
               for attempt in [
-                  lambda t: json.loads(t.strip()),
-                  lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
-                  lambda t: json.loads(t.replace("```json","").replace("```","").strip()[t.replace("```json","").replace("```","").strip().find("["):]),
+                  lambda t: json.loads(_clean(t)),
+                  lambda t: json.loads(_extract_balanced(_clean(t), "[", "]")),
+                  lambda t: json.loads(_clean(t)[_clean(t).find("["):_clean(t).rfind("]")+1]),
               ]:
                   try:
                       result = attempt(text)

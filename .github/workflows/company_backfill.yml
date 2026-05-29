@@ -1,0 +1,270 @@
+name: OB Company Backfill — Associate Company objects on Isabella's Core list
+# ═══════════════════════════════════════════════════════════════════════════
+# One-shot backfill for the Core OB agent (Isabella Simpatico).
+#
+# Problem it fixes:
+#   The Core daily agent (outbound_agent_core.yml) historically wrote a
+#   `company` TEXT property onto each contact but never linked them to a
+#   Company OBJECT, so "Contact → Companies" shows blank in HubSpot. The
+#   daily agent now creates that association going forward; this workflow
+#   backfills the contacts created BEFORE that fix.
+#
+# Scope (Isabella's Core list, NOT all of JL OB):
+#   leadsource = "Claude"
+#   AND lead_source_details = "JL OB"
+#   AND hubspot_owner_id = <Isabella Simpatico>
+#
+# Behavior:
+#   For each in-scope contact, check whether it already has a company
+#   association. If it does NOT, find-or-create the Company object by name
+#   (using the contact's `company` text prop, falling back to `office`) and
+#   attach the default contact↔company association via the v4 API.
+#   Contacts that already have a company association are skipped. Contacts
+#   with no usable company/office string are logged for manual review.
+#
+# Run dry first (dry_run = true, the default) to preview counts, then
+# re-run with dry_run = false to apply — same pattern as persona_backfill.yml.
+# ═══════════════════════════════════════════════════════════════════════════
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (preview changes only, no writes to HubSpot)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+jobs:
+  company-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Backfill company associations on Isabella's Core contacts
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DRY_RUN:         ${{ github.event.inputs.dry_run }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import requests, json, os, time
+
+          HUBSPOT_KEY      = os.environ["HUBSPOT_API_KEY"]
+          SLACK_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
+          DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() == "true"
+          DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob
+          # TODO: swap to Isabella's Slack member ID if you want her @-mentioned
+          SLACK_USER       = "U08JJMM2QSW"
+
+          OWNER_NAME  = "Isabella Simpatico"
+          OWNER_EMAIL = "isabella.simpatico@rev.com"
+          LEADSOURCE_VALUE    = "Claude"
+          LEAD_SOURCE_DETAILS = "JL OB"
+
+          HS_HEADERS    = {"Authorization": f"Bearer {HUBSPOT_KEY}", "Content-Type": "application/json"}
+          SLACK_HEADERS = {"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"}
+
+          def hs_get(path):
+              return requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
+          def hs_post(path, payload):
+              return requests.post(f"https://api.hubapi.com{path}", headers=HS_HEADERS, json=payload)
+
+          mode = "🧪 DRY RUN" if DRY_RUN else "🔧 LIVE RUN"
+          print(f"{mode} — Company backfill for {OWNER_NAME}'s Core list\n")
+
+          # ── Step 1: resolve Isabella's owner id ───────────────────────
+          owners = hs_get("/crm/v3/owners").json().get("results", [])
+          owner_id = None
+          for o in owners:
+              if o.get("email", "").lower() == OWNER_EMAIL.lower():
+                  owner_id = o["id"]; break
+          if not owner_id:
+              for o in owners:
+                  full = f"{o.get('firstName','')} {o.get('lastName','')}".strip()
+                  if full.lower() == OWNER_NAME.lower():
+                      owner_id = o["id"]; break
+          if not owner_id:
+              raise RuntimeError(f"❌ Could not resolve HubSpot owner for {OWNER_NAME} ({OWNER_EMAIL})")
+          print(f"✅ Resolved owner: {OWNER_NAME} → ID {owner_id}\n")
+
+          # ── Step 2: fetch Isabella's JL OB contacts ───────────────────
+          def fetch_core_contacts():
+              contacts = []
+              after    = None
+              page     = 0
+              while True:
+                  page += 1
+                  payload = {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "leadsource",          "operator": "EQ", "value": LEADSOURCE_VALUE},
+                          {"propertyName": "lead_source_details", "operator": "EQ", "value": LEAD_SOURCE_DETAILS},
+                          {"propertyName": "hubspot_owner_id",    "operator": "EQ", "value": str(owner_id)},
+                      ]}],
+                      "properties": ["firstname", "lastname", "email", "company", "office", "jobtitle"],
+                      "limit": 100,
+                  }
+                  if after:
+                      payload["after"] = after
+                  resp_obj = hs_post("/crm/v3/objects/contacts/search", payload)
+                  resp     = resp_obj.json()
+                  if resp_obj.status_code >= 400:
+                      print(f"  ❌ Search failed status={resp_obj.status_code}: {resp_obj.text[:300]}")
+                      break
+                  results = resp.get("results", [])
+                  contacts.extend(results)
+                  print(f"  Page {page}: +{len(results)} (total {len(contacts)})")
+                  after = resp.get("paging", {}).get("next", {}).get("after")
+                  if not after:
+                      break
+                  time.sleep(0.3)
+              return contacts
+
+          print("📋 Fetching contacts...")
+          contacts = fetch_core_contacts()
+          print(f"\n📋 Found {len(contacts)} contacts owned by {OWNER_NAME}.\n")
+
+          # ── Step 3: company find-or-create (cached) ───────────────────
+          _company_cache = {}
+          def find_or_create_company(name):
+              if not name:
+                  return None
+              if name in _company_cache:
+                  return _company_cache[name]
+              cid = None
+              try:
+                  r = hs_post("/crm/v3/objects/companies/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "name", "operator": "EQ", "value": name}
+                      ]}],
+                      "properties": ["name"],
+                      "limit": 1,
+                  }).json()
+                  results = r.get("results", [])
+                  if results:
+                      cid = results[0]["id"]
+              except Exception as e:
+                  print(f"    ⚠️ Company search error ({name}): {e}")
+              created = False
+              if not cid and not DRY_RUN:
+                  try:
+                      resp = hs_post("/crm/v3/objects/companies", {"properties": {"name": name}}).json()
+                      cid = resp.get("id")
+                      created = bool(cid)
+                  except Exception as e:
+                      print(f"    ⚠️ Company create error ({name}): {e}")
+              _company_cache[name] = cid
+              return cid, created
+
+          def has_company_association(contact_id):
+              try:
+                  r = hs_get(f"/crm/v4/objects/contacts/{contact_id}/associations/companies").json()
+                  return len(r.get("results", [])) > 0
+              except Exception as e:
+                  print(f"    ⚠️ Association read error ({contact_id}): {e}")
+                  return False  # treat as missing so it gets attempted
+
+          def associate(contact_id, company_id):
+              try:
+                  r = requests.put(
+                      f"https://api.hubapi.com/crm/v4/objects/contacts/{contact_id}/associations/default/companies/{company_id}",
+                      headers=HS_HEADERS,
+                  )
+                  return r.status_code in (200, 201)
+              except Exception as e:
+                  print(f"    ⚠️ Association write error: {e}")
+                  return False
+
+          # ── Step 4: walk contacts ─────────────────────────────────────
+          already_linked   = 0
+          no_company_str   = 0
+          to_link          = []   # (contact_id, name, label)
+          unmatched_samples = []
+          for c in contacts:
+              cid   = c["id"]
+              props = c.get("properties", {}) or {}
+              # Prefer the parent-org `company` text prop; fall back to `office`.
+              name  = (props.get("company") or "").strip() or (props.get("office") or "").strip()
+              fn    = (props.get("firstname") or "").strip()
+              ln    = (props.get("lastname")  or "").strip()
+              if has_company_association(cid):
+                  already_linked += 1
+                  continue
+              if not name:
+                  no_company_str += 1
+                  if len(unmatched_samples) < 10:
+                      unmatched_samples.append(f"{fn} {ln} — title='{(props.get('jobtitle') or '').strip()}' (no company/office string)")
+                  continue
+              to_link.append((cid, name, f"{fn} {ln}"))
+              time.sleep(0.1)
+
+          print(f"📊 Scan complete:")
+          print(f"   • Already linked to a company: {already_linked}")
+          print(f"   • Missing a company link:      {len(to_link)}")
+          print(f"   • No company/office string:    {no_company_str}")
+          print(f"   • Total scanned:               {len(contacts)}\n")
+
+          # ── Step 5: link (or preview) ─────────────────────────────────
+          linked          = 0
+          create_count    = 0
+          link_err        = 0
+          link_samples    = []
+          if to_link and DRY_RUN:
+              print(f"🧪 DRY RUN — would link {len(to_link)} contacts to company objects. No writes performed.")
+              for cid, name, label in to_link[:10]:
+                  print(f"   • {label} → {name}")
+          elif to_link:
+              print(f"🚀 Linking {len(to_link)} contacts to company objects...")
+              for cid, name, label in to_link:
+                  res = find_or_create_company(name)
+                  company_id, created = (res if res else (None, False))
+                  if created:
+                      create_count += 1
+                  if company_id and associate(cid, company_id):
+                      linked += 1
+                      if len(link_samples) < 8:
+                          link_samples.append(f"{label} → {name}")
+                  else:
+                      link_err += 1
+                      print(f"    ❌ Failed to link {label} → {name}")
+                  time.sleep(0.2)
+              print(f"\n  ✅ Linked {linked} · 🏢 created {create_count} new companies · ❌ {link_err} errors")
+          else:
+              print("✅ Nothing to backfill — every Core contact already has a company association.")
+
+          # ── Step 6: Slack summary ─────────────────────────────────────
+          msg  = f"<@{SLACK_USER}>\n"
+          msg += f"*🏢 OB Company Backfill — {mode}*\n"
+          msg += f"_Scope: `leadsource = Claude AND lead_source_details = JL OB AND owner = {OWNER_NAME}`_\n\n"
+          msg += f"• Contacts scanned: *{len(contacts)}*\n"
+          msg += f"• Already linked: *{already_linked}*\n"
+          msg += f"• Missing a company link: *{len(to_link)}*\n"
+          msg += f"• No company/office string (skipped): *{no_company_str}*\n"
+          if not DRY_RUN:
+              msg += f"• Successfully linked: *{linked}*\n"
+              msg += f"• New company objects created: *{create_count}*\n"
+              if link_err:
+                  msg += f"• Errors: *{link_err}* (see workflow logs)\n"
+              if link_samples:
+                  msg += f"\n*Sample links:*\n"
+                  for s in link_samples:
+                      msg += f"• `{s}`\n"
+          else:
+              msg += f"• _Re-run with `dry_run = false` to apply._\n"
+          if unmatched_samples:
+              msg += f"\n*No company/office string (manual review):*\n"
+              for s in unmatched_samples[:5]:
+                  msg += f"• `{s}`\n"
+
+          try:
+              r = requests.post("https://slack.com/api/chat.postMessage",
+                                headers=SLACK_HEADERS,
+                                json={"channel": DAILY_OB_CHANNEL, "text": msg})
+              if r.json().get("ok"):
+                  print("\n✅ Slack summary posted")
+              else:
+                  print(f"\n⚠️ Slack post failed: {r.json()}")
+          except Exception as e:
+              print(f"\n⚠️ Slack post error: {e}")
+          EOF

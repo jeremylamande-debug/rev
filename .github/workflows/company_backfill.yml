@@ -128,10 +128,12 @@ jobs:
           # ── Step 3: company find-or-create (cached) ───────────────────
           _company_cache = {}
           def find_or_create_company(name):
+              # Always returns a (company_id_or_None, created_bool) tuple so
+              # callers can unpack consistently — including on cache hits.
               if not name:
-                  return None
+                  return None, False
               if name in _company_cache:
-                  return _company_cache[name]
+                  return _company_cache[name], False
               cid = None
               try:
                   r = hs_post("/crm/v3/objects/companies/search", {
@@ -217,8 +219,7 @@ jobs:
           elif to_link:
               print(f"🚀 Linking {len(to_link)} contacts to company objects...")
               for cid, name, label in to_link:
-                  res = find_or_create_company(name)
-                  company_id, created = (res if res else (None, False))
+                  company_id, created = find_or_create_company(name)
                   if created:
                       create_count += 1
                   if company_id and associate(cid, company_id):

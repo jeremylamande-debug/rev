@@ -16,7 +16,8 @@ name: Daily Outbound Agent — Core (HR/ER/Compliance & Workplace Investigations
 #                    Bloomberg, Disney, Kaiser, Walt Disney Co, Paramount,
 #                    Apple, News Corp, Fox, Meta).
 #   Personas (3):    HR/ER Leaders · Workplace Investigators · Compliance/Ethics
-#   Daily volume:    50 leads/day total, MAX 20 leads/company
+#   Daily volume:    25 leads/day total (HR/ER 9 · Workplace Inv 8 ·
+#                    Compliance/Ethics 8), MAX 20 leads/company
 #   Rotation:        1 company at a time as "active". When a company is done
 #                    (saturated via dupes or yield), advance to next.
 #   ICP expansion:   When the seed list is exhausted, ask Claude for 5 more
@@ -68,13 +69,25 @@ jobs:
           # CONFIG — Core (Isabella Simpatico)
           # ═════════════════════════════════════════════════════════════
           # ── Daily lead cap ─────────────────────────────────────────
-          # Per-persona daily cap mirrors the Legal pattern (25/state/day).
-          # With 3 personas active, the agent fills up to 25 of each per run,
-          # for a max total of 75/day. Each persona's cap is independent —
-          # if HR/ER saturates at 25 but Workplace Investigators only finds
-          # 12, we still take all 12; we don't roll over the unused quota.
-          LEADS_PER_PERSONA_PER_DAY = 25
-          MAX_LEADS_PER_COMPANY     = 20  # cap one company's contribution per day
+          # 2026-05-29 (JL): total daily volume capped at 25/day, split as
+          # evenly as possible across the 3 personas (was 25/persona = 75/day).
+          # Per-persona caps are now a dict keyed by persona. Each cap is
+          # independent — if HR/ER saturates at 9 but Workplace Investigators
+          # only finds 5, we take all 5; we don't roll over the unused quota.
+          # The TOTAL_DAILY_CAP (sum below) is also enforced as a hard ceiling.
+          LEADS_PER_PERSONA_PER_DAY = {
+              "HR/ER Leader":           9,
+              "Workplace Investigator": 8,
+              "Compliance/Ethics":      8,
+          }  # → 25/day total
+          # 2026-05-29 (JL): per-company cap raised 20 → 30, and split evenly
+          # across personas so a single company contributes a balanced mix
+          # (~10 per persona) instead of 20 skewed toward whichever persona
+          # filled first. A company is exhausted once it hits 30 total OR every
+          # persona has hit its per-company cap / run dry. This is a LIFETIME
+          # cap per company (accumulated in state across runs), not per-day.
+          MAX_LEADS_PER_COMPANY             = 30  # lifetime cap per company
+          MAX_LEADS_PER_COMPANY_PER_PERSONA = 10  # balanced mix: 10 of each persona
           # ── Owner ─────────────────────────────────────────────────
           OWNER_NAME  = "Isabella Simpatico"
           OWNER_EMAIL = "isabella.simpatico@rev.com"
@@ -244,7 +257,8 @@ jobs:
           print(f"🎯 Active personas ({len(ACTIVE_PERSONAS)}): {ACTIVE_PERSONAS}")
           print(f"📍 Seed companies: {len(SEED_COMPANIES)}")
           print(f"👤 Owner: {OWNER_NAME} ({OWNER_EMAIL})")
-          print(f"📊 Daily cap: {LEADS_PER_PERSONA_PER_DAY}/persona ({MAX_LEADS_PER_COMPANY}/company max) — up to {LEADS_PER_PERSONA_PER_DAY * len(ACTIVE_PERSONAS)} total/day")
+          _cap_str = ", ".join(f"{p}:{LEADS_PER_PERSONA_PER_DAY[p]}" for p in ACTIVE_PERSONAS)
+          print(f"📊 Daily cap: {sum(LEADS_PER_PERSONA_PER_DAY.values())} total/day ({_cap_str}) — {MAX_LEADS_PER_COMPANY}/company max")
           # ═════════════════════════════════════════════════════════════
           # HUBSPOT HELPERS
           # ═════════════════════════════════════════════════════════════
@@ -308,6 +322,14 @@ jobs:
                   ],
               },
           ]
+          # 2026-05-29: PATCH-on-409 pattern. The original code treated
+          # 409 (property already exists) as success, but POST is a NO-OP
+          # when the property exists — HubSpot does NOT merge new enum
+          # options into the existing property. Result: when Legal agent
+          # created `ob_persona` with 3 Legal options, Core's POST returned
+          # 409 and the 3 Core options never got added. Every Core contact
+          # then failed with INVALID_OPTION. Fix: on 409 for an enum
+          # property, follow up with PATCH to sync the full options list.
           for prop in CORE_PROPS:
               try:
                   body = {
@@ -326,10 +348,27 @@ jobs:
                       json=body,
                   )
                   status = r.status_code
-                  if status not in (200, 201, 409):
-                      print(f"  ⚠️ Property create issue ({prop['name']}): {status} {r.text[:120]}")
+                  if status in (200, 201):
+                      print(f"  ✅ Property created: {prop['name']} ({status})")
+                  elif status == 409:
+                      # Property exists. If it's an enumeration, PATCH to
+                      # ensure all expected options are present (HubSpot
+                      # won't merge them via POST).
+                      if prop.get("type") == "enumeration" and "options" in prop:
+                          patch_body = {"options": prop["options"]}
+                          rp = requests.patch(
+                              f"https://api.hubapi.com/crm/v3/properties/contacts/{prop['name']}",
+                              headers=HS_HEADERS,
+                              json=patch_body,
+                          )
+                          if rp.status_code in (200, 201):
+                              print(f"  🔄 Property options synced: {prop['name']} ({rp.status_code}, {len(prop['options'])} values)")
+                          else:
+                              print(f"  ⚠️ Property options sync failed ({prop['name']}): {rp.status_code} {rp.text[:120]}")
+                      else:
+                          print(f"  ✅ Property ready: {prop['name']} (409, no sync needed)")
                   else:
-                      print(f"  ✅ Property ready: {prop['name']} ({status})")
+                      print(f"  ⚠️ Property create issue ({prop['name']}): {status} {r.text[:120]}")
               except Exception as e:
                   print(f"  ⚠️ Property setup error ({prop['name']}): {e}")
           # ═════════════════════════════════════════════════════════════
@@ -375,11 +414,12 @@ jobs:
                   print(f"State save error: {e}")
           def init_state():
               return {
-                  "company":            SEED_COMPANIES[0],
-                  "exhausted":          [],
-                  "company_leads":      {},
-                  "empty_passes":       {},
-                  "zero_lead_attempts": {},
+                  "company":              SEED_COMPANIES[0],
+                  "exhausted":            [],
+                  "company_leads":        {},
+                  "company_persona_leads": {},  # {company: {persona: count}}
+                  "empty_passes":         {},
+                  "zero_lead_attempts":   {},
                   "expanded_companies": [],
               }
           def all_companies(state):
@@ -786,6 +826,63 @@ jobs:
               if any(k in t for k in ("senior manager", "sr. manager", "lead", "principal")):
                   return "Influencer"
               return "End User"
+          # ═════════════════════════════════════════════════════════════
+          # COMPANY ASSOCIATION
+          # 2026-05-29 (JL): contacts were getting a `company` text property
+          # but no link to a Company OBJECT, so "Contact → Companies" showed
+          # blank in HubSpot. find_or_create_company() looks the company up by
+          # exact name, creates it if missing, and caches the id for the run.
+          # associate_contact_to_company() then attaches the default (primary)
+          # contact↔company association via the v4 API.
+          # ═════════════════════════════════════════════════════════════
+          _company_cache = {}
+          def find_or_create_company(name):
+              if not name:
+                  return None
+              if name in _company_cache:
+                  return _company_cache[name]
+              cid = None
+              try:
+                  r = hs_post("/crm/v3/objects/companies/search", {
+                      "filterGroups": [{"filters": [
+                          {"propertyName": "name", "operator": "EQ", "value": name}
+                      ]}],
+                      "properties": ["name"],
+                      "limit": 1,
+                  })
+                  results = r.get("results", [])
+                  if results:
+                      cid = results[0]["id"]
+                      print(f"    🏢 Matched existing company: {name} → {cid}")
+              except Exception as e:
+                  print(f"    ⚠️ Company search error ({name}): {e}")
+              if not cid:
+                  try:
+                      resp = hs_post("/crm/v3/objects/companies", {"properties": {"name": name}})
+                      cid = resp.get("id")
+                      if cid:
+                          print(f"    🏢 Created company: {name} → {cid}")
+                      else:
+                          print(f"    ⚠️ Company create returned no id ({name}): {json.dumps(resp)[:200]}")
+                  except Exception as e:
+                      print(f"    ⚠️ Company create error ({name}): {e}")
+              _company_cache[name] = cid
+              return cid
+          def associate_contact_to_company(contact_id, company_id):
+              if not (contact_id and company_id):
+                  return False
+              try:
+                  r = requests.put(
+                      f"https://api.hubapi.com/crm/v4/objects/contacts/{contact_id}/associations/default/companies/{company_id}",
+                      headers=HS_HEADERS,
+                  )
+                  ok = r.status_code in (200, 201)
+                  if not ok:
+                      print(f"    ⚠️ Association failed ({contact_id}→{company_id}): {r.status_code} {r.text[:120]}")
+                  return ok
+              except Exception as e:
+                  print(f"    ⚠️ Association error: {e}")
+                  return False
           def create_contact(contact, email_body, subject, emails=None, subjects=None):
               emails   = emails   or {}
               subjects = subjects or {}
@@ -824,6 +921,11 @@ jobs:
               if not contact_id:
                   print(f"    ❌ Contact creation failed: {json.dumps(resp)[:300]}")
                   return None
+              # Link the contact to a Company OBJECT (find-or-create by name)
+              # so it shows under "Contact → Companies" in HubSpot.
+              company_id = find_or_create_company(contact.get("organization", ""))
+              if company_id:
+                  associate_contact_to_company(contact_id, company_id)
               note = (
                   f"OUTBOUND EMAIL SEQUENCE (Core — {OWNER_NAME})\n"
                   f"Company: {contact['organization']} | Division: {contact.get('division','-')} | Location: {contact.get('location','-')}\n"
@@ -963,6 +1065,7 @@ jobs:
                   ("company",            SEED_COMPANIES[0]),
                   ("exhausted",          []),
                   ("company_leads",      {}),
+                  ("company_persona_leads", {}),
                   ("empty_passes",       {}),
                   ("zero_lead_attempts", {}),
                   ("expanded_companies", []),
@@ -979,9 +1082,9 @@ jobs:
           # independently. Loop exits when every persona has hit its cap, OR when
           # we've exhausted all companies and can't expand further.
           persona_today = {p: 0 for p in ACTIVE_PERSONAS}
-          TOTAL_DAILY_CAP = LEADS_PER_PERSONA_PER_DAY * len(ACTIVE_PERSONAS)
+          TOTAL_DAILY_CAP = sum(LEADS_PER_PERSONA_PER_DAY.values())
           def all_personas_capped():
-              return all(persona_today[p] >= LEADS_PER_PERSONA_PER_DAY for p in ACTIVE_PERSONAS)
+              return all(persona_today[p] >= LEADS_PER_PERSONA_PER_DAY[p] for p in ACTIVE_PERSONAS)
           while not all_personas_capped() and len(added) < TOTAL_DAILY_CAP:
               company = state.get("company")
               if not company:
@@ -1008,7 +1111,7 @@ jobs:
                   else:
                       state["company"] = company
               print(f"\n{'='*60}")
-              persona_status = ", ".join(f"{p.split('/')[0]}:{persona_today[p]}/{LEADS_PER_PERSONA_PER_DAY}" for p in ACTIVE_PERSONAS)
+              persona_status = ", ".join(f"{p.split('/')[0]}:{persona_today[p]}/{LEADS_PER_PERSONA_PER_DAY[p]}" for p in ACTIVE_PERSONAS)
               print(f"🏢 Company: {company} (today: {persona_status} | total {len(added)})")
               # Per-company state — total leads ever found for this company.
               # When that count hits MAX_LEADS_PER_COMPANY we move on.
@@ -1019,6 +1122,13 @@ jobs:
                       state["exhausted"].append(company)
                   state["company"] = next_company(state)
                   continue
+              # Per-company per-persona counts (lifetime, across runs). Used to
+              # keep each company's mix balanced at MAX_LEADS_PER_COMPANY_PER_PERSONA.
+              cpl = state.setdefault("company_persona_leads", {}).setdefault(company, {})
+              def cpp(persona):
+                  return state["company_persona_leads"].get(company, {}).get(persona, 0)
+              def company_personas_all_capped():
+                  return all(cpp(p) >= MAX_LEADS_PER_COMPANY_PER_PERSONA for p in ACTIVE_PERSONAS)
               # Per-run loop state
               company_new      = 0
               company_skipped  = 0
@@ -1031,17 +1141,24 @@ jobs:
                       break
                   if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
                       break
-                  # Skip this persona if it's already hit its daily 25.
-                  if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY:
-                      print(f"  ⏭️  Skipping {org['type']} — already at {LEADS_PER_PERSONA_PER_DAY}/day cap")
+                  # Skip this persona if it's already hit its daily cap.
+                  if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY[org["type"]]:
+                      print(f"  ⏭️  Skipping {org['type']} — already at {LEADS_PER_PERSONA_PER_DAY[org['type']]}/day cap")
                       continue
-                  print(f"  Searching {org['type']}... ({persona_today[org['type']]}/{LEADS_PER_PERSONA_PER_DAY} so far today)")
+                  # Skip this persona if this COMPANY already has its balanced
+                  # share of this persona (keeps the company mix even).
+                  if cpp(org["type"]) >= MAX_LEADS_PER_COMPANY_PER_PERSONA:
+                      print(f"  ⏭️  Skipping {org['type']} for {company} — already at {MAX_LEADS_PER_COMPANY_PER_PERSONA}/persona company cap")
+                      continue
+                  print(f"  Searching {org['type']}... (today {persona_today[org['type']]}/{LEADS_PER_PERSONA_PER_DAY[org['type']]} · {company} {cpp(org['type'])}/{MAX_LEADS_PER_COMPANY_PER_PERSONA})")
                   org_found_names  = []
                   org_new_this_run = 0
                   for batch_num in range(1, MAX_BATCHES_PER_ORG + 1):
                       if all_personas_capped():
                           break
-                      if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY:
+                      if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY[org["type"]]:
+                          break
+                      if cpp(org["type"]) >= MAX_LEADS_PER_COMPANY_PER_PERSONA:
                           break
                       if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
                           break
@@ -1056,7 +1173,9 @@ jobs:
                           if leads:
                               found_any_leads = True
                           for lead in leads:
-                              if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY:
+                              if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY[org["type"]]:
+                                  break
+                              if cpp(org["type"]) >= MAX_LEADS_PER_COMPANY_PER_PERSONA:
                                   break
                               if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
                                   break
@@ -1097,8 +1216,9 @@ jobs:
                                   batch_new        += 1
                                   persona_today[org["type"]] = persona_today.get(org["type"], 0) + 1
                                   state["company_leads"][company] = state["company_leads"].get(company, 0) + 1
+                                  cpl[org["type"]] = cpl.get(org["type"], 0) + 1
                                   enroll_icon = "📧" if enrolled else "📭"
-                                  print(f"    ✅ Added: {full_name} — {lead.get('title')} {enroll_icon} (persona: {persona_today[org['type']]}/{LEADS_PER_PERSONA_PER_DAY})")
+                                  print(f"    ✅ Added: {full_name} — {lead.get('title')} {enroll_icon} (today {persona_today[org['type']]}/{LEADS_PER_PERSONA_PER_DAY[org['type']]} · {company} {cpl[org['type']]}/{MAX_LEADS_PER_COMPANY_PER_PERSONA})")
                               time.sleep(1)
                       except Exception as e:
                           print(f"    Error: {e}")
@@ -1113,9 +1233,11 @@ jobs:
               if company_new > 0:
                   state.setdefault("empty_passes", {}).pop(company, None)
               # ── Saturation logic ────────────────────────────────
-              # 1) Hit per-company cap → mark exhausted, advance
-              if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
-                  print(f"  ✅ {company} hit {MAX_LEADS_PER_COMPANY}-lead cap — marking exhausted")
+              # 1) Hit per-company cap (total OR every persona maxed) → exhaust
+              if (state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY
+                      or company_personas_all_capped()):
+                  mix = ", ".join(f"{p.split('/')[0]}:{cpp(p)}" for p in ACTIVE_PERSONAS)
+                  print(f"  ✅ {company} balanced-full ({mix}) — marking exhausted")
                   if company not in state["exhausted"]:
                       state["exhausted"].append(company)
                   state["company"] = next_company(state)
@@ -1174,12 +1296,12 @@ jobs:
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — Core — {today_str}*\n"
           msg += f"*{len(added)} new leads added | {skipped} duplicates skipped | {enrolled_count} enrolled in sequence*\n"
-          msg += f"_Owner: {OWNER_NAME} · Personas: {', '.join(ACTIVE_PERSONAS)} · Cap: {LEADS_PER_PERSONA_PER_DAY}/persona/day_\n"
+          msg += f"_Owner: {OWNER_NAME} · Personas: {', '.join(ACTIVE_PERSONAS)} · Cap: {TOTAL_DAILY_CAP}/day total_\n"
           msg += f"_<{CONSOLIDATED_LIST_URL}|View consolidated Core list in HubSpot>_\n\n"
-          msg += f"*Per-persona today (cap {LEADS_PER_PERSONA_PER_DAY} each):*\n"
-          msg += f"• 👔 HR/ER Leader: *{per_persona.get('HR/ER Leader', 0)}/{LEADS_PER_PERSONA_PER_DAY}*\n"
-          msg += f"• 🔍 Workplace Investigator: *{per_persona.get('Workplace Investigator', 0)}/{LEADS_PER_PERSONA_PER_DAY}*\n"
-          msg += f"• ⚖️  Compliance & Ethics Investigations: *{per_persona.get('Compliance/Ethics', 0)}/{LEADS_PER_PERSONA_PER_DAY}*\n\n"
+          msg += f"*Per-persona today (total cap {TOTAL_DAILY_CAP}/day):*\n"
+          msg += f"• 👔 HR/ER Leader: *{per_persona.get('HR/ER Leader', 0)}/{LEADS_PER_PERSONA_PER_DAY['HR/ER Leader']}*\n"
+          msg += f"• 🔍 Workplace Investigator: *{per_persona.get('Workplace Investigator', 0)}/{LEADS_PER_PERSONA_PER_DAY['Workplace Investigator']}*\n"
+          msg += f"• ⚖️  Compliance & Ethics Investigations: *{per_persona.get('Compliance/Ethics', 0)}/{LEADS_PER_PERSONA_PER_DAY['Compliance/Ethics']}*\n\n"
           msg += f"*Active company:* {state.get('company') or '(none — all exhausted)'}\n"
           exhausted_n = len(state.get("exhausted", []))
           total_n     = len(all_companies(state))

@@ -15,9 +15,10 @@ name: Daily Outbound Agent — Core (HR/ER/Compliance & Workplace Investigations
 #                    Target, Marriott, Kroger, Accenture, GE, GE Aerospace,
 #                    Bloomberg, Disney, Kaiser, Walt Disney Co, Paramount,
 #                    Apple, News Corp, Fox, Meta).
-#   Personas (3):    HR/ER Leaders · Workplace Investigators · Compliance/Ethics
-#   Daily volume:    25 leads/day total (HR/ER 9 · Workplace Inv 8 ·
-#                    Compliance/Ethics 8), MAX 20 leads/company
+#   Personas (2):    HR/ER Leaders · Workplace Investigators
+#   Daily volume:    25 leads/day total (HR/ER 13 · Workplace Inv 12),
+#                    MAX 30 leads/company. ICP capped at Manager / Sr
+#                    Manager seniority — no Director / VP / C-suite.
 #   Rotation:        1 company at a time as "active". When a company is done
 #                    (saturated via dupes or yield), advance to next.
 #   ICP expansion:   When the seed list is exhausted, ask Claude for 5 more
@@ -70,15 +71,16 @@ jobs:
           # ═════════════════════════════════════════════════════════════
           # ── Daily lead cap ─────────────────────────────────────────
           # 2026-05-29 (JL): total daily volume capped at 25/day, split as
-          # evenly as possible across the 3 personas (was 25/persona = 75/day).
+          # evenly as possible across the personas (was 25/persona = 75/day).
+          # 2026-05-29 (JL): Compliance/Ethics persona removed — dropped to 2
+          # personas and rebalanced 25/day across them.
           # Per-persona caps are now a dict keyed by persona. Each cap is
-          # independent — if HR/ER saturates at 9 but Workplace Investigators
+          # independent — if HR/ER saturates at 13 but Workplace Investigators
           # only finds 5, we take all 5; we don't roll over the unused quota.
           # The TOTAL_DAILY_CAP (sum below) is also enforced as a hard ceiling.
           LEADS_PER_PERSONA_PER_DAY = {
-              "HR/ER Leader":           9,
-              "Workplace Investigator": 8,
-              "Compliance/Ethics":      8,
+              "HR/ER Leader":           13,
+              "Workplace Investigator": 12,
           }  # → 25/day total
           # 2026-05-29 (JL): per-company cap raised 20 → 30, and split evenly
           # across personas so a single company contributes a balanced mix
@@ -87,7 +89,9 @@ jobs:
           # persona has hit its per-company cap / run dry. This is a LIFETIME
           # cap per company (accumulated in state across runs), not per-day.
           MAX_LEADS_PER_COMPANY             = 30  # lifetime cap per company
-          MAX_LEADS_PER_COMPANY_PER_PERSONA = 10  # balanced mix: 10 of each persona
+          # 2026-05-29 (JL): bumped 10 → 15 after dropping to 2 personas, so the
+          # 30-per-company cap stays reachable with a balanced 15/15 mix.
+          MAX_LEADS_PER_COMPANY_PER_PERSONA = 15  # balanced mix: 15 of each persona
           # ── Owner ─────────────────────────────────────────────────
           OWNER_NAME  = "Isabella Simpatico"
           OWNER_EMAIL = "isabella.simpatico@rev.com"
@@ -156,30 +160,34 @@ jobs:
               "Technology",
           ]
           # ── Active personas ──────────────────────────────────────
-          # 3 personas mirror the Legal agent's 3-persona structure so chart
-          # / email / report code shapes are reusable. The Core titles map to
-          # these buckets.
+          # 2026-05-29 (JL): dropped from 3 to 2 personas — Compliance/Ethics
+          # removed. Chart / email / report code is persona-count-agnostic
+          # (driven by ACTIVE_PERSONAS), so removal is config-only.
           ACTIVE_PERSONAS = [
               "HR/ER Leader",
               "Workplace Investigator",
-              "Compliance/Ethics",
           ]
           # ── Per-persona title lists ──────────────────────────────
           # The agent passes these as search hints to Claude when scraping
           # each company. Add new titles here as you learn what works.
+          # 2026-05-29 (JL): title lists rebuilt from JL's sample-titles list
+          # and capped at MANAGER / SENIOR MANAGER seniority. Director, VP,
+          # Head, Chief, and Officer-level titles were intentionally removed —
+          # senior execs (e.g. a Chief People Officer at Walmart) don't engage
+          # with cold outreach. Investigator-flavored compliance titles were
+          # folded into the Workplace Investigator persona; the standalone
+          # Compliance/Ethics persona was retired.
           ORG_TYPES = [
               {"type": "HR/ER Leader",
                "titles": [
-                   "HR Business Partner", "HRBP",
-                   "Human Resources Manager", "Human Resources Director",
-                   "Senior HR Business Partner", "Sr. HR Business Partner",
                    "Employee Relations Specialist",
                    "Employee Relations Manager",
                    "Senior Employee Relations Manager",
-                   "Director of Employee Relations",
+                   "HR Business Partner", "HRBP",
+                   "Senior HR Business Partner", "Sr. HR Business Partner",
+                   "Human Resources Manager",
+                   "People Operations Manager",
                    "Labor Relations Manager",
-                   "Director of Labor Relations",
-                   "VP People", "VP Human Resources", "Chief People Officer",
                ]},
               {"type": "Workplace Investigator",
                "titles": [
@@ -189,39 +197,13 @@ jobs:
                    "Employee Relations Investigator",
                    "Corporate Investigator",
                    "People Operations Investigator",
-                   "Ethics & Compliance Investigator",
                    "Employee Conduct Investigator",
                    "Workplace Conduct Manager",
-                   "Internal Investigations Manager",
-                   "Director of Workplace Investigations",
-                   "EEO Investigator",
-               ]},
-              {"type": "Compliance/Ethics",
-               # 2026-05-28: pivoted from policy/leadership roles (CCO, VP
-               # Compliance, Ethics Officer) toward INVESTIGATIONS-flavored
-               # compliance roles. The thesis: people who actually run
-               # fraud/SOX/FCPA/ethics investigations have the same
-               # transcription pain as Workplace Investigators (persona 2),
-               # just on the regulatory/financial side. Policy executives
-               # don't sit in the interviews so they're not the right ICP.
-               "titles": [
-                   "Compliance Investigator",
-                   "Corporate Compliance Investigator",
-                   "Senior Compliance Investigator",
-                   "Ethics Investigator",
                    "Ethics & Compliance Investigator",
-                   "Compliance & Ethics Investigator",
-                   "Internal Investigator",
-                   "Fraud Investigator",
-                   "Anti-Corruption Investigator",
-                   "Financial Crimes Investigator",
-                   "SOX Investigator",
-                   "FCPA Investigator",
-                   "Investigations Manager — Compliance",
-                   "Director of Compliance Investigations",
-                   "Ethics & Investigations Lead",
-                   "Head of Internal Investigations",
-                   "Manager, Internal Investigations",
+                   "Corporate Compliance Investigator",
+                   "Compliance Manager",
+                   "Internal Investigations Manager",
+                   "EEO Investigator",
                ]},
           ]
           # ── Persona angles ───────────────────────────────────────
@@ -238,21 +220,12 @@ jobs:
                   "use_case": "investigator-grade transcription of interviews, recordings, and evidence with timestamped speaker labels — ready for the case file",
                   "proof":    "workplace investigations teams using Rev close cases 40% faster and reduce the interview-to-report turnaround from weeks to days",
               },
-              "Compliance/Ethics": {
-                  # 2026-05-28: angle pivoted from policy/audit-readiness to
-                  # active investigations work — fraud, SOX, FCPA, anti-bribery,
-                  # ethics violations. The pain mirrors persona 2 (Workplace
-                  # Investigator) but on the regulatory/financial side.
-                  "pain":     "fraud, SOX, FCPA, and ethics-violation investigations stacking up — every interview, regulator call, and whistleblower follow-up has to be transcribed cleanly and defensibly before the report can be filed, and the volume keeps growing",
-                  "use_case": "investigator-grade transcription of compliance interviews, regulator-facing testimony, fraud allegations, and whistleblower intake — timestamped, speaker-labeled, and audit-ready for chain-of-custody",
-                  "proof":    "internal-investigations teams using Rev cut case turnaround by 40-50% and produce documentation that holds up under regulator or external-counsel review — without paying for outside scribe services",
-              },
+              # 2026-05-29 (JL): Compliance/Ethics persona + angle removed.
           }
           # Dept-map used in note bodies and the chart legend.
           DEPT_MAP = {
               "HR/ER Leader":           "HR / Employee Relations",
               "Workplace Investigator": "Workplace Investigations",
-              "Compliance/Ethics":      "Compliance & Ethics Investigations",
           }
           print(f"🎯 Active personas ({len(ACTIVE_PERSONAS)}): {ACTIVE_PERSONAS}")
           print(f"📍 Seed companies: {len(SEED_COMPANIES)}")
@@ -307,7 +280,7 @@ jobs:
                   # blocking creation of a contact property with that label.
                   "name":        "ob_persona",
                   "label":       "OB Persona",
-                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR/ER Leader / Workplace Investigator / Compliance/Ethics.",
+                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR/ER Leader / Workplace Investigator.",
                   "type":        "enumeration",
                   "fieldType":   "select",
                   "options": [
@@ -318,7 +291,7 @@ jobs:
                       # Core personas
                       {"label": "HR/ER Leader",                 "value": "HR/ER Leader",                 "displayOrder": 3},
                       {"label": "Workplace Investigator",       "value": "Workplace Investigator",       "displayOrder": 4},
-                      {"label": "Compliance/Ethics",            "value": "Compliance/Ethics",            "displayOrder": 5},
+                      # 2026-05-29 (JL): Compliance/Ethics persona retired.
                   ],
               },
           ]
@@ -486,7 +459,7 @@ jobs:
               already = set(all_companies(state))
               prompt = f"""You are a B2B sales-intel analyst. Recommend {k} more US-based companies
           we should prospect into for selling Rev's enterprise transcription software (~$15k-50k/yr) to
-          their HR/Employee Relations, Workplace Investigations, and Compliance/Ethics teams.
+          their HR/Employee Relations and Workplace Investigations teams.
           Constraints:
           - Public or large private companies (5,000+ employees)
           - Industry MUST fall in one of: {", ".join(INDUSTRY_WHITELIST)}
@@ -535,8 +508,11 @@ jobs:
           Find people with these titles (or close variants): {', '.join(titles)}
           Look at official corporate websites, LinkedIn, press releases, leadership pages,
           and public org-chart data. {company} is a large enterprise — find as many real
-          people as possible. Aim for 15-25 contacts including all seniority levels, not
-          just executives.{exclude_str}{batch_str}
+          people as possible. Aim for 15-25 contacts.
+          SENIORITY — IMPORTANT: target individual contributors through Senior Manager
+          level only (Specialists, Coordinators, Analysts, HRBPs, Investigators, Managers,
+          Senior Managers). Do NOT return Directors, Senior Directors, VPs, Heads,
+          Chiefs, or any C-suite — they don't engage with cold outreach.{exclude_str}{batch_str}
           Return a JSON array. Each item must have these exact keys:
           first_name, last_name, title, organization, division, location, org_type, website, linkedin, email, phone
           - `organization` MUST be "{company}" (the parent org)
@@ -1300,8 +1276,7 @@ jobs:
           msg += f"_<{CONSOLIDATED_LIST_URL}|View consolidated Core list in HubSpot>_\n\n"
           msg += f"*Per-persona today (total cap {TOTAL_DAILY_CAP}/day):*\n"
           msg += f"• 👔 HR/ER Leader: *{per_persona.get('HR/ER Leader', 0)}/{LEADS_PER_PERSONA_PER_DAY['HR/ER Leader']}*\n"
-          msg += f"• 🔍 Workplace Investigator: *{per_persona.get('Workplace Investigator', 0)}/{LEADS_PER_PERSONA_PER_DAY['Workplace Investigator']}*\n"
-          msg += f"• ⚖️  Compliance & Ethics Investigations: *{per_persona.get('Compliance/Ethics', 0)}/{LEADS_PER_PERSONA_PER_DAY['Compliance/Ethics']}*\n\n"
+          msg += f"• 🔍 Workplace Investigator: *{per_persona.get('Workplace Investigator', 0)}/{LEADS_PER_PERSONA_PER_DAY['Workplace Investigator']}*\n\n"
           msg += f"*Active company:* {state.get('company') or '(none — all exhausted)'}\n"
           exhausted_n = len(state.get("exhausted", []))
           total_n     = len(all_companies(state))

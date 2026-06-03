@@ -16,6 +16,13 @@ name: Daily Outbound Agent — Core (HR/ER/Compliance & Workplace Investigations
 #                    Bloomberg, Disney, Kaiser, Walt Disney Co, Paramount,
 #                    Apple, News Corp, Fox, Meta).
 #   Personas (2):    HR/ER Leaders · Workplace Investigators
+#                    2026-06-03 (JL): titles re-scoped per colleague feedback —
+#                    err toward Employee-Relations precision over HR-generalist,
+#                    and restrict "investigations" to PEOPLE / EMPLOYEE /
+#                    WORKPLACE investigations only (no corporate / financial /
+#                    fraud / security / ethics-compliance). HR Manager + HRBP are
+#                    kept but function-gated in the find_leads SCOPE block, since
+#                    which title actually runs investigations varies by org.
 #   Daily volume:    25 leads/day total (HR/ER 13 · Workplace Inv 12),
 #                    MAX 30 leads/company. ICP capped at Manager / Sr
 #                    Manager seniority — no Director / VP / C-suite.
@@ -177,32 +184,52 @@ jobs:
           # with cold outreach. Investigator-flavored compliance titles were
           # folded into the Workplace Investigator persona; the standalone
           # Compliance/Ethics persona was retired.
+          # 2026-06-03 (JL): titles re-scoped per colleague feedback (Stephen
+          # Kerner thread). Two principles:
+          #   1) Err toward EMPLOYEE RELATIONS precision over HR-generalist.
+          #      HR Manager / HRBP stay because they often oversee or run
+          #      investigations — but they're function-gated in the find_leads
+          #      prompt (only counted when their role actually covers ER cases /
+          #      workplace investigations). Pure-generalist titles (e.g. People
+          #      Operations Manager) were dropped.
+          #   2) Investigations must be PEOPLE / EMPLOYEE / WORKPLACE
+          #      investigations — NOT corporate/financial/fraud/security/ethics-
+          #      compliance. Titles that bleed into corporate-investigation land
+          #      (Corporate Investigator, Ethics & Compliance Investigator,
+          #      Corporate Compliance Investigator, Compliance Manager, bare
+          #      Internal Investigations Manager) were removed. The find_leads
+          #      SCOPE block enforces this by function, since titles vary by org
+          #      (e.g. at FedEx an "Employee Relations Specialist" runs employee
+          #      incident investigations; elsewhere an HRBP might).
           ORG_TYPES = [
               {"type": "HR/ER Leader",
                "titles": [
                    "Employee Relations Specialist",
+                   "Senior Employee Relations Specialist",
                    "Employee Relations Manager",
                    "Senior Employee Relations Manager",
+                   "Employee Relations Partner",
+                   "Employee Relations Consultant",
+                   "Employee Relations Advisor",
+                   "Human Resources Manager",
+                   "HR Manager",
                    "HR Business Partner", "HRBP",
                    "Senior HR Business Partner", "Sr. HR Business Partner",
-                   "Human Resources Manager",
-                   "People Operations Manager",
                    "Labor Relations Manager",
                ]},
               {"type": "Workplace Investigator",
                "titles": [
                    "Workplace Investigator",
                    "Senior Workplace Investigator",
-                   "HR Investigator",
+                   "Workplace Investigations Manager",
                    "Employee Relations Investigator",
-                   "Corporate Investigator",
+                   "Employee Relations Investigations Manager",
+                   "HR Investigator",
                    "People Operations Investigator",
                    "Employee Conduct Investigator",
                    "Workplace Conduct Manager",
-                   "Ethics & Compliance Investigator",
-                   "Corporate Compliance Investigator",
-                   "Compliance Manager",
-                   "Internal Investigations Manager",
+                   "Misconduct Investigator",
+                   "Harassment & Discrimination Investigator",
                    "EEO Investigator",
                ]},
           ]
@@ -509,6 +536,28 @@ jobs:
           Look at official corporate websites, LinkedIn, press releases, leadership pages,
           and public org-chart data. {company} is a large enterprise — find as many real
           people as possible. Aim for 15-25 contacts.
+          SCOPE — CRITICAL (judge by what the person actually DOES, not the title text):
+          We ONLY want people whose real work is EMPLOYEE RELATIONS and PEOPLE /
+          EMPLOYEE / WORKPLACE INVESTIGATIONS — workplace misconduct, harassment,
+          discrimination, retaliation, EEO, policy violations, and employee
+          complaints/grievances. Titles for this work vary a lot by company, so
+          use the title only as a hint and confirm the function:
+          - At some orgs an "Employee Relations Specialist" runs the workplace
+            investigations; at others an "HR Business Partner" or "HR Manager"
+            does, or they manage the people who do. Include HR Manager / HRBP
+            ONLY when their role clearly covers ER cases or workplace
+            investigations — not generic HR generalists (benefits, recruiting,
+            onboarding, comp, HRIS).
+          - Prefer Employee-Relations-specific roles over broad HR-generalist roles.
+          EXCLUDE — do NOT return people who run NON-people investigations, even if
+          their title contains "Investigator", "Investigations", or "Compliance":
+          - Corporate / financial / fraud investigations, internal audit, SIU
+          - Security, loss prevention, asset protection, physical/cyber security
+          - Regulatory, ethics-hotline, or compliance investigations that are
+            financial or business-conduct (not employee-conduct) in nature
+          - Claims, insurance, or background-check investigators
+          If you cannot confirm a person's work is employee/people/workplace-
+          focused, leave them out.
           SENIORITY — IMPORTANT: target individual contributors through Senior Manager
           level only (Specialists, Coordinators, Analysts, HRBPs, Investigators, Managers,
           Senior Managers). Do NOT return Directors, Senior Directors, VPs, Heads,

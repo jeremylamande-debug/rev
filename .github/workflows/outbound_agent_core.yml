@@ -108,8 +108,10 @@ jobs:
           # AND hubspot_owner_id=<Isabella>) and paste the list view URL here
           CONSOLIDATED_LIST_URL = f"https://app.hubspot.com/contacts/{PORTAL_ID}/objects/0-1/views/REPLACE_ME_CORE_LIST_ID/list"
           # ── Slack ─────────────────────────────────────────────────
-          # TODO_CORE: confirm Isabella's Slack member ID (right-click profile → View profile → ⋮ → Copy member ID)
-          SLACK_USER       = "REPLACE_ME_ISABELLA_SLACK_USER_ID"
+          # 2026-06-03 (JL): tag JL on the Core summary (same member ID the Legal
+          # agent uses) instead of Isabella — the Isabella placeholder was never
+          # filled, so the mention rendered as literal text. Owner stays Isabella.
+          SLACK_USER       = "U08JJMM2QSW"  # Jeremy Lamande
           DAILY_OB_CHANNEL = "C0AQFHD6Q4F"  # #daily-ob (same as Legal — change if Core gets its own channel)
           # ── HubSpot sequence ──────────────────────────────────────
           # TODO_CORE: create a 4-email sequence in HubSpot for Isabella and paste the numeric sequence ID

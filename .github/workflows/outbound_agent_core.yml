@@ -141,7 +141,6 @@ jobs:
               "Accenture",
               "General Electric",
               "GE Aerospace",
-              "Bloomberg",
               "Disney",
               "Kaiser Permanente",
               "The Walt Disney Company",
@@ -151,6 +150,35 @@ jobs:
               "Fox Corporation",
               "Meta",
           ]
+          # ── Exclusion list — NEVER outbound (JL 2026-06-11) ──────────
+          # Companies we must never prospect into: current customers / deep
+          # existing relationships. Matching is case-insensitive SUBSTRING on
+          # the company name, so subsidiaries that carry the parent's name are
+          # caught automatically (e.g. "Bloomberg Industry Group",
+          # "Bloomberg Law", "Bloomberg BNA", "Bloomberg Government",
+          # "Bloomberg Tax", "Bloomberg Media").
+          #   EXCLUDED_NAME_TOKENS    → substring match on the company name.
+          #   EXCLUDED_EMAIL_DOMAINS  → backstop: drop any individual lead
+          #                             whose email sits on one of these
+          #                             domains, even if a differently-named
+          #                             subsidiary slipped past the name check.
+          # To exclude another account in future, add a lowercase token here.
+          EXCLUDED_NAME_TOKENS = [
+              "bloomberg",            # Bloomberg L.P. + all subsidiaries — current customer
+          ]
+          EXCLUDED_EMAIL_DOMAINS = [
+              "bloomberg.com",
+              "bloomberg.net",
+              "bloombergindustry.com",
+              "bgov.com",
+              "bna.com",
+          ]
+          def is_excluded_company(name):
+              n = (name or "").strip().lower()
+              return any(tok in n for tok in EXCLUDED_NAME_TOKENS)
+          def is_excluded_email(email):
+              e = (email or "").strip().lower()
+              return any(e.endswith("@" + d) or e.endswith("." + d) for d in EXCLUDED_EMAIL_DOMAINS)
           # ── Industry whitelist ───────────────────────────────────
           # Used for the ICP-expansion step. We tell Claude to find similar
           # companies whose HubSpot Industry Group falls into one of these.
@@ -241,8 +269,8 @@ jobs:
           PERSONA_ANGLES = {
               "HR/ER Leader": {
                   "pain":     "documenting employee relations meetings, performance conversations, and exit interviews by hand while juggling 30+ active cases",
-                  "use_case": "auto-transcription of ER intake calls, performance reviews, and HR meeting notes so the case file writes itself",
-                  "proof":    "HR teams using Rev cut documentation time per case by 50% and free up enough capacity to take on more headcount investigations without growing the team",
+                  "use_case": "auto-transcription of employee conversations, performance reviews, and HR meeting notes. Rev transcribes them automatically with speaker labels, so the documentation for each case file mostly writes itself",
+                  "proof":    "the biggest thing HR people tell us is that they can finally focus on the conversation instead of taking notes. On top of that, teams using Rev cut documentation time per case by about half, freeing up real capacity without adding headcount",
               },
               "Workplace Investigator": {
                   "pain":     "hours of witness interviews, complainant statements, and respondent testimony that all have to be transcribed manually before the report can be written",
@@ -251,6 +279,15 @@ jobs:
               },
               # 2026-05-29 (JL): Compliance/Ethics persona + angle removed.
           }
+          # ── Copy guidance (JL 2026-06-09) ─────────────────────────
+          # Wording + emphasis rules baked into every generated email & subject.
+          # Lead benefit: HR people get to focus on the conversation, not notes.
+          COPY_GUIDE = (
+              "Wording and emphasis rules: "
+              "lead with the benefit that HR people can focus on the conversation instead of taking notes "
+              "(Rev transcribes automatically with speaker labels, so the documentation for each case file mostly writes itself). "
+              "Say 'investigation' not 'care'. Say 'employee conversation' not 'intake call'. Use 'HR' not 'ER'."
+          )
           # Dept-map used in note bodies and the chart legend.
           DEPT_MAP = {
               "HR/ER Leader":           "HR / Employee Relations",
@@ -425,8 +462,11 @@ jobs:
                   "expanded_companies": [],
               }
           def all_companies(state):
-              """Seed list + any expansion picks. Order: seed first, then expansion."""
-              return SEED_COMPANIES + state.get("expanded_companies", [])
+              """Seed list + any expansion picks. Order: seed first, then expansion.
+              Excluded companies (current customers, e.g. Bloomberg) are filtered
+              out here so the rotation can never select them."""
+              combined = SEED_COMPANIES + state.get("expanded_companies", [])
+              return [c for c in combined if not is_excluded_company(c)]
           def next_company(state, skip=None):
               exhausted_self = set(state.get("exhausted", []))
               skip_set = {skip} if skip else set()
@@ -494,6 +534,10 @@ jobs:
           - Industry MUST fall in one of: {", ".join(INDUSTRY_WHITELIST)}
           - DO NOT include Legal services firms, Government agencies, or Law Enforcement
             (those are handled by a separate agent)
+          - DO NOT recommend Bloomberg or ANY Bloomberg subsidiary / affiliate
+            (Bloomberg L.P., Bloomberg Industry Group, Bloomberg Law, Bloomberg BNA,
+            Bloomberg Government, Bloomberg Tax, Bloomberg Media) — they are an
+            existing customer and must never be outbounded
           - Must have a known internal HR / Employee Relations / Investigations function
           - DO NOT recommend any of these already-prospected companies: {", ".join(sorted(already))}
           Return ONLY a JSON array of {k} company names (strings), nothing else.
@@ -507,8 +551,11 @@ jobs:
                       try:
                           result = attempt(raw)
                           if isinstance(result, list):
-                              # De-dupe + drop empties + drop any that snuck through
-                              clean = [c.strip() for c in result if isinstance(c, str) and c.strip() and c.strip() not in already]
+                              # De-dupe + drop empties + drop already-known + drop excluded
+                              clean = [c.strip() for c in result
+                                       if isinstance(c, str) and c.strip()
+                                       and c.strip() not in already
+                                       and not is_excluded_company(c)]
                               return clean[:k]
                       except Exception:
                           continue
@@ -786,6 +833,7 @@ jobs:
           - Reference Rev's value in plain language (no marketing-speak)
           - Close with a CTA: ask if they'd be open to a 15-min call; include the meeting link
           - NO em dashes (—) or en dashes (–). Use periods or commas instead
+          - {COPY_GUIDE}
           - Return raw HTML body only. No "Subject:" line. No signature block.""", max_tokens=600), first_name)
               emails["email_2"] = clean_email_body(claude(f"""Write cold outreach Email 2 of 4 (follow-up). Sent 4 days after Email 1.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Proof: {angles['proof']}. Meeting link: {MEETING_LINK}
@@ -795,6 +843,7 @@ jobs:
           - 80-100 words, follow-up tone — acknowledge they probably didn't see Email 1
           - Lead with the proof point ({angles['proof']}) — make it concrete
           - End with a low-commitment CTA: "open to a 15-min look?" and include the meeting link
+          - {COPY_GUIDE}
           - NO em/en dashes. Raw HTML body only.""", max_tokens=500), first_name)
               emails["email_3"] = clean_email_body(claude(f"""Write cold outreach Email 3 of 4. Sent 7 days after Email 2.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
@@ -805,6 +854,7 @@ jobs:
           - Short, direct, value-forward
           - Reference a peer company in the same vertical (without naming a specific one) that's seen results
           - End with the meeting link CTA
+          - {COPY_GUIDE}
           - NO em/en dashes. Raw HTML body only.""", max_tokens=400), first_name)
               emails["email_4"] = clean_email_body(claude(f"""Write cold outreach Email 4 of 4 — the breakup email. Sent 10 days after Email 3.
           Recipient: {name} at {loc_str}. Meeting link: {MEETING_LINK}
@@ -814,6 +864,7 @@ jobs:
           - 40-60 words
           - Polite breakup — "I'll stop reaching out unless you'd like to chat"
           - Include the meeting link one last time
+          - {COPY_GUIDE}
           - NO em/en dashes. Raw HTML body only.""", max_tokens=300), first_name)
               return emails
           def gen_subject(contact, idx):
@@ -1099,6 +1150,15 @@ jobs:
               ):
                   if k not in state:
                       state[k] = default
+          # ── Scrub excluded companies from loaded state (JL 2026-06-11) ──
+          # Bloomberg was a seed company, so the persisted state may still have
+          # it as the active company or in the expansion list. Drop it so the
+          # agent never resumes outbound against an excluded account.
+          _before_exp = state.get("expanded_companies", [])
+          state["expanded_companies"] = [c for c in _before_exp if not is_excluded_company(c)]
+          if is_excluded_company(state.get("company") or ""):
+              print(f"🚫 Active company {state.get('company')!r} is on the exclusion list — advancing to next eligible company")
+              state["company"] = next_company(state)
           # ═════════════════════════════════════════════════════════════
           # MAIN LOOP — fill the per-persona caps, rotating companies as we go
           # ═════════════════════════════════════════════════════════════
@@ -1213,6 +1273,12 @@ jobs:
                                   continue
                               full_name = f"{fn} {ln}"
                               org_found_names.append(full_name)
+                              # Backstop: never push a lead on an excluded email
+                              # domain (e.g. a Bloomberg subsidiary with a
+                              # differently-spelled name that slipped the company check).
+                              if is_excluded_email(lead.get("email", "")):
+                                  print(f"    🚫 Skipping {full_name} — excluded email domain ({lead.get('email','')})")
+                                  continue
                               if is_duplicate(lead.get("email", ""), fn, ln):
                                   company_skipped += 1
                                   skipped         += 1

@@ -1172,7 +1172,24 @@ jobs:
           TOTAL_DAILY_CAP = sum(LEADS_PER_PERSONA_PER_DAY.values())
           def all_personas_capped():
               return all(persona_today[p] >= LEADS_PER_PERSONA_PER_DAY[p] for p in ACTIVE_PERSONAS)
+          # ── Wall-clock budget — graceful exit (JL 2026-06-11) ────────
+          # GitHub hard-cancels the job at 90 min (timeout-minutes: 52). A hard
+          # cancel kills us mid-batch BEFORE save_state/Slack run, so progress is
+          # lost and contacts already pushed aren't recorded in state. To avoid
+          # that, the main loop self-exits at RUN_BUDGET_SECONDS (default 75 min)
+          # — comfortably under the 90-min ceiling — then falls through to the
+          # normal save_state + Slack summary. Overridable via env if needed.
+          RUN_BUDGET_SECONDS = int(os.environ.get("RUN_BUDGET_SECONDS", str(75 * 60)))
+          RUN_DEADLINE       = time.monotonic() + RUN_BUDGET_SECONDS
+          hit_time_budget    = False
+          def time_budget_exceeded():
+              return time.monotonic() >= RUN_DEADLINE
+          print(f"⏱️  Run budget: {RUN_BUDGET_SECONDS // 60} min (graceful exit before GitHub's 90-min cancel)")
           while not all_personas_capped() and len(added) < TOTAL_DAILY_CAP:
+              if time_budget_exceeded():
+                  hit_time_budget = True
+                  print(f"⏰ Time budget ({RUN_BUDGET_SECONDS // 60} min) reached — exiting main loop to save state + post summary. Resumes from {state.get('company')!r} next run.")
+                  break
               company = state.get("company")
               if not company:
                   # Try to advance to a non-exhausted company
@@ -1224,6 +1241,9 @@ jobs:
               MAX_EMPTY_PASSES    = 3
               ZERO_LEAD_MAX_RUNS  = 3
               for org in ORG_TYPES:
+                  if time_budget_exceeded():
+                      hit_time_budget = True
+                      break
                   if all_personas_capped():
                       break
                   if state["company_leads"].get(company, 0) >= MAX_LEADS_PER_COMPANY:
@@ -1241,6 +1261,9 @@ jobs:
                   org_found_names  = []
                   org_new_this_run = 0
                   for batch_num in range(1, MAX_BATCHES_PER_ORG + 1):
+                      if time_budget_exceeded():
+                          hit_time_budget = True
+                          break
                       if all_personas_capped():
                           break
                       if persona_today[org["type"]] >= LEADS_PER_PERSONA_PER_DAY[org["type"]]:
@@ -1398,6 +1421,8 @@ jobs:
           exhausted_n = len(state.get("exhausted", []))
           total_n     = len(all_companies(state))
           msg += f"*Progress:* {exhausted_n}/{total_n} companies exhausted\n"
+          if hit_time_budget:
+              msg += f"_⏰ Note: exited early on the {RUN_BUDGET_SECONDS // 60}-min run budget (likely slow/degraded API). State saved — resumes from {state.get('company')!r} next run._\n"
           # Sample of today's leads (first 8)
           if added:
               msg += "\n*Sample leads:*\n"

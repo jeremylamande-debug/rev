@@ -768,9 +768,34 @@ jobs:
           def clean_email_body(text, first_name=None):
               if not text:
                   return text
+              # 2026-06-11 (JL): robustness pass on model output. Sonnet
+              # intermittently (a) wraps the whole body in a ```html ... ```
+              # markdown code fence, (b) emits the meeting link as a markdown
+              # link [my calendar](url), (c) bolds text with **...**, and
+              # (d) separates paragraphs with blank lines (\n\n). The old
+              # cleaner ran .replace("\n","") BEFORE stripping fences, which
+              # produced the "```htmlHi Josephina," artifact + a duplicated
+              # greeting (the fence prefix dodged the greeting check), collapsed
+              # every email into one wall-of-text paragraph, and left raw
+              # markdown in the body. Order matters: strip fences and convert
+              # markdown FIRST, turn paragraph breaks into <br><br>, THEN drop
+              # the remaining stray newlines.
+              # 0) Strip markdown code fences (```html, ```python, bare ```)
+              text = re.sub(r'```[a-zA-Z]*', '', text)
+              text = text.replace('```', '')
               lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
               cleaned = "\n".join(lines).strip()
-              cleaned = cleaned.replace("\n", "")
+              # 1) Markdown link  [text](url) -> <a href="url">text</a>
+              cleaned = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)', r'<a href="\2">\1</a>', cleaned)
+              # 2) Strip markdown emphasis (**bold**, __bold__, *italic*)
+              cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
+              cleaned = re.sub(r'__([^_]+)__', r'\1', cleaned)
+              cleaned = re.sub(r'(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)', r'\1', cleaned)
+              # 3) Preserve paragraph breaks: blank line -> <br><br>; a lone
+              #    newline -> single space so wrapped lines re-flow cleanly.
+              cleaned = re.sub(r'\n[ \t]*\n+', '<br><br>', cleaned)
+              cleaned = re.sub(r'\n', ' ', cleaned)
+              cleaned = re.sub(r'  +', ' ', cleaned)
               cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
               cleaned = re.sub(r'^(Hi\s+[^,<]{1,40},)(?!\s*<br)\s*', r'\1<br><br>', cleaned, flags=re.IGNORECASE)
               if first_name:
@@ -808,7 +833,11 @@ jobs:
                   body += f' Grab a time on <a href="{MEETING_LINK}">my calendar</a>.'
                   cleaned = body
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
-              return cleaned + '<br>'
+              # 2026-06-11 (JL): end every body with a blank line (<br><br>)
+              # before HubSpot appends the signature, so all 4 emails have
+              # consistent breathing room above "Jeremy Lamande / phone"
+              # (was a single <br>, which read as cramped on emails 2-4).
+              return cleaned + '<br><br>'
           # ═════════════════════════════════════════════════════════════
           # EMAIL SEQUENCE — 4 cold-email bodies + subjects per persona
           # ═════════════════════════════════════════════════════════════
@@ -834,6 +863,7 @@ jobs:
           - Close with a CTA: ask if they'd be open to a 15-min call; include the meeting link
           - NO em dashes (—) or en dashes (–). Use periods or commas instead
           - {COPY_GUIDE}
+          - Output PLAIN HTML only: NEVER use markdown — no triple-backtick code fences, no ** for bold, no [text](url) links. Separate paragraphs with <br><br>. Write the CTA link as <a href="{MEETING_LINK}">my calendar</a>.
           - Return raw HTML body only. No "Subject:" line. No signature block.""", max_tokens=600), first_name)
               emails["email_2"] = clean_email_body(claude(f"""Write cold outreach Email 2 of 4 (follow-up). Sent 4 days after Email 1.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Proof: {angles['proof']}. Meeting link: {MEETING_LINK}
@@ -844,7 +874,7 @@ jobs:
           - Lead with the proof point ({angles['proof']}) — make it concrete
           - End with a low-commitment CTA: "open to a 15-min look?" and include the meeting link
           - {COPY_GUIDE}
-          - NO em/en dashes. Raw HTML body only.""", max_tokens=500), first_name)
+          - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=500), first_name)
               emails["email_3"] = clean_email_body(claude(f"""Write cold outreach Email 3 of 4. Sent 7 days after Email 2.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
@@ -855,7 +885,7 @@ jobs:
           - Reference a peer company in the same vertical (without naming a specific one) that's seen results
           - End with the meeting link CTA
           - {COPY_GUIDE}
-          - NO em/en dashes. Raw HTML body only.""", max_tokens=400), first_name)
+          - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=400), first_name)
               emails["email_4"] = clean_email_body(claude(f"""Write cold outreach Email 4 of 4 — the breakup email. Sent 10 days after Email 3.
           Recipient: {name} at {loc_str}. Meeting link: {MEETING_LINK}
           Rules:
@@ -865,19 +895,28 @@ jobs:
           - Polite breakup — "I'll stop reaching out unless you'd like to chat"
           - Include the meeting link one last time
           - {COPY_GUIDE}
-          - NO em/en dashes. Raw HTML body only.""", max_tokens=300), first_name)
+          - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=300), first_name)
               return emails
           def gen_subject(contact, idx):
               org_type = contact.get("org_type", "HR/ER Leader")
               angles   = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
+              # 2026-06-11 (JL): every subject prompt now forbids markdown — the
+              # model was wrapping subjects in **bold** asterisks that rendered
+              # literally in HubSpot (e.g. "**Transcription Tips for Investigators**").
+              NO_FMT = " Return ONLY the plain-text subject line: no markdown, no asterisks, no bold, no quotes, no emoji, no em dashes."
               prompts = {
-                  1: f"Write a cold-email subject line (≤8 words) for {contact['title']} about {angles['use_case']}. No emoji, no clickbait, no em dashes.",
-                  2: f"Write a follow-up subject line (≤6 words) referencing {angles['proof']}. Plain language. No emoji.",
-                  3: f"Write a short subject line (≤5 words) about transcription for {org_type}s. No emoji.",
-                  4: f"Write a breakup subject line (≤4 words). Polite, no emoji.",
+                  1: f"Write a cold-email subject line (≤8 words) for {contact['title']} about {angles['use_case']}. No clickbait.{NO_FMT}",
+                  2: f"Write a follow-up subject line (≤6 words) referencing {angles['proof']}. Plain language.{NO_FMT}",
+                  3: f"Write a short subject line (≤5 words) about transcription for {org_type}s.{NO_FMT}",
+                  4: f"Write a breakup subject line (≤4 words). Polite.{NO_FMT}",
               }
               raw = claude(prompts[idx], max_tokens=80)
-              return raw.strip().strip('"').strip("'")[:80]
+              # Strip any markdown the model still slips in, plus wrapping quotes.
+              raw = re.sub(r'```[a-zA-Z]*', '', raw).replace('```', '')
+              raw = raw.replace('*', '').replace('`', '').replace('_', '')
+              raw = re.sub(r'^\s*#+\s*', '', raw)
+              raw = raw.strip().strip('"').strip("'").strip()
+              return raw[:80]
           # ═════════════════════════════════════════════════════════════
           # CREATE CONTACT — pushes to HubSpot
           # ═════════════════════════════════════════════════════════════

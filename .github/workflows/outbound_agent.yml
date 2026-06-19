@@ -146,7 +146,7 @@ jobs:
               {"type": "District Attorney",
                "titles": ["District Attorney", "First Assistant DA", "Chief Assistant DA", "Deputy District Attorney", "Chief Investigator", "Senior Investigator", "Investigator"],
                "fallback_titles": ["District Attorney", "First Assistant DA", "Chief Assistant DA", "Assistant District Attorney", "Deputy District Attorney", "Chief Investigator", "Senior Investigator", "Investigator"]},
-              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender", "Staff Attorney", "Trial Attorney", "Supervising Attorney"]},
+              {"type": "Public Defender",   "titles": ["Public Defender", "Chief Public Defender", "Chief Deputy Public Defender", "Assistant Public Defender", "Deputy Public Defender", "Staff Attorney", "Supervising Attorney"]},
               {"type": "Police/Sheriff Investigators",
                "titles": [
                    # Command

@@ -477,14 +477,14 @@ jobs:
           # ═════════════════════════════════════════════════════════════
           # CLAUDE HELPER — identical retry/backoff to the Legal agent
           # ═════════════════════════════════════════════════════════════
-          def claude(prompt, max_tokens=1000, use_search=False, max_retries=4):
+          def claude(prompt, max_tokens=1000, use_search=False, max_retries=4, model="claude-sonnet-4-6"):
               body = {
-                  "model":      "claude-sonnet-4-6",
+                  "model": model,
                   "max_tokens": max_tokens,
                   "messages":   [{"role": "user", "content": prompt}],
               }
               if use_search:
-                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
               last_err = None
               for attempt in range(max_retries):
                   try:
@@ -841,6 +841,10 @@ jobs:
           # ═════════════════════════════════════════════════════════════
           # EMAIL SEQUENCE — 4 cold-email bodies + subjects per persona
           # ═════════════════════════════════════════════════════════════
+          def claude_copy(prompt, max_tokens=400):
+              # Cost optimization (2026-06-22, JL): email/subject copy does not
+              # need Sonnet. Route these calls to Haiku (~1/3 the price).
+              return claude(prompt, max_tokens=max_tokens, model="claude-haiku-4-5")
           def gen_email_sequence(contact):
               org_type   = contact.get("org_type", "HR/ER Leader")
               angles     = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
@@ -851,7 +855,7 @@ jobs:
               loc        = contact.get("location", "")
               loc_str    = f"{org}" + (f" ({division})" if division else "") + (f" — {loc}" if loc else "")
               emails     = {}
-              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {loc_str}.
+              emails["email_1"] = clean_email_body(claude_copy(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {loc_str}.
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
@@ -865,7 +869,7 @@ jobs:
           - {COPY_GUIDE}
           - Output PLAIN HTML only: NEVER use markdown — no triple-backtick code fences, no ** for bold, no [text](url) links. Separate paragraphs with <br><br>. Write the CTA link as <a href="{MEETING_LINK}">my calendar</a>.
           - Return raw HTML body only. No "Subject:" line. No signature block.""", max_tokens=600), first_name)
-              emails["email_2"] = clean_email_body(claude(f"""Write cold outreach Email 2 of 4 (follow-up). Sent 4 days after Email 1.
+              emails["email_2"] = clean_email_body(claude_copy(f"""Write cold outreach Email 2 of 4 (follow-up). Sent 4 days after Email 1.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Proof: {angles['proof']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly: Hi {first_name},
@@ -875,7 +879,7 @@ jobs:
           - End with a low-commitment CTA: "open to a 15-min look?" and include the meeting link
           - {COPY_GUIDE}
           - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=500), first_name)
-              emails["email_3"] = clean_email_body(claude(f"""Write cold outreach Email 3 of 4. Sent 7 days after Email 2.
+              emails["email_3"] = clean_email_body(claude_copy(f"""Write cold outreach Email 3 of 4. Sent 7 days after Email 2.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly: Hi {first_name},
@@ -886,7 +890,7 @@ jobs:
           - End with the meeting link CTA
           - {COPY_GUIDE}
           - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=400), first_name)
-              emails["email_4"] = clean_email_body(claude(f"""Write cold outreach Email 4 of 4 — the breakup email. Sent 10 days after Email 3.
+              emails["email_4"] = clean_email_body(claude_copy(f"""Write cold outreach Email 4 of 4 — the breakup email. Sent 10 days after Email 3.
           Recipient: {name} at {loc_str}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly: Hi {first_name},
@@ -910,7 +914,7 @@ jobs:
                   3: f"Write a short subject line (≤5 words) about transcription for {org_type}s.{NO_FMT}",
                   4: f"Write a breakup subject line (≤4 words). Polite.{NO_FMT}",
               }
-              raw = claude(prompts[idx], max_tokens=80)
+              raw = claude_copy(prompts[idx], max_tokens=80)
               # Strip any markdown the model still slips in, plus wrapping quotes.
               raw = re.sub(r'```[a-zA-Z]*', '', raw).replace('```', '')
               raw = raw.replace('*', '').replace('`', '').replace('_', '')

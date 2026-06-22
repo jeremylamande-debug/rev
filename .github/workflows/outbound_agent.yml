@@ -393,7 +393,7 @@ jobs:
               return upcoming[:n]
           # ── County scoring (will populate via Claude API on first run) ──
           SCORE_MARKER   = "COUNTY_SCORE_STATE_V3_NYMA"  # bumped from V2 — large-counties expansion 2026-05-25 (forces re-score of all 44 counties so new NY/MA large counties get full signal data)
-          SCORE_MAX_DAYS = 7
+          SCORE_MAX_DAYS = 30  # 2026-06-22 (JL): monthly re-score (was weekly) — county signals barely move
           # No seed scores for NY/MA — Claude API will score on first run and cache.
           # CA seed scores preserved in dormant block below.
           def load_county_scores():
@@ -515,7 +515,7 @@ jobs:
                   "messages": [{"role": "user", "content": prompt}]
               }
               if use_search:
-                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
               resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
               return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()

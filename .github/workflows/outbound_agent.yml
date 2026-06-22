@@ -28,17 +28,26 @@ jobs:
           GIST_ID       = os.environ.get("GIST_ID", "")
           PORTAL_ID     = "21451281"
           # ════════════════════════════════════════════════════════════
-          # ACTIVE CONFIG — NY & MA Law Enforcement (Mike Merritts only)
-          # Pivoted from CA on 2026-05-20. Full CA block preserved
-          # commented-out below for instant revival when you ask.
+          # ACTIVE CONFIG — Legal Outbound Agent (Mike Merritts)
+          # 2026-06-22 (JL): unified region toggle. The agent runs ONLY the
+          # states listed in ACTIVE_STATES. NY/MA/CA are all fully defined
+          # (counties + procurement) below; flip a state on/off by editing
+          # the ACTIVE_STATES list — nothing else needs to change.
+          #   NY → live   |   MA → defined, OFF   |   CA → defined, OFF
+          # To deploy CA later: add "CA" to ACTIVE_STATES (set its cap below;
+          # confirm the owner — CA historically used 3 AEs, this unified
+          # engine runs single-owner, so set OWNER_* or revive the per-AE
+          # model from archive_redundant_agents/daily_outbound_agent.yml).
           # ════════════════════════════════════════════════════════════
-          # ── Daily lead cap ─────────────────────────────────────────
-          # 50 leads/day total, split 25 NY / 25 MA.
+          ACTIVE_STATES  = ["NY", "MA"]   # ← only line to edit to turn states on/off
+          STATE_FULLNAME = {"NY": "New York", "MA": "Massachusetts", "CA": "California"}
+          # ── Daily lead cap (per state; only ACTIVE_STATES are counted) ──
           LEADS_PER_STATE = {
               "NY": 15,
-              "MA": 15,
+              "MA": 15,   # inactive until "MA" is added to ACTIVE_STATES
+              "CA": 20,   # inactive until "CA" is added to ACTIVE_STATES
           }
-          TOTAL_DAILY_CAP = sum(LEADS_PER_STATE.values())
+          TOTAL_DAILY_CAP = sum(LEADS_PER_STATE[s] for s in ACTIVE_STATES)
           # ── Single owner: Mike Merritts ────────────────────────────
           OWNER_NAME  = "Mike Merritts"
           OWNER_EMAIL = "mike.merritts@rev.com"
@@ -128,6 +137,19 @@ jobs:
                   "Dukes",        # ~20K, Martha's Vineyard
                   "Nantucket",    # ~14K
               ],
+              # ── CA: dormant (add "CA" to ACTIVE_STATES to revive). Counties
+              # carried over from the pre-2026-05-20 3-AE CA agent (AE + overflow
+              # territories, minus the excluded counties). Ordered large-first;
+              # the scorer re-sorts by signal on first run.
+              "CA": [
+                  "Santa Clara", "Alameda", "Contra Costa", "San Mateo", "Sonoma",
+                  "Solano", "Placer", "Marin", "Merced", "Butte", "Napa",
+                  "Santa Cruz", "Yolo", "El Dorado", "Shasta", "Madera", "Imperial",
+                  "Kings", "Nevada", "Tehama", "Humboldt", "Lake", "Mendocino",
+                  "San Benito", "Tuolumne", "Amador", "Calaveras", "Siskiyou",
+                  "Glenn", "Sutter", "Colusa", "Del Norte", "Inyo", "Mono",
+                  "Trinity", "Plumas", "Modoc", "Lassen", "Sierra", "Alpine",
+              ],
           }
           # ── Active personas (locked to the 3 we established) ───────
           ACTIVE_PERSONAS = [
@@ -187,13 +209,14 @@ jobs:
           STATE_PROCUREMENT = {
               "NY": "NY OGS Centralized Contract available — NYS Contract PT (Manageable Print Services / SaaS) and OGS IT Umbrella Contracts allow direct purchase without separate RFP. County agencies can piggyback on state contracts.",
               "MA": "MA Statewide Contract via COMMBUYS — ITS78 (Software & Services) and ITC73 (IT Project Services) vehicles allow county/municipal LE agencies to purchase directly without standalone procurement.",
+              "CA": "CA NASPO ValuePoint / Carahsoft cooperative contract (#AR2472) — statewide vehicle lets county/municipal LE agencies purchase SaaS directly without a standalone RFP.",
           }
           # ── Persona angles & DEPT_MAP filtered to ACTIVE_PERSONAS ──
           ORG_TYPES = [o for o in ORG_TYPES if o["type"] in ACTIVE_PERSONAS]
           print(f"🎯 Active personas ({len(ORG_TYPES)}): {[o['type'] for o in ORG_TYPES]}")
-          print(f"📍 States: NY ({len(STATE_COUNTIES['NY'])} counties) + MA ({len(STATE_COUNTIES['MA'])} counties)")
+          print("📍 Active states (" + str(len(ACTIVE_STATES)) + "): " + ", ".join(f"{s} ({len(STATE_COUNTIES[s])} counties)" for s in ACTIVE_STATES))
           print(f"👤 Single owner: {OWNER_NAME} ({OWNER_EMAIL})")
-          print(f"📊 Daily cap: {TOTAL_DAILY_CAP} ({LEADS_PER_STATE['NY']} NY / {LEADS_PER_STATE['MA']} MA)")
+          print(f"📊 Daily cap: {TOTAL_DAILY_CAP} (" + " / ".join(f"{LEADS_PER_STATE[s]} {s}" for s in ACTIVE_STATES) + ")")
           # ── HubSpot helpers ───────────────────────────────────────
           def hs_get(path):
               r = requests.get(f"https://api.hubapi.com{path}", headers=HS_HEADERS)
@@ -233,7 +256,7 @@ jobs:
                   resp = hs_post("/crm/v3/objects/contacts/search", {
                       "filterGroups": [{"filters": [
                           {"propertyName": "lead_source_details", "operator": "EQ", "value": "JL OB"},
-                          {"propertyName": "state", "operator": "IN", "values": ["New York", "Massachusetts"]}
+                          {"propertyName": "state", "operator": "IN", "values": [STATE_FULLNAME[s] for s in ACTIVE_STATES]}
                       ]}],
                       "properties": ["county", "state", "hubspot_owner_id"],
                       "limit": 200,
@@ -354,10 +377,7 @@ jobs:
               except Exception as e:
                   print(f"State save error: {e}")
           def init_state():
-              return {
-                  "NY": {"county": STATE_COUNTIES["NY"][0], "exhausted": [], "county_leads": {}},
-                  "MA": {"county": STATE_COUNTIES["MA"][0], "exhausted": [], "county_leads": {}},
-              }
+              return {s: {"county": STATE_COUNTIES[s][0], "exhausted": [], "county_leads": {}} for s in ACTIVE_STATES}
           def next_county_for_state(state_code, state):
               exhausted_self = set(state[state_code].get("exhausted", []))
               for county in STATE_COUNTIES[state_code]:
@@ -414,7 +434,7 @@ jobs:
               except Exception as e:
                   print(f"Score save error: {e}")
           def score_county(county, state_code):
-              state_name = "New York" if state_code == "NY" else "Massachusetts"
+              state_name = STATE_FULLNAME.get(state_code, "")
               procurement_hint = STATE_PROCUREMENT[state_code]
               prompt = f"""You are a B2B sales intelligence analyst. Research {county} County, {state_name}
           for signals relevant to selling Rev's legal transcription software (~$15k/yr) to law enforcement.
@@ -488,14 +508,14 @@ jobs:
           def sort_counties_by_score(county_list, state_code, scores):
               return sorted(county_list, key=lambda c: scores.get(county_key(state_code, c), {}).get("score", 0), reverse=True)
           # ── Claude helper ─────────────────────────────────────────
-          def claude(prompt, max_tokens=1000, use_search=False):
+          def claude(prompt, max_tokens=1000, use_search=False, model="claude-sonnet-4-6"):
               body = {
-                  "model": "claude-sonnet-4-6",
+                  "model": model,
                   "max_tokens": max_tokens,
                   "messages": [{"role": "user", "content": prompt}]
               }
               if use_search:
-                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+                  body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
               resp = requests.post("https://api.anthropic.com/v1/messages", headers=ANTH_HEADERS, json=body)
               data = resp.json()
               return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
@@ -506,7 +526,7 @@ jobs:
               state = init_state()
           else:
               print(f"Loaded state: {json.dumps(state, indent=2)}")
-              for sc in ["NY", "MA"]:
+              for sc in ACTIVE_STATES:
                   if sc not in state:
                       state[sc] = {"county": STATE_COUNTIES[sc][0], "exhausted": [], "county_leads": {}}
                   if "county_leads" not in state[sc]:
@@ -519,7 +539,7 @@ jobs:
           county_scores = load_county_scores() or {}
           was_empty     = len(county_scores) == 0
           missing = []
-          for state_code in ["NY", "MA"]:
+          for state_code in ACTIVE_STATES:
               for county in STATE_COUNTIES[state_code]:
                   if county_key(state_code, county) not in county_scores:
                       missing.append((state_code, county))
@@ -542,7 +562,7 @@ jobs:
               if datetime.datetime.today().weekday() == 0:
                   week_of   = datetime.datetime.today().strftime("%B %d, %Y")
                   score_msg = f"<@{SLACK_USER}>\n*📊 County Signal Scores — Weekly Update* (week of {week_of})\n\n"
-                  for state_code in ["NY", "MA"]:
+                  for state_code in ACTIVE_STATES:
                       score_msg += f"*{state_code}:*\n"
                       state_scores = [(c, county_scores.get(county_key(state_code, c), {})) for c in STATE_COUNTIES[state_code]]
                       state_scores.sort(key=lambda x: x[1].get("score", 0), reverse=True)
@@ -562,7 +582,7 @@ jobs:
           else:
               print(f"✅ Using cached county scores ({len(county_scores)} counties — all current)")
           # Re-sort each state's county list by score (preserving exhausted + current at front)
-          for state_code in ["NY", "MA"]:
+          for state_code in ACTIVE_STATES:
               not_started  = [c for c in STATE_COUNTIES[state_code]
                                if c not in state[state_code].get("exhausted", [])
                                and c != state[state_code].get("county")]
@@ -573,7 +593,7 @@ jobs:
               print(f"  {state_code} county order: {STATE_COUNTIES[state_code]}")
           # ── Find leads (state-aware prompt) ───────────────────────
           def find_leads(county, state_code, org_type, titles, exclude_names=None, batch=1):
-              state_name = "New York" if state_code == "NY" else "Massachusetts"
+              state_name = STATE_FULLNAME.get(state_code, "")
               exclude_str = ""
               if exclude_names:
                   sample = exclude_names[:30]
@@ -754,6 +774,10 @@ jobs:
                   cleaned = body
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
               return cleaned + '<br>'
+          def claude_copy(prompt, max_tokens=400):
+              # Cost optimization (2026-06-22, JL): email/subject copy does not
+              # need Sonnet. Route these calls to Haiku (~1/3 the price).
+              return claude(prompt, max_tokens=max_tokens, model="claude-haiku-4-5")
           def gen_email_sequence(contact):
               org_type   = contact.get("org_type", "Public Defender")
               angles     = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
@@ -762,10 +786,10 @@ jobs:
               org        = contact["organization"]
               county     = contact["county"]
               state_code = contact.get("state", "")
-              state_name = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
+              state_name = STATE_FULLNAME.get(state_code, "")
               emails     = {}
               loc_str    = f"{county} County, {state_name}" if state_name else f"{county} County"
-              emails["email_1"] = clean_email_body(claude(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {loc_str}.
+              emails["email_1"] = clean_email_body(claude_copy(f"""Write cold outreach Email 1 of 4 from Rev to {name} at {org} in {loc_str}.
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
@@ -779,7 +803,7 @@ jobs:
           - No pricing
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=400), first_name=first_name)
               time.sleep(1)
-              emails["email_2"] = clean_email_body(claude(f"""Write follow-up Email 2 of 4 from Rev to {name} at {org}.
+              emails["email_2"] = clean_email_body(claude_copy(f"""Write follow-up Email 2 of 4 from Rev to {name} at {org}.
           No response to first email about {angles['use_case']}.
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
@@ -794,7 +818,7 @@ jobs:
           - No "just following up"
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=350), first_name=first_name)
               time.sleep(1)
-              emails["email_3"] = clean_email_body(claude(f"""Write value-add Email 3 of 4 from Rev to {name} at {org}.
+              emails["email_3"] = clean_email_body(claude_copy(f"""Write value-add Email 3 of 4 from Rev to {name} at {org}.
           No response to 2 emails about {angles['use_case']}.
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
@@ -808,7 +832,7 @@ jobs:
           - No sign-off name, the sender is automated
           Return ONLY the email body starting with "Hi {first_name},". Do NOT include a subject line.""", max_tokens=350), first_name=first_name)
               time.sleep(1)
-              emails["email_4"] = clean_email_body(claude(f"""Write break-up Email 4 of 4 from Rev to {name} at {org}.
+              emails["email_4"] = clean_email_body(claude_copy(f"""Write break-up Email 4 of 4 from Rev to {name} at {org}.
           Final email about {angles['use_case']}.
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
@@ -831,7 +855,7 @@ jobs:
                   1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
                   3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
               }
-              return claude(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
+              return claude_copy(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
           # ── Buying role ───────────────────────────────────────────
           def get_buying_role(title):
               t = title.lower()
@@ -875,7 +899,7 @@ jobs:
               buying_role = get_buying_role(contact.get("title", ""))
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
               state_code  = contact.get("state", "")
-              state_name  = "New York" if state_code == "NY" else ("Massachusetts" if state_code == "MA" else "")
+              state_name  = STATE_FULLNAME.get(state_code, "")
               props = {
                   "firstname":             contact["first_name"],
                   "lastname":              contact["last_name"],
@@ -959,13 +983,16 @@ jobs:
               return data.get("html_url", "")
           # ── Generate chart (2-panel: NY + MA breakdown for Mike) ──
           def generate_chart(state, results, today_str):
-              fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+              n_states = len(ACTIVE_STATES)
+              fig, axes = plt.subplots(1, n_states, figsize=(7 * n_states, 6))
+              if n_states == 1:
+                  axes = [axes]
               fig.patch.set_facecolor('#1a1d21')
-              fig.suptitle(f'OB Agent — Mike Merritts (NY & MA)\n{today_str}',
+              fig.suptitle(f'OB Agent — Mike Merritts ({" & ".join(ACTIVE_STATES)})\n{today_str}',
                            color='white', fontsize=14, fontweight='bold', y=1.02)
               ACTIVE_COLOR = "#7c3aed"
               STATE_COLORS = {"NY": "#2563eb", "MA": "#059669"}
-              for idx, state_code in enumerate(["NY", "MA"]):
+              for idx, state_code in enumerate(ACTIVE_STATES):
                   ax = axes[idx]
                   ax.set_facecolor('#222529')
                   for spine in ax.spines.values():
@@ -992,7 +1019,7 @@ jobs:
                       ax.tick_params(colors='white')
                       ax.set_xlabel('Leads', color='#aaa', fontsize=9)
                   total = sum(county_leads.values()) if county_leads else 0
-                  state_label = "New York" if state_code == "NY" else "Massachusetts"
+                  state_label = STATE_FULLNAME.get(state_code, "")
                   ax.set_title(f'{state_label}\n{total} total · {active} active',
                                color='white', fontsize=10, fontweight='bold', pad=10)
                   patches = [
@@ -1047,8 +1074,8 @@ jobs:
           # ── Main loop ─────────────────────────────────────────────
           today_str = datetime.date.today().strftime("%A, %B %d, %Y")
           results   = {}
-          for state_code in ["NY", "MA"]:
-              state_name = "New York" if state_code == "NY" else "Massachusetts"
+          for state_code in ACTIVE_STATES:
+              state_name = STATE_FULLNAME.get(state_code, "")
               added         = []
               skipped       = 0
               state_cap     = LEADS_PER_STATE[state_code]
@@ -1215,9 +1242,9 @@ jobs:
           msg += f"*{total_added} new leads added | {total_skip} duplicates skipped*\n"
           msg += f"_Owner: {OWNER_NAME} · Personas: {', '.join(ACTIVE_PERSONAS)}_\n"
           msg += f"_<{CONSOLIDATED_LIST_URL}|View consolidated list in HubSpot>_\n\n"
-          for state_code in ["NY", "MA"]:
+          for state_code in ACTIVE_STATES:
               data = results[state_code]
-              state_name = "New York" if state_code == "NY" else "Massachusetts"
+              state_name = STATE_FULLNAME.get(state_code, "")
               county       = data["county"]
               added_st     = data["added"]
               skipped_st   = data["skipped"]

@@ -151,10 +151,16 @@ jobs:
                   "Trinity", "Plumas", "Modoc", "Lassen", "Sierra", "Alpine",
               ],
           }
-          # ── Active personas (locked to the 3 we established) ───────
+          # ── Active personas ────────────────────────────────────────
+          # 2026-06-24 (JL): District Attorney REMOVED per product decision.
+          # DA was generating leads we did not want (NY 10 / MA 14 on the
+          # 2026-06-24 run). The DA entry remains DEFINED below in ORG_TYPES /
+          # PERSONA_ANGLES / DEPT_MAP (so it can be re-enabled in one line),
+          # but it is intentionally absent from ACTIVE_PERSONAS, so the
+          # ORG_TYPES filter drops it and it is never searched. Do not
+          # re-add "District Attorney" here without product sign-off.
           ACTIVE_PERSONAS = [
               "Public Defender",
-              "District Attorney",
               "Police/Sheriff Investigators",
           ]
           # ── Org types & titles (state-aware search guidance) ───────
@@ -182,7 +188,7 @@ jobs:
                    "Sergeant Investigations", "Investigations Sergeant",
                ]},
           ]
-          # ── Persona angles (3 active personas) ─────────────────────
+          # ── Persona angles (DA retained for re-enable; filtered out below) ──
           PERSONA_ANGLES = {
               "District Attorney": {
                   "pain":     "preparing court proceedings and managing evidence documentation",

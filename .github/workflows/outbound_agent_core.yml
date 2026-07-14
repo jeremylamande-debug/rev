@@ -812,6 +812,20 @@ jobs:
                       f"Hi {first_name},<br><br>",
                       cleaned, count=1, flags=re.IGNORECASE,
                   )
+                  # 2026-07-14 (JL): collapse a DUPLICATED greeting. Haiku
+                  # sometimes emits the greeting twice — once as plain text,
+                  # then again inside a ```html fence containing the whole
+                  # email. After fence-stripping, the two greetings sit
+                  # back-to-back ("Hi Rachel,<br><br>Hi Rachel,<br><br>...").
+                  # The regexes above only normalize the FIRST greeting, so
+                  # the repeat survived. Strip every repeated greeting that
+                  # immediately follows the canonical one.
+                  cleaned = re.sub(
+                      r'^(Hi\s+' + re.escape(first_name) + r'\s*,\s*(?:<br\s*/?>\s*)*)'
+                      r'(?:(?:Hello|Hi|Dear|Greetings)\s+' + re.escape(first_name) + r'\s*,?\s*(?:<br\s*/?>\s*)*)+',
+                      r'\1',
+                      cleaned, flags=re.IGNORECASE,
+                  )
               cleaned = re.sub(r'\s+[—–]\s+', '. ',  cleaned)
               cleaned = re.sub(r'[—–]',         ', ', cleaned)
               cleaned = re.sub(r'\.\s*\.', '.', cleaned)
@@ -859,6 +873,7 @@ jobs:
           Pain point: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly this greeting on its own line: Hi {first_name},
+          - Write the greeting EXACTLY ONCE — do not repeat "Hi {first_name}," anywhere else in your output
           - Follow the greeting with <br><br> then the body
           - Professional, peer-to-peer tone — no corporate filler
           - 100-130 words
@@ -873,7 +888,7 @@ jobs:
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Proof: {angles['proof']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly: Hi {first_name},
-          - <br><br> after greeting
+          - <br><br> after greeting; write the greeting EXACTLY ONCE, never repeat it
           - 80-100 words, follow-up tone — acknowledge they probably didn't see Email 1
           - Lead with the proof point ({angles['proof']}) — make it concrete
           - End with a low-commitment CTA: "open to a 15-min look?" and include the meeting link
@@ -883,7 +898,7 @@ jobs:
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly: Hi {first_name},
-          - <br><br> after greeting
+          - <br><br> after greeting; write the greeting EXACTLY ONCE, never repeat it
           - 60-80 words
           - Short, direct, value-forward
           - Reference a peer company in the same vertical (without naming a specific one) that's seen results
@@ -894,7 +909,7 @@ jobs:
           Recipient: {name} at {loc_str}. Meeting link: {MEETING_LINK}
           Rules:
           - MUST start with exactly: Hi {first_name},
-          - <br><br> after greeting
+          - <br><br> after greeting; write the greeting EXACTLY ONCE, never repeat it
           - 40-60 words
           - Polite breakup — "I'll stop reaching out unless you'd like to chat"
           - Include the meeting link one last time

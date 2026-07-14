@@ -730,9 +730,32 @@ jobs:
           def clean_email_body(text, first_name=None):
               if not text:
                   return text
+              # 2026-07-14 (JL): ported the Core agent's robustness pass. Haiku
+              # intermittently (a) wraps the whole body in a ```html ... ```
+              # markdown code fence, (b) emits markdown links [text](url),
+              # (c) bolds with **...**, (d) separates paragraphs with \n\n,
+              # and (e) emits the greeting TWICE (plain + again inside the
+              # fence). The old cleaner ran .replace("\n","") BEFORE stripping
+              # fences, producing the "```htmlHi Name," artifact + duplicated
+              # greeting + wall-of-text. Order matters: strip fences and
+              # convert markdown FIRST, turn paragraph breaks into <br><br>,
+              # THEN drop stray newlines, THEN collapse duplicate greetings.
+              # 0) Strip markdown code fences (```html, ```python, bare ```)
+              text = re.sub(r'```[a-zA-Z]*', '', text)
+              text = text.replace('```', '')
               lines = [l for l in text.splitlines() if not l.strip().lower().startswith("subject:")]
               cleaned = "\n".join(lines).strip()
-              cleaned = cleaned.replace("\n", "")
+              # 1) Markdown link  [text](url) -> <a href="url">text</a>
+              cleaned = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)', r'<a href="\2">\1</a>', cleaned)
+              # 2) Strip markdown emphasis (**bold**, __bold__, *italic*)
+              cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
+              cleaned = re.sub(r'__([^_]+)__', r'\1', cleaned)
+              cleaned = re.sub(r'(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)', r'\1', cleaned)
+              # 3) Preserve paragraph breaks: blank line -> <br><br>; a lone
+              #    newline -> single space so wrapped lines re-flow cleanly.
+              cleaned = re.sub(r'\n[ \t]*\n+', '<br><br>', cleaned)
+              cleaned = re.sub(r'\n', ' ', cleaned)
+              cleaned = re.sub(r'  +', ' ', cleaned)
               cleaned = re.sub(r'(<br\s*/?>)+', '<br><br>', cleaned, flags=re.IGNORECASE)
               cleaned = re.sub(r'^(Hi\s+[^,<]{1,40},)(?!\s*<br)\s*', r'\1<br><br>', cleaned, flags=re.IGNORECASE)
               if first_name:
@@ -748,6 +771,15 @@ jobs:
                       r'^Hi\s+' + re.escape(first_name) + r'\s*,\s*(?:<br\s*/?>\s*)+',
                       f"Hi {first_name},<br><br>",
                       cleaned, count=1, flags=re.IGNORECASE
+                  )
+                  # 2026-07-14 (JL): collapse a DUPLICATED greeting (greeting
+                  # emitted plain AND again inside the stripped fence). Strip
+                  # every repeated greeting immediately after the canonical one.
+                  cleaned = re.sub(
+                      r'^(Hi\s+' + re.escape(first_name) + r'\s*,\s*(?:<br\s*/?>\s*)*)'
+                      r'(?:(?:Hello|Hi|Dear|Greetings)\s+' + re.escape(first_name) + r'\s*,?\s*(?:<br\s*/?>\s*)*)+',
+                      r'\1',
+                      cleaned, flags=re.IGNORECASE,
                   )
               # ── Hard strip em/en dashes (model leaks these despite prompt rules) ──
               # Em dash (—, U+2014) and en dash (–, U+2013).
@@ -779,7 +811,10 @@ jobs:
                   body += f' Grab a time on <a href="https://meetings.hubspot.com/mike-merritts">my calendar</a>.'
                   cleaned = body
               cleaned = re.sub(r'(<br\s*/?>)+$', '', cleaned.rstrip(), flags=re.IGNORECASE)
-              return cleaned + '<br>'
+              # 2026-07-14 (JL): end with <br><br> (was single <br>) so all
+              # emails get consistent breathing room above the signature —
+              # same fix the Core agent got 2026-06-11.
+              return cleaned + '<br><br>'
           def claude_copy(prompt, max_tokens=400):
               # Cost optimization (2026-06-22, JL): email/subject copy does not
               # need Sonnet. Route these calls to Haiku (~1/3 the price).
@@ -857,11 +892,19 @@ jobs:
                   return ""
               org_type = contact.get("org_type", "Public Defender")
               angles   = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
+              # 2026-07-14 (JL): ported the Core agent's subject de-markdown —
+              # Haiku wraps subjects in **bold** that renders literally in HubSpot.
+              NO_FMT = " Return ONLY the plain-text subject line: no markdown, no asterisks, no bold, no quotes, no emoji, no em dashes."
               prompts  = {
-                  1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev {angles['use_case']}. Under 10 words. Professional, curiosity-driving.",
-                  3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.",
+                  1: f"Cold email subject for {contact['title']} at {contact['organization']} about Rev {angles['use_case']}. Under 10 words. Professional, curiosity-driving.{NO_FMT}",
+                  3: f"Value-add subject for {contact['title']} — 3rd email about {angles['use_case']}. Under 8 words. Insight-driven.{NO_FMT}",
               }
-              return claude_copy(f"{prompts[email_num]} Return ONLY the subject line.", max_tokens=50)
+              raw = claude_copy(prompts[email_num], max_tokens=50)
+              raw = re.sub(r'```[a-zA-Z]*', '', raw).replace('```', '')
+              raw = raw.replace('*', '').replace('`', '').replace('_', '')
+              raw = re.sub(r'^\s*#+\s*', '', raw)
+              raw = raw.strip().strip('"').strip("'").strip()
+              return raw[:80]
           # ── Buying role ───────────────────────────────────────────
           def get_buying_role(title):
               t = title.lower()

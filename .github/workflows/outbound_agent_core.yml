@@ -31,6 +31,16 @@ name: Daily Outbound Agent — Core (HR/ER/Compliance & Workplace Investigations
 #   ICP expansion:   When the seed list is exhausted, ask Claude for 5 more
 #                    similar-shape companies within the industry whitelist.
 #
+#   NFL track (2026-08-17 JL): parallel Comms/PR track — enrich 2 NFL teams
+#                    per weekday using JL's 5 titles (+ close variants) from
+#                    the title/account doc. No per-team business cap ("max
+#                    out each team"); seniority cap LIFTED for this track
+#                    (Directors / Heads of PR are wanted). Runs BEFORE the
+#                    HR/ER loop each day with its own slice of the run
+#                    budget. Summary posts to #daily-ob in the same daily
+#                    message. Owner stays Isabella. See "NFL COMMS/PR TRACK"
+#                    config block below.
+#
 # Persistence:
 #   State (which company is active, which are exhausted, per-company counts)
 #   lives in a HubSpot note marked with OUTBOUND_AGENT_STATE_CORE_V1, mirroring
@@ -292,8 +302,108 @@ jobs:
           DEPT_MAP = {
               "HR/ER Leader":           "HR / Employee Relations",
               "Workplace Investigator": "Workplace Investigations",
+              "NFL Comms/PR":           "Communications / Public Relations",  # NFL track (2026-08-17)
           }
+          # ═════════════════════════════════════════════════════════════
+          # NFL COMMS/PR TRACK — added 2026-08-17 (JL)
+          # Parallel track inside the Core agent: enrich TWO NFL teams per
+          # weekday with Communications / Public Relations contacts, per JL's
+          # title + account doc. Key differences from the HR/ER track:
+          #   - Seniority cap LIFTED for this track only — Senior Directors,
+          #     Directors, and Heads of PR at NFL teams ARE the buyers.
+          #   - No business per-team cap ("max out each team") — take every
+          #     qualifying Comms/PR contact found. NFL_MAX_LEADS_PER_TEAM is
+          #     a runaway-cost guard only, not a business cap.
+          #   - Runs BEFORE the HR/ER loop each day, with its own slice of
+          #     the run budget so neither track can starve the other.
+          #   - Owner stays Isabella; summary posts to #daily-ob inside the
+          #     same daily Slack message.
+          # State keys (stored in the same OUTBOUND_AGENT_STATE_CORE_V1 note):
+          #   nfl_teams_done   — teams fully enriched (searches ran dry)
+          #   nfl_team_leads   — per-team lifetime lead counts
+          #   nfl_active_team  — team in progress if a run was cut mid-team
+          # ═════════════════════════════════════════════════════════════
+          NFL_PERSONA              = "NFL Comms/PR"
+          NFL_TEAMS_PER_DAY        = 2
+          NFL_MAX_LEADS_PER_TEAM   = 50  # SAFETY guard against runaway cost — not a business cap
+          NFL_MAX_BATCHES_PER_TEAM = 5
+          # NFL track gets the first NFL_RUN_BUDGET_SECONDS of the run; the
+          # HR/ER loop gets whatever remains of the global RUN_BUDGET_SECONDS.
+          NFL_RUN_BUDGET_SECONDS   = int(os.environ.get("NFL_RUN_BUDGET_SECONDS", str(35 * 60)))
+          # Rotation order = JL's doc order (NFC East → NFC North → NFC South
+          # → NFC West → AFC East → AFC North → AFC South → AFC West).
+          NFL_TEAMS = [
+              # NFC East
+              "Dallas Cowboys", "New York Giants", "Philadelphia Eagles", "Washington Commanders",
+              # NFC North
+              "Chicago Bears", "Detroit Lions", "Green Bay Packers", "Minnesota Vikings",
+              # NFC South
+              "Atlanta Falcons", "Carolina Panthers", "New Orleans Saints", "Tampa Bay Buccaneers",
+              # NFC West
+              "Arizona Cardinals", "Los Angeles Rams", "San Francisco 49ers", "Seattle Seahawks",
+              # AFC East
+              "Buffalo Bills", "Miami Dolphins", "New England Patriots", "New York Jets",
+              # AFC North
+              "Baltimore Ravens", "Cincinnati Bengals", "Cleveland Browns", "Pittsburgh Steelers",
+              # AFC South
+              "Houston Texans", "Indianapolis Colts", "Jacksonville Jaguars", "Tennessee Titans",
+              # AFC West
+              "Denver Broncos", "Kansas City Chiefs", "Las Vegas Raiders", "Los Angeles Chargers",
+          ]
+          # JL's exact 5 titles first, then close variants. NFL teams title
+          # their top PR person inconsistently (VP of Communications is the
+          # common equivalent of Head of PR), so close variants include the
+          # media-relations flavor and the football-communications side.
+          NFL_TITLES = [
+              # ── JL's doc titles ──
+              "Senior Director of Corporate Communications",
+              "Communications Coordinator",
+              "Director of Communications",
+              "Head of Public Relations",
+              "Public Relations Coordinator",
+              # ── close variants ──
+              "Director of Corporate Communications",
+              "Senior Director of Communications",
+              "Communications Manager",
+              "Senior Communications Coordinator",
+              "Public Relations Manager",
+              "PR Coordinator",
+              "Director of Football Communications",
+              "Football Communications Coordinator",
+              "Media Relations Coordinator",
+              "Media Relations Manager",
+              "Director of Media Relations",
+              "VP of Communications",  # common NFL-team equivalent of Head of PR
+          ]
+          # Scope block swapped into the find_leads prompt for NFL searches
+          # (replaces the HR/ER scope + seniority rules).
+          NFL_SCOPE_BLOCK = """SCOPE — CRITICAL (judge by what the person actually DOES, not just the title text):
+          We ONLY want COMMUNICATIONS / PUBLIC RELATIONS / MEDIA RELATIONS staff — the
+          people who run press conferences, media availabilities, press releases, media
+          credentialing, and corporate/executive communications for the team.
+          - Include BOTH corporate communications AND football communications / media
+            relations staff (NFL teams split press duties across both).
+          EXCLUDE — do NOT return:
+          - Players, coaches, scouts, or football operations staff
+          - Marketing, sponsorship, sales, ticketing, or fan-experience staff
+          - Broadcasters, in-house content/video producers, or social media creators
+          - Team owners, Presidents, EVPs, or C-suite executives
+          SENIORITY — for THIS search, Coordinator through Senior Director / Head / VP of
+          Communications-level roles are ALL in scope (Directors and Heads ARE wanted
+          here). Still exclude EVP, President, and C-suite."""
+          # Persona angle + copy guide for cold emails to comms/PR staff.
+          PERSONA_ANGLES[NFL_PERSONA] = {
+              "pain":     "turning press conferences, coach and player availabilities, and media interviews into quotes, transcripts, and releases on game-week deadlines",
+              "use_case": "fast, accurate transcription of press conferences, interviews, and media sessions with speaker labels, ready for media distribution, quote pulls, and the team's archives",
+              "proof":    "communications teams using Rev turn a full press conference into a clean, quotable transcript in minutes instead of hours, so quotes reach media while the story is still live",
+          }
+          NFL_COPY_GUIDE = (
+              "Wording and emphasis rules: "
+              "lead with speed to quotes — comms staff can get accurate, speaker-labeled transcripts of pressers and interviews out in minutes. "
+              "Speak their language: say 'press conference' and 'media availability', not 'meeting'. Keep it concrete to a team communications workflow."
+          )
           print(f"🎯 Active personas ({len(ACTIVE_PERSONAS)}): {ACTIVE_PERSONAS}")
+          print(f"🏈 NFL track: {len(NFL_TEAMS)} teams · {NFL_TEAMS_PER_DAY} teams/day · persona '{NFL_PERSONA}' · {len(NFL_TITLES)} title hints · max-out (guard {NFL_MAX_LEADS_PER_TEAM}/team)")
           print(f"📍 Seed companies: {len(SEED_COMPANIES)}")
           print(f"👤 Owner: {OWNER_NAME} ({OWNER_EMAIL})")
           _cap_str = ", ".join(f"{p}:{LEADS_PER_PERSONA_PER_DAY[p]}" for p in ACTIVE_PERSONAS)
@@ -346,7 +456,7 @@ jobs:
                   # blocking creation of a contact property with that label.
                   "name":        "ob_persona",
                   "label":       "OB Persona",
-                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR/ER Leader / Workplace Investigator.",
+                  "description": "Which OB agent persona this contact belongs to. Legal: Public Defender / District Attorney / Police-Sheriff Investigators. Core: HR/ER Leader / Workplace Investigator / NFL Comms/PR.",
                   "type":        "enumeration",
                   "fieldType":   "select",
                   "options": [
@@ -357,6 +467,9 @@ jobs:
                       # Core personas
                       {"label": "HR/ER Leader",                 "value": "HR/ER Leader",                 "displayOrder": 3},
                       {"label": "Workplace Investigator",       "value": "Workplace Investigator",       "displayOrder": 4},
+                      # NFL Comms/PR track (2026-08-17 JL). PATCH-on-409
+                      # below syncs this new option into the existing prop.
+                      {"label": "NFL Comms/PR",                 "value": "NFL Comms/PR",                 "displayOrder": 5},
                       # 2026-05-29 (JL): Compliance/Ethics persona retired.
                   ],
               },
@@ -460,6 +573,10 @@ jobs:
                   "empty_passes":         {},
                   "zero_lead_attempts":   {},
                   "expanded_companies": [],
+                  # NFL track (2026-08-17)
+                  "nfl_teams_done":   [],
+                  "nfl_team_leads":   {},
+                  "nfl_active_team":  None,
               }
           def all_companies(state):
               """Seed list + any expansion picks. Order: seed first, then expansion.
@@ -567,25 +684,11 @@ jobs:
           # ═════════════════════════════════════════════════════════════
           # FIND LEADS — given a company + persona, surface real people
           # Scrapes website + LinkedIn via Claude web_search.
+          # 2026-08-17 (JL): scope/seniority block parameterized so the NFL
+          # track can swap in NFL_SCOPE_BLOCK (Comms/PR scope, lifted
+          # seniority cap). Default = the original HR/ER scope below.
           # ═════════════════════════════════════════════════════════════
-          def find_leads(company, org_type, titles, exclude_names=None, batch=1):
-              exclude_str = ""
-              if exclude_names:
-                  sample = exclude_names[:30]
-                  exclude_str = f"\nDo NOT return these people (already found): {', '.join(sample)}\nFind different people beyond this list."
-              batch_str = ""
-              if batch > 1:
-                  batch_str = (
-                      f"\nThis is search batch {batch} — find people not already captured in previous searches. "
-                      f"Look deeper: LinkedIn profiles, corporate org charts, press releases, internal job boards, "
-                      f"and the company's careers / leadership pages."
-                  )
-              prompt = f"""Search for real {org_type} staff at {company}.
-          Find people with these titles (or close variants): {', '.join(titles)}
-          Look at official corporate websites, LinkedIn, press releases, leadership pages,
-          and public org-chart data. {company} is a large enterprise — find as many real
-          people as possible. Aim for 15-25 contacts.
-          SCOPE — CRITICAL (judge by what the person actually DOES, not the title text):
+          HR_SCOPE_BLOCK = """SCOPE — CRITICAL (judge by what the person actually DOES, not the title text):
           We ONLY want people whose real work is EMPLOYEE RELATIONS and PEOPLE /
           EMPLOYEE / WORKPLACE INVESTIGATIONS — workplace misconduct, harassment,
           discrimination, retaliation, EEO, policy violations, and employee
@@ -610,7 +713,27 @@ jobs:
           SENIORITY — IMPORTANT: target individual contributors through Senior Manager
           level only (Specialists, Coordinators, Analysts, HRBPs, Investigators, Managers,
           Senior Managers). Do NOT return Directors, Senior Directors, VPs, Heads,
-          Chiefs, or any C-suite — they don't engage with cold outreach.{exclude_str}{batch_str}
+          Chiefs, or any C-suite — they don't engage with cold outreach."""
+          def find_leads(company, org_type, titles, exclude_names=None, batch=1, scope_block=None):
+              if scope_block is None:
+                  scope_block = HR_SCOPE_BLOCK
+              exclude_str = ""
+              if exclude_names:
+                  sample = exclude_names[:30]
+                  exclude_str = f"\nDo NOT return these people (already found): {', '.join(sample)}\nFind different people beyond this list."
+              batch_str = ""
+              if batch > 1:
+                  batch_str = (
+                      f"\nThis is search batch {batch} — find people not already captured in previous searches. "
+                      f"Look deeper: LinkedIn profiles, corporate org charts, press releases, internal job boards, "
+                      f"and the company's careers / leadership pages."
+                  )
+              prompt = f"""Search for real {org_type} staff at {company}.
+          Find people with these titles (or close variants): {', '.join(titles)}
+          Look at official corporate websites, LinkedIn, press releases, leadership pages,
+          and public org-chart data. {company} is a large enterprise — find as many real
+          people as possible. Aim for 15-25 contacts.
+          {scope_block}{exclude_str}{batch_str}
           Return a JSON array. Each item must have these exact keys:
           first_name, last_name, title, organization, division, location, org_type, website, linkedin, email, phone
           - `organization` MUST be "{company}" (the parent org)
@@ -862,6 +985,10 @@ jobs:
           def gen_email_sequence(contact):
               org_type   = contact.get("org_type", "HR/ER Leader")
               angles     = PERSONA_ANGLES.get(org_type) or next(iter(PERSONA_ANGLES.values()))
+              # 2026-08-17 (JL): NFL Comms/PR leads get their own copy guide —
+              # the HR guide's wording rules ("say HR not ER" etc.) make no
+              # sense in a press-box email.
+              copy_guide = NFL_COPY_GUIDE if org_type == NFL_PERSONA else COPY_GUIDE
               first_name = contact["first_name"]
               name       = f"{contact['title']} {contact['last_name']}"
               org        = contact["organization"]
@@ -881,7 +1008,7 @@ jobs:
           - Reference Rev's value in plain language (no marketing-speak)
           - Close with a CTA: ask if they'd be open to a 15-min call; include the meeting link
           - NO em dashes (—) or en dashes (–). Use periods or commas instead
-          - {COPY_GUIDE}
+          - {copy_guide}
           - Output PLAIN HTML only: NEVER use markdown — no triple-backtick code fences, no ** for bold, no [text](url) links. Separate paragraphs with <br><br>. Write the CTA link as <a href="{MEETING_LINK}">my calendar</a>.
           - Return raw HTML body only. No "Subject:" line. No signature block.""", max_tokens=600), first_name)
               emails["email_2"] = clean_email_body(claude_copy(f"""Write cold outreach Email 2 of 4 (follow-up). Sent 4 days after Email 1.
@@ -892,7 +1019,7 @@ jobs:
           - 80-100 words, follow-up tone — acknowledge they probably didn't see Email 1
           - Lead with the proof point ({angles['proof']}) — make it concrete
           - End with a low-commitment CTA: "open to a 15-min look?" and include the meeting link
-          - {COPY_GUIDE}
+          - {copy_guide}
           - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=500), first_name)
               emails["email_3"] = clean_email_body(claude_copy(f"""Write cold outreach Email 3 of 4. Sent 7 days after Email 2.
           Recipient: {name} at {loc_str}. Pain: {angles['pain']}. Use case: {angles['use_case']}. Meeting link: {MEETING_LINK}
@@ -903,7 +1030,7 @@ jobs:
           - Short, direct, value-forward
           - Reference a peer company in the same vertical (without naming a specific one) that's seen results
           - End with the meeting link CTA
-          - {COPY_GUIDE}
+          - {copy_guide}
           - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=400), first_name)
               emails["email_4"] = clean_email_body(claude_copy(f"""Write cold outreach Email 4 of 4 — the breakup email. Sent 10 days after Email 3.
           Recipient: {name} at {loc_str}. Meeting link: {MEETING_LINK}
@@ -913,7 +1040,7 @@ jobs:
           - 40-60 words
           - Polite breakup — "I'll stop reaching out unless you'd like to chat"
           - Include the meeting link one last time
-          - {COPY_GUIDE}
+          - {copy_guide}
           - NO em/en dashes. Output PLAIN HTML only: no markdown, no triple-backtick code fences, no ** bold, no [text](url) links. Separate paragraphs with <br><br>. Raw HTML body only.""", max_tokens=300), first_name)
               return emails
           def gen_subject(contact, idx):
@@ -1024,7 +1151,10 @@ jobs:
               subjects = subjects or {}
               buying_role = get_buying_role(contact.get("title", ""))
               dept        = DEPT_MAP.get(contact.get("org_type", ""), contact.get("org_type", ""))
-              persona_val = contact.get("org_type", "") if contact.get("org_type", "") in ACTIVE_PERSONAS else ""
+              # 2026-08-17 (JL): NFL persona is valid too (it isn't in
+              # ACTIVE_PERSONAS, which only drives the HR/ER loop).
+              _ot = contact.get("org_type", "")
+              persona_val = _ot if (_ot in ACTIVE_PERSONAS or _ot == NFL_PERSONA) else ""
               props = {
                   "firstname":             contact["first_name"],
                   "lastname":              contact["last_name"],
@@ -1205,6 +1335,10 @@ jobs:
                   ("empty_passes",       {}),
                   ("zero_lead_attempts", {}),
                   ("expanded_companies", []),
+                  # NFL track (2026-08-17) — migrate older state notes
+                  ("nfl_teams_done",     []),
+                  ("nfl_team_leads",     {}),
+                  ("nfl_active_team",    None),
               ):
                   if k not in state:
                       state[k] = default
@@ -1243,6 +1377,135 @@ jobs:
           def time_budget_exceeded():
               return time.monotonic() >= RUN_DEADLINE
           print(f"⏱️  Run budget: {RUN_BUDGET_SECONDS // 60} min (graceful exit before GitHub's 90-min cancel)")
+          # ═════════════════════════════════════════════════════════════
+          # NFL TRACK MAIN LOOP — runs FIRST (JL 2026-08-17: "focus on
+          # enriching 2 teams per day"). Picks the next NFL_TEAMS_PER_DAY
+          # un-done teams in doc order and maxes each out: keeps batching
+          # find_leads until a batch yields zero NEW contacts (dry), then
+          # marks the team done — it is never revisited. If the NFL time
+          # budget cuts a team mid-run, it stays "active" and resumes
+          # tomorrow (and still counts toward tomorrow's 2 teams).
+          # ═════════════════════════════════════════════════════════════
+          nfl_added       = []
+          nfl_skipped     = 0
+          nfl_teams_today = []  # [(team, new_leads_this_run, finished_bool)]
+          NFL_DEADLINE = time.monotonic() + min(NFL_RUN_BUDGET_SECONDS, RUN_BUDGET_SECONDS)
+          def nfl_time_up():
+              return time.monotonic() >= NFL_DEADLINE or time_budget_exceeded()
+          def next_nfl_team():
+              done = set(state.get("nfl_teams_done", []))
+              # Resume a team that was cut mid-run before starting a new one
+              act = state.get("nfl_active_team")
+              if act and act in NFL_TEAMS and act not in done:
+                  return act
+              for t in NFL_TEAMS:
+                  if t not in done:
+                      return t
+              return None
+          print(f"\n🏈 NFL Comms/PR track — target {NFL_TEAMS_PER_DAY} teams this run, budget {min(NFL_RUN_BUDGET_SECONDS, RUN_BUDGET_SECONDS) // 60} min")
+          while len(nfl_teams_today) < NFL_TEAMS_PER_DAY and not nfl_time_up():
+              team = next_nfl_team()
+              if not team:
+                  # All 32 teams enriched — tell JL once, then stand down.
+                  if not state.get("nfl_complete_notified"):
+                      try:
+                          requests.post("https://slack.com/api/chat.postMessage",
+                              headers=SLACK_HEADERS, json={"channel": DAILY_OB_CHANNEL,
+                              "text": (f"<@{SLACK_USER}> 🏈 *NFL Comms/PR track complete* — all "
+                                       f"{len(NFL_TEAMS)} teams enriched. Add more accounts or "
+                                       f"titles to NFL_TEAMS / NFL_TITLES to continue.")})
+                      except Exception:
+                          pass
+                      state["nfl_complete_notified"] = True
+                  break
+              state["nfl_active_team"] = team
+              print(f"\n{'='*60}")
+              print(f"🏈 Team {len(state.get('nfl_teams_done', [])) + 1}/{len(NFL_TEAMS)}: {team} (lifetime leads so far: {state['nfl_team_leads'].get(team, 0)})")
+              team_new    = 0
+              team_dupes  = 0
+              found_names = []
+              finished    = False
+              for batch_num in range(1, NFL_MAX_BATCHES_PER_TEAM + 1):
+                  if nfl_time_up():
+                      break
+                  if state["nfl_team_leads"].get(team, 0) >= NFL_MAX_LEADS_PER_TEAM:
+                      print(f"  ⚠️ {team} hit the {NFL_MAX_LEADS_PER_TEAM}-lead safety guard — marking done")
+                      finished = True
+                      break
+                  batch_new = 0
+                  try:
+                      leads = find_leads(team, NFL_PERSONA, NFL_TITLES,
+                                         exclude_names=found_names, batch=batch_num,
+                                         scope_block=NFL_SCOPE_BLOCK)
+                      for lead in leads:
+                          if nfl_time_up():
+                              break
+                          if state["nfl_team_leads"].get(team, 0) >= NFL_MAX_LEADS_PER_TEAM:
+                              break
+                          lead = normalize_lead(lead)
+                          fn = lead.get("first_name", "")
+                          ln = lead.get("last_name", "")
+                          if not fn or not ln:
+                              continue
+                          full_name = f"{fn} {ln}"
+                          found_names.append(full_name)
+                          if is_excluded_email(lead.get("email", "")):
+                              print(f"    🚫 Skipping {full_name} — excluded email domain ({lead.get('email','')})")
+                              continue
+                          if is_duplicate(lead.get("email", ""), fn, ln):
+                              team_dupes  += 1
+                              nfl_skipped += 1
+                              print(f"    ↩ Duplicate: {full_name}")
+                              continue
+                          emails_body = gen_email_sequence(lead)
+                          subjects = {i: gen_subject(lead, i) for i in (1, 2, 3, 4)}
+                          result = create_contact(
+                              lead, email_body="",
+                              subject=subjects[1], emails=emails_body, subjects=subjects,
+                          )
+                          if result and result.get("id"):
+                              nfl_added.append({
+                                  "name":     full_name,
+                                  "title":    lead.get("title", ""),
+                                  "org":      lead.get("organization", ""),
+                                  "division": lead.get("division", ""),
+                                  "id":       result["id"],
+                                  "subject":  subjects[1],
+                                  "enrolled": result.get("enrolled", False),
+                                  "email":    lead.get("email", ""),
+                                  "org_type": NFL_PERSONA,
+                              })
+                              team_new  += 1
+                              batch_new += 1
+                              state["nfl_team_leads"][team] = state["nfl_team_leads"].get(team, 0) + 1
+                              print(f"    ✅ Added: {full_name} — {lead.get('title')} ({team} total: {state['nfl_team_leads'][team]})")
+                          time.sleep(1)
+                  except Exception as e:
+                      print(f"    Error: {e}")
+                  if batch_new == 0:
+                      # Dry batch (nothing new / all dupes) — team is maxed out.
+                      print(f"  ℹ️ {team} batch {batch_num} dry — team maxed out")
+                      finished = True
+                      break
+                  print(f"    Batch {batch_num}: {batch_new} new. Looping for more...")
+                  time.sleep(2)
+              else:
+                  # Ran every batch and the last one still produced leads —
+                  # call it done rather than looping forever.
+                  finished = True
+              if not finished:
+                  # Time budget cut us mid-team — stay active, resume next run.
+                  print(f"  ⏰ NFL budget reached mid-team — {team} resumes next run ({team_new} new this run)")
+                  nfl_teams_today.append((team, team_new, False))
+                  break
+              state.setdefault("nfl_teams_done", []).append(team)
+              state["nfl_active_team"] = None
+              nfl_teams_today.append((team, team_new, True))
+              print(f"  ✅ {team} done — {team_new} new, {team_dupes} dupes ({len(state['nfl_teams_done'])}/{len(NFL_TEAMS)} teams complete)")
+          print(f"\n🏈 NFL track pass complete: {len(nfl_added)} new leads across {len(nfl_teams_today)} team(s), {nfl_skipped} dupes")
+          # ═════════════════════════════════════════════════════════════
+          # HR/ER TRACK MAIN LOOP — unchanged; gets the remaining run budget
+          # ═════════════════════════════════════════════════════════════
           while not all_personas_capped() and len(added) < TOTAL_DAILY_CAP:
               if time_budget_exceeded():
                   hit_time_budget = True
@@ -1462,19 +1725,27 @@ jobs:
           # ═════════════════════════════════════════════════════════════
           chart_path = generate_chart(state, today_str)
           upload_chart_to_slack(chart_path, DAILY_OB_CHANNEL, today_str)
-          enrolled_count = sum(1 for c in added if c.get("enrolled"))
+          enrolled_count = sum(1 for c in (added + nfl_added) if c.get("enrolled"))
           # Per-persona breakdown
           per_persona = {p: 0 for p in ACTIVE_PERSONAS}
           for c in added:
               per_persona[c.get("org_type", "")] = per_persona.get(c.get("org_type", ""), 0) + 1
           msg  = f"<@{SLACK_USER}>\n"
           msg += f"*🎯 Daily Outbound Agent — Core — {today_str}*\n"
-          msg += f"*{len(added)} new leads added | {skipped} duplicates skipped | {enrolled_count} enrolled in sequence*\n"
+          msg += f"*{len(added) + len(nfl_added)} new leads added ({len(nfl_added)} 🏈 NFL Comms/PR · {len(added)} HR/ER) | {skipped + nfl_skipped} duplicates skipped | {enrolled_count} enrolled in sequence*\n"
           msg += f"_Owner: {OWNER_NAME} · Personas: {', '.join(ACTIVE_PERSONAS)} · Cap: {TOTAL_DAILY_CAP}/day total_\n"
           msg += f"_<{CONSOLIDATED_LIST_URL}|View consolidated Core list in HubSpot>_\n\n"
           msg += f"*Per-persona today (total cap {TOTAL_DAILY_CAP}/day):*\n"
           msg += f"• 👔 HR/ER Leader: *{per_persona.get('HR/ER Leader', 0)}/{LEADS_PER_PERSONA_PER_DAY['HR/ER Leader']}*\n"
           msg += f"• 🔍 Workplace Investigator: *{per_persona.get('Workplace Investigator', 0)}/{LEADS_PER_PERSONA_PER_DAY['Workplace Investigator']}*\n\n"
+          # NFL track summary (2026-08-17)
+          msg += f"*🏈 NFL Comms/PR track ({NFL_TEAMS_PER_DAY} teams/day, max-out):*\n"
+          if nfl_teams_today:
+              for _t, _n, _fin in nfl_teams_today:
+                  msg += f"• {_t}: *{_n} new leads*" + ("" if _fin else " _(in progress — resumes next run)_") + "\n"
+          else:
+              msg += "• No teams processed this run\n"
+          msg += f"• Progress: *{len(state.get('nfl_teams_done', []))}/{len(NFL_TEAMS)} teams enriched* | {nfl_skipped} duplicates skipped\n\n"
           msg += f"*Active company:* {state.get('company') or '(none — all exhausted)'}\n"
           exhausted_n = len(state.get("exhausted", []))
           total_n     = len(all_companies(state))
@@ -1482,8 +1753,12 @@ jobs:
           if hit_time_budget:
               msg += f"_⏰ Note: exited early on the {RUN_BUDGET_SECONDS // 60}-min run budget (likely slow/degraded API). State saved — resumes from {state.get('company')!r} next run._\n"
           # Sample of today's leads (first 8)
+          if nfl_added:
+              msg += "\n*Sample NFL leads:*\n"
+              for a in nfl_added[:6]:
+                  msg += f"• `{a['name']}` — {a['title']} @ {a['org']}" + (f" ({a.get('division','')})" if a.get('division') else "") + "\n"
           if added:
-              msg += "\n*Sample leads:*\n"
+              msg += "\n*Sample HR/ER leads:*\n"
               for a in added[:8]:
                   msg += f"• `{a['name']}` — {a['title']} @ {a['org']}" + (f" ({a.get('division','')})" if a.get('division') else "") + "\n"
           try:

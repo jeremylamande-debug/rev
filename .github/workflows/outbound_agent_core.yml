@@ -374,6 +374,14 @@ jobs:
               "Media Relations Manager",
               "Director of Media Relations",
               "VP of Communications",  # common NFL-team equivalent of Head of PR
+              # ── seniority-flex variants (JL 2026-08-17: keep flexible — take
+              # any comms/PR seniority level, intern through EVP) ──
+              "Vice President of Communications",
+              "Senior Vice President of Communications",
+              "Communications Associate",
+              "Communications Specialist",
+              "Media Relations Assistant",
+              "Communications Intern",
           ]
           # Scope block swapped into the find_leads prompt for NFL searches
           # (replaces the HR/ER scope + seniority rules).
@@ -387,10 +395,12 @@ jobs:
           - Players, coaches, scouts, or football operations staff
           - Marketing, sponsorship, sales, ticketing, or fan-experience staff
           - Broadcasters, in-house content/video producers, or social media creators
-          - Team owners, Presidents, EVPs, or C-suite executives
-          SENIORITY — for THIS search, Coordinator through Senior Director / Head / VP of
-          Communications-level roles are ALL in scope (Directors and Heads ARE wanted
-          here). Still exclude EVP, President, and C-suite."""
+          - Team owners, team Presidents, or non-communications C-suite executives
+          SENIORITY — for THIS search, be FLEXIBLE: ALL seniority levels within
+          Communications / PR / Media Relations are in scope — Interns, Associates,
+          Coordinators, Specialists, Managers, Directors, Senior Directors, Heads,
+          VPs, SVPs, and EVPs of Communications are ALL wanted. Only exclude the
+          team's owners, President, and non-communications executives."""
           # Persona angle + copy guide for cold emails to comms/PR staff.
           PERSONA_ANGLES[NFL_PERSONA] = {
               "pain":     "turning press conferences, coach and player availabilities, and media interviews into quotes, transcripts, and releases on game-week deadlines",
